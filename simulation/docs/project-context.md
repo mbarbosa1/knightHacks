@@ -7,7 +7,7 @@ A multi-agent disaster-response platform for Shinjuku, Tokyo. A simulator create
 - **Location:** Shinjuku ward, ~1.5–2 km box around Shinjuku Station / Kabukichō.
 - **Hazards:** earthquake (first, fully done) then flood. Fire spread is cut for now (may return). Compound disasters are a stretch goal.
 - **Every run is different:** a new random seed each run, but replayable from the seed.
-- **Stack:** React + MapLibre GL (3D buildings), FastAPI/Python, OSMnx + NetworkX routing, Neon (Postgres + PostGIS) for live state, Databricks for analysis, AWS S3 (audio/images) + SNS (test notification), Gemini (report writing + agent reasoning), Hugging Face (e.g. Whisper for audio).
+- **Stack:** React + MapLibre GL (3D buildings), FastAPI/Python, OSMnx + NetworkX routing, Neon (Postgres + PostGIS) for live state, Databricks for analysis, AWS S3 (audio/images) + SNS (test notification), Gemini (report writing), Qwen (agent reasoning), Hugging Face (e.g. Whisper for audio).
 - **No Unity.** 3D digital-twin look done in the browser with MapLibre extruded buildings.
 - **VLM / drone imagery: scrapped.**
 - **English everywhere** judges look: UI, briefings, agent output, romanized place names. Original Japanese kept in separate fields; reports show English translation first with an "original" toggle. Report mix ~60% English / 40% Japanese & other.
@@ -34,7 +34,7 @@ Files: `data/plateau/COVERAGE.md`, `data/plateau/REFERENCE.md` (formulas, consta
 MVP: 119 emergency calls (audio), eyewitness texts, social media, fire/police radio. Later: hospital feeds, shelter updates, ward bulletins, sensors, responder field updates. Each has its own speed, accuracy, location precision, format and language; each report carries a source-reliability score. Code decides the facts, delays and errors; **Gemini only writes the human wording**; text-to-speech makes call audio.
 
 ## Agents
-Logical roles: orchestrator, input, language, detection, medical-needs, verification, resource, planning, report, notifying. MVP implements them as ~4 Gemini calls (intake; verify/merge; planning; briefing); resource matching, routing, validation and DB writes are plain Python. Humans approve plans; approval is per plan version and a material change invalidates it.
+Two agents, both running on Qwen. Each agent hosts several personas (TBD) that handle different tasks within it. Resource matching, routing, validation and DB writes are plain Python. Humans approve plans; approval is per plan version and a material change invalidates it.
 
 ## Data flow
 Prep (load PLATEAU/OSM/facilities into Neon; build NetworkX graph from the same road IDs) → scenario starts (seed) → simulator writes truth → report generator releases reports over time → agents process each report **live** (intake → detect → verify/merge → update situations & road beliefs) → resource + routing → plan v1 + English briefing → human approval → test notification + ack → new event (e.g. road collapse) → plan v1 invalidated, reroute to v2, briefing explains why (**key demo moment**) → end: reveal truth + scorecard.
@@ -48,7 +48,7 @@ Working prototype: `demo/shinjuku-quake.html` (sources in `demo/source/`). Roads
 Full table/column spec: `database/database-schema.md`.
 
 ## Team split (suggested)
-A: backend/data (Neon, FastAPI, scenario runner, Databricks export). B: agents (Gemini prompts, Whisper). C: simulation physics + routing (OSMnx/NetworkX). D: frontend (React + MapLibre, panels, reveal truth).
+A: backend/data (Neon, FastAPI, scenario runner, Databricks export). B: agents (Qwen agents + personas, Whisper). C: simulation physics + routing (OSMnx/NetworkX). D: frontend (React + MapLibre, panels, reveal truth).
 Hours 0–3: agree on schema + message formats and stub endpoints. Goal by hour 20: one earthquake scenario running end to end in the UI.
 
 ## If behind, cut in this order
