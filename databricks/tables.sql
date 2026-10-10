@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS knighthacks.truth.truth_links (
     event_id                STRING NOT NULL COMMENT 'Unique per link; dedupe key',
     scenario_id             STRING NOT NULL,
     observation_id          STRING NOT NULL COMMENT 'Neon ops.observations.id',
-    truth_entity_type       STRING COMMENT 'building / road / people',
+    truth_entity_type       STRING COMMENT 'building / road / people; NULL for rumors and chatter',
     truth_entity_id         STRING,
     truth_simulation_time_s DOUBLE,
     match_type              STRING COMMENT 'matched / misleading / fabricated / unmatched'
@@ -79,8 +79,9 @@ ALTER TABLE knighthacks.truth.truth_building_damage ADD CONSTRAINT damage_level_
     CHECK (damage_level IN ('none', 'light', 'moderate', 'severe', 'collapsed'));
 ALTER TABLE knighthacks.truth.truth_links ADD CONSTRAINT match_type_valid
     CHECK (match_type IN ('matched', 'misleading', 'fabricated', 'unmatched'));
+-- NULL allowed: rumors (fabricated) and chatter (unmatched) have no real entity behind them.
 ALTER TABLE knighthacks.truth.truth_links ADD CONSTRAINT entity_type_valid
-    CHECK (truth_entity_type IN ('building', 'road', 'people'));
+    CHECK (truth_entity_type IS NULL OR truth_entity_type IN ('building', 'road', 'people'));
 
 -- ============================================================================
 -- history: what the agents did (copied from Neon after each run)

@@ -261,6 +261,37 @@ DROP TRIGGER IF EXISTS resources_facility_ref ON ops.resources;
 CREATE TRIGGER resources_facility_ref BEFORE INSERT OR UPDATE OF home_facility_id ON ops.resources
     FOR EACH ROW EXECUTE FUNCTION ops.check_static_ref('home_facility_id', 'facilities');
 
+-- Outbox writer: every insert/update/delete on an ops table appends one row to
+-- ops.operational_events, so a run's full history can be exported to Databricks.
+-- payload = {"op": INSERT|UPDATE|DELETE, "row": <row as JSON>}.
+CREATE OR REPLACE FUNCTION ops.log_event() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE
+    r jsonb := to_jsonb(CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END);
+BEGIN
+    INSERT INTO ops.operational_events (run_id, table_name, row_id, payload, created_at)
+    VALUES (
+        (CASE WHEN TG_TABLE_NAME = 'simulation_runs' THEN r ->> 'id' ELSE r ->> 'run_id' END)::uuid,
+        TG_TABLE_NAME,
+        COALESCE(r ->> 'id', r ->> 'road_id'),          -- road_restrictions is keyed by road_id
+        jsonb_build_object('op', TG_OP, 'row', r),
+        clock_timestamp()                               -- now() is fixed per transaction; this keeps order
+    );
+    RETURN NULL;
+END $$;
+
+-- Every ops table except operational_events itself (that would log its own rows forever).
+DO $$
+DECLARE t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['simulation_runs', 'observations', 'incidents', 'road_restrictions',
+                             'resources', 'decisions', 'agent_runs', 'notifications'] LOOP
+        EXECUTE format('DROP TRIGGER IF EXISTS %I ON ops.%I', t || '_log', t);
+        EXECUTE format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON ops.%I
+                        FOR EACH ROW EXECUTE FUNCTION ops.log_event()', t || '_log', t);
+    END LOOP;
+END $$;
+
 -- ============================================================================
 -- Roles
 --   map_import : maintains static (used by scripts/load_static.py)
