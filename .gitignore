@@ -1,3 +1,15 @@
+# frontend
 node_modules/
 dist/
 .vite/
+
+# backend
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.DS_Store
+data/
