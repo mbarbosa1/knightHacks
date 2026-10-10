@@ -14,3 +14,11 @@ __pycache__/
 .DS_Store
 data/
 .vscode/
+
+# simulation
+simulation/runs/
+simulation/cache/
+# reference prototype from the data package (9 MB, not used by the simulator); delete this line to track it
+simulation/demo/
+db-handoff.zip
+gemini-handoff.zip
