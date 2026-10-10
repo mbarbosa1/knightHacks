@@ -1,6 +1,7 @@
 # KnightHacks / KYU-BOT
 
-FastAPI connects to Neon Postgres + PostGIS. Unity and the browser call the API;
+FastAPI connects to Neon Postgres + PostGIS. The simulator and the browser
+(React + MapLibre) call the API;
 database credentials stay server-side. The React/Vite frontend currently uses
 mock reports, dispatches, and an illustrated placeholder map.
 
@@ -18,9 +19,9 @@ Verified October 10, 2026 against the configured development database:
   retries, run isolation, ended runs, and atomic event history. All test writes
   are rolled back.
 
-Still to connect: real 3D rendering and frontend API calls, Unity simulation,
+Still to connect: the MapLibre 3D map and frontend API calls, the simulation,
 agent processing, routing/replanning, decision approval, and Databricks
-export/scoring. There is no Unity project or agent/export implementation in
+export/scoring. There is no simulator or agent/export implementation in
 this repository. The API has no authentication or per-user authorization yet;
 keep it on localhost until those are added.
 
@@ -171,7 +172,7 @@ Neon project: `soft-mountain-91298548`; database: `neondb`.
 - `MAP_IMPORT_DATABASE_URL`: `map_import` login for `scripts/load_static.py`.
 
 The `agents` role is separate. Keep owner credentials out of `DATABASE_URL`,
-Unity, and the browser. `database/schema.sql` matches `database/final-database.md`.
+the simulator, and the browser. `database/schema.sql` matches `database/final-database.md`.
 **`scripts/apply_schema.py` deletes all ops data** before rebuilding it, with a
 confirmation prompt. It is not an incremental migration runner; do not run it
 to deploy API-only changes.
@@ -195,7 +196,7 @@ cd backend
 
 The live check uses the real simulator login/imported map, exercises FastAPI
 in process, and rolls back all fixtures. It needs network access to Neon.
-It does not test Unity, agents, routes, or Databricks.
+It does not test the simulator, the MapLibre map, agents, routes, or Databricks.
 
 Frontend: `npm install`, then `npm run dev` or `npm run build`. Reports, map,
 and dispatch controls currently remain local demo UI state.
