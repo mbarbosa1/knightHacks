@@ -19,9 +19,10 @@ Edit `backend/.env` with one connection string per login, all for the **same
 development branch** (see [Database logins](#database-logins)). Neon project:
 `soft-mountain-91298548`, database: `neondb`.
 
-The existing `dev` branch is `br-royal-flower-b4y1ucfi`. It expires October 11,
-2026 at 5:22 AM Eastern. Extend its lifetime in Neon or select a longer-lived
-development branch before relying on it. Do not silently fall back to main.
+The `dev` branch is `br-royal-flower-b4y1ucfi`; all logins in `backend/.env`
+point at it. On October 10, 2026 its expiry was extended by one month (to about
+November 10, 2026). Extend it again in Neon if needed. Do not silently fall
+back to main.
 
 ```sh
 uvicorn app.asgi:app --reload --host 127.0.0.1 --port 8000
