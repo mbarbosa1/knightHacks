@@ -4,6 +4,7 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from psycopg import OperationalError
 from psycopg.errors import CheckViolation, ForeignKeyViolation, UniqueViolation
@@ -12,7 +13,7 @@ from psycopg_pool import PoolTimeout
 from . import repository
 from .config import Settings
 from .db import get_connection, make_pool
-from .models import ObservationCreate, RunCreate
+from .models import IncidentPut, ObservationCreate, ResourcePut, RoadRestrictionPut, RunCreate, RunEnd
 
 
 def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
@@ -31,7 +32,8 @@ def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
     # works consistently for the browser and keeps its list explicit.
     config = settings or Settings()
     app.add_middleware(CORSMiddleware, allow_origins=config.cors_origins,
-                       allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
+                       allow_methods=["GET", "POST", "PUT"], allow_headers=["Content-Type"])
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
 
     async def unavailable(_request, _exc):
         return JSONResponse(status_code=503, content={"detail": "Database unavailable"})
@@ -72,6 +74,14 @@ def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
     async def facilities(version_id: str, connection: Connection):
         return await repository.list_facilities(connection, version_id)
 
+    @app.get("/map/versions/{version_id}/buildings")
+    async def buildings(version_id: str, connection: Connection, bbox: str | None = None):
+        return await repository.bulk_map(connection, version_id, "buildings", repository.parse_bbox(bbox))
+
+    @app.get("/map/versions/{version_id}/roads")
+    async def roads(version_id: str, connection: Connection, bbox: str | None = None):
+        return await repository.bulk_map(connection, version_id, "road_segments", repository.parse_bbox(bbox))
+
     @app.get("/map/versions/{version_id}/buildings/{building_id}")
     async def building(version_id: str, building_id: str, connection: Connection,
                        radius_m: float = Query(1000, ge=0, le=10000, allow_inf_nan=False),
@@ -85,6 +95,31 @@ def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
     @app.get("/runs/{run_id}")
     async def read_run(run_id: UUID, connection: Connection):
         return await repository.require_run(connection, run_id)
+
+    @app.post("/runs/{run_id}/end")
+    async def end(run_id: UUID, body: RunEnd, connection: Connection):
+        return await repository.end_run(connection, run_id, body)
+
+    @app.put("/runs/{run_id}/resources/{resource_id}")
+    async def resource(run_id: UUID, resource_id: UUID, body: ResourcePut, connection: Connection):
+        return await repository.put_resource(connection, run_id, resource_id, body)
+
+    @app.put("/runs/{run_id}/incidents/{incident_id}")
+    async def incident(run_id: UUID, incident_id: UUID, body: IncidentPut, connection: Connection):
+        return await repository.put_incident(connection, run_id, incident_id, body)
+
+    @app.put("/runs/{run_id}/road-restrictions/{road_id}")
+    async def road_restriction(run_id: UUID, road_id: str, body: RoadRestrictionPut, connection: Connection):
+        return await repository.put_road_restriction(connection, run_id, road_id, body)
+
+    @app.get("/runs/{run_id}/road-restrictions")
+    async def road_restrictions(run_id: UUID, connection: Connection,
+                                limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
+        await repository.require_run(connection, run_id)
+        return await (await connection.execute(
+            "SELECT run_id,road_id,status,source_observation_id,updated_at FROM ops.road_restrictions WHERE run_id=%s ORDER BY road_id LIMIT %s OFFSET %s",
+            (run_id, limit, offset),
+        )).fetchall()
 
     @app.post("/runs/{run_id}/observations")
     async def observation(run_id: UUID, body: ObservationCreate, connection: Connection):

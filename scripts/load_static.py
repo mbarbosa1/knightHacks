@@ -1,6 +1,8 @@
 """Load the static map (buildings, facilities, roads if present) into Neon.
 
-usage: DATABASE_URL=postgresql://map_import:...@.../neondb python3 scripts/load_static.py [--map-version shinjuku-v1] [--replace]
+usage (from the project root):  backend/.venv/bin/python scripts/load_static.py [--map-version shinjuku-v1] [--replace]
+
+Connects as map_import using MAP_IMPORT_DATABASE_URL from backend/.env or the environment.
 
 Reads data/buildings.geojson, data/facilities.geojson and, when it exists, data/road_segments.geojson.
 Everything goes in one transaction; --replace deletes that map version first so you can reload.
@@ -8,6 +10,7 @@ Run database/schema.sql once before this.
 """
 import argparse, json, os, pathlib, sys
 import psycopg
+from dotenv import dotenv_values
 from psycopg.types.json import Jsonb
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -54,7 +57,9 @@ def main():
     ap.add_argument('--replace', action='store_true', help='delete this map version first')
     ap.add_argument('--notes', default='Shinjuku demo box, 1.5 km around Shinjuku Station')
     a = ap.parse_args()
-    url = os.environ.get('DATABASE_URL') or sys.exit('set DATABASE_URL')
+    url = (os.environ.get('MAP_IMPORT_DATABASE_URL')
+           or dotenv_values(ROOT / 'backend' / '.env').get('MAP_IMPORT_DATABASE_URL')
+           or sys.exit('MAP_IMPORT_DATABASE_URL is not set in backend/.env (use the map_import login)'))
 
     roads = DATA / 'road_segments.geojson'
     sv = dict(SOURCE_VERSIONS)
