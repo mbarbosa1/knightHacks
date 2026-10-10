@@ -1,8 +1,11 @@
 """Start a run: load the map, create the run + scenario rows, compute truth, flush.
 
-    python -m sim.run --seed 42 [--mw 7.3]
+    python -m sim.run --seed 42 [--mw 7.3] [--gemini] [--save-reports runs/reports.json]
+
+--gemini has Gemini write the report wording (needs GEMINI_API_KEY and GEMINI_MODEL, see sim/report_writer.py);
+any report it gets wrong, or every report if Gemini is unreachable, keeps the template text.
 """
-import argparse, collections, datetime, uuid
+import argparse, collections, datetime, json, uuid
 from .damage import compute_building_damage
 from .damage_model import shindo_class
 from .people import compute_people
@@ -15,7 +18,11 @@ from .truth import TruthState
 SIMULATOR_VERSION = '0.1.0'
 
 
-def start_run(seed, storage=None, static_map=None, scenario=None, map_version='shinjuku-v1', mw=None):
+def start_run(seed, storage=None, static_map=None, scenario=None, map_version='shinjuku-v1', mw=None, writer=None,
+              save_reports=None):
+    """writer: optional wording function for generate_reports (e.g. report_writer.write_reports).
+    save_reports: optional path for every report with its recipe and links, in the shape of Gerard's sample file.
+    That file holds the answer key, so it is for the simulator team only, never for agents."""
     storage = storage or LocalStorage()
     static_map = static_map or storage.load_static_map(map_version)
     sc = scenario or random_scenario(seed, mw=mw)
@@ -32,7 +39,11 @@ def start_run(seed, storage=None, static_map=None, scenario=None, map_version='s
     compute_people(static_map, sc, truth)
     # Until the live loop exists, every report is released at once, stamped with the time it would arrive.
     start = datetime.datetime.fromisoformat(now)
-    for item in generate_reports(static_map, sc, truth):
+    reports = generate_reports(static_map, sc, truth, writer=writer)
+    if save_reports:
+        with open(save_reports, 'w', encoding='utf-8') as f:
+            json.dump({'scenario': sc.params(), 'reports': reports}, f, ensure_ascii=False, indent=1)
+    for item in reports:
         obs = item['observation']
         storage.save_observation({**obs, 'received_at': (start + datetime.timedelta(seconds=obs['sim_time_s'])).isoformat()})
         for link in item['links']:
@@ -46,8 +57,13 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--seed', type=int, required=True)
     ap.add_argument('--mw', type=float, help='fix the magnitude instead of drawing it from the seed')
+    ap.add_argument('--gemini', action='store_true', help='have Gemini write the report wording (opt-in)')
+    ap.add_argument('--save-reports', metavar='PATH', help='also write reports + recipes + answer key to a JSON file')
     a = ap.parse_args()
-    truth, sc, _ = start_run(a.seed, mw=a.mw)
+    writer = None
+    if a.gemini:
+        from .report_writer import write_reports as writer
+    truth, sc, _ = start_run(a.seed, mw=a.mw, writer=writer, save_reports=a.save_reports)
     i = [d['intensity'] for d in truth.building_damage.values()]
     print(f'run {truth.run_id}  seed {sc.seed}  {sc.params()}')
     print(f'Intensity {shindo_class(min(i))} to {shindo_class(max(i))} (Japan scale), {min(i)}-{max(i)}')

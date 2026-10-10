@@ -30,7 +30,7 @@ class LocalStorage:
         from shapely.geometry import shape
 
         def features(name):
-            return json.load(open(self.data_dir / name))['features']
+            return json.load(open(self.data_dir / name, encoding='utf-8'))['features']
 
         b = features('buildings.geojson')
         f = features('facilities.geojson')
@@ -54,7 +54,7 @@ class LocalStorage:
     def _append(self, run_id, name, rows):
         d = self.runs_dir / str(run_id)
         d.mkdir(parents=True, exist_ok=True)
-        with open(d / name, 'a') as fh:
+        with open(d / name, 'a', encoding='utf-8') as fh:
             for row in rows:
                 fh.write(json.dumps(row, ensure_ascii=False) + '\n')
 
@@ -62,7 +62,7 @@ class LocalStorage:
         """ops.simulation_runs row; rewritten on status change."""
         d = self.runs_dir / str(run['id'])
         d.mkdir(parents=True, exist_ok=True)
-        json.dump(run, open(d / 'simulation_run.json', 'w'), indent=1)
+        json.dump(run, open(d / 'simulation_run.json', 'w', encoding='utf-8'), indent=1)
 
     def save_truth_batch(self, rows):
         """Rows carry 'table' (Databricks table name); one file per table. Dedupes on event_id like Databricks."""
@@ -73,7 +73,7 @@ class LocalStorage:
             by_file.setdefault((row.get('scenario_id') or row['id'], f'{table}.jsonl'), []).append(row)
         for (run_id, name), new in by_file.items():
             path = self.runs_dir / str(run_id) / name
-            seen = {json.loads(l).get('event_id') for l in open(path)} if path.exists() else set()
+            seen = {json.loads(l).get('event_id') for l in open(path, encoding='utf-8')} if path.exists() else set()
             self._append(run_id, name, [x for x in new if x.get('event_id') is None or x['event_id'] not in seen])
 
     def save_observation(self, obs):

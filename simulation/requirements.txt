@@ -4,3 +4,4 @@ networkx>=3.0          # routing in the simulator
 pytest>=8.0            # tests/
 scipy>=1.11            # unit-to-incident assignment in sim/routing.py
 numpy>=1.26
+google-genai>=1.0      # optional: Gemini report wording (python -m sim.run --gemini)
