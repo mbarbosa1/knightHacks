@@ -22,3 +22,6 @@ simulation/cache/
 simulation/demo/
 db-handoff.zip
 gemini-handoff.zip
+
+# map + truth files exported by the simulator for local viewing (python -m sim.export)
+frontend/public/sim/

@@ -33,7 +33,8 @@ def start_run(seed, storage=None, static_map=None, scenario=None, map_version='s
     compute_people(static_map, sc, truth)
     # Until the live loop exists, every report is released at once, stamped with the time it would arrive.
     start = datetime.datetime.fromisoformat(now)
-    for item in generate_reports(static_map, sc, truth):
+    truth.reports = generate_reports(static_map, sc, truth)
+    for item in truth.reports:
         obs = item['observation']
         storage.save_observation({**obs, 'received_at': (start + datetime.timedelta(seconds=obs['sim_time_s'])).isoformat()})
         for link in item['links']:

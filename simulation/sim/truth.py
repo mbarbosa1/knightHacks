@@ -18,6 +18,7 @@ class TruthState:
         self.people = {}               # group_id -> {building_id, count, condition, mobility, language, sim_time_s}
         self.sampled_attributes = {}   # building_id -> {era, structure, ...}
         self.truth_links = []
+        self.reports = []              # generated reports with their links and recipe; never leaves the simulator
         self.pending_truth_writes = []
 
     def _queue(self, table, row, event_id=True):
