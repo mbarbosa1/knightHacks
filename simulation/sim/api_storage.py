@@ -76,14 +76,38 @@ def observation_body(obs):
     return body
 
 
+def build_graph(roads, road_geoms):
+    """The road graph sim/routing.py needs, rebuilt from static.road_segments instead of the local
+    road_graph.graphml (which only exists on machines with simulation/data/).
+
+    Same shape as the OSMnx graph: a MultiDiGraph whose edge (u, v, key) is road id "u_v_key", nodes
+    with x/y (lon/lat), and edges with length (m), travel_time (s) and geometry. travel_time is
+    length / speed, the same formula OSMnx's add_edge_travel_times uses.
+    """
+    import networkx as nx
+    G = nx.MultiDiGraph()
+    for rid, p in roads.items():
+        line = road_geoms[rid]
+        # An OSMnx edge geometry runs from node u to node v, so its ends give the node coordinates.
+        G.add_node(p['from_node'], x=line.coords[0][0], y=line.coords[0][1])
+        G.add_node(p['to_node'], x=line.coords[-1][0], y=line.coords[-1][1])
+        G.add_edge(p['from_node'], p['to_node'], key=int(rid.rsplit('_', 1)[1]), length=p['length_m'],
+                   travel_time=p['length_m'] / (p['speed_kmh'] / 3.6), geometry=line)
+    return G
+
+
 class ApiStorage:
-    def __init__(self, base_url='http://127.0.0.1:8000', truth_storage=None, timeout=120):
+    def __init__(self, base_url='http://127.0.0.1:8000', truth_storage=None, timeout=120, defer_observations=False):
         # base_url: where uvicorn is serving the backend (no trailing slash, so paths join cleanly).
         # timeout: seconds to wait per request; the bulk buildings layer is ~6 MB, so it is generous.
         self.base_url, self.timeout = base_url.rstrip('/'), timeout
         # Where everything that must NOT go to Neon is written (truth rows), plus a local copy of the
         # run and its observations so scripts/check_sim_run.py can compare Neon against them.
         self.truth_storage = truth_storage or LocalStorage()
+        # defer_observations=True: save_observation only queues reports; post_pending_observations()
+        # sends them later. sim/server.py uses this so the map gets its answer before ~300-600 reports
+        # (1.5-3 minutes of requests) have reached Neon.
+        self.defer_observations, self.pending_observations = defer_observations, []
 
     # =========================================================================
     # 2. HTTP HELPER
@@ -114,11 +138,8 @@ class ApiStorage:
     # =========================================================================
 
     def load_static_map(self, version='shinjuku-v1'):
-        """The map from Neon static.* via the API, in the same StaticMap shape LocalStorage returns.
-
-        No road graph yet (graph=None): start_run does not route, and building the NetworkX graph
-        from road_segments is a later step.
-        """
+        """The map from Neon static.* via the API, in the same StaticMap shape LocalStorage returns,
+        including the road graph (built from road_segments, see build_graph)."""
         base = f'/map/versions/{version}'
         b = self._call('GET', base + '/buildings')['features']   # repository.bulk_map -> GeoJSON FeatureCollection
         r = self._call('GET', base + '/roads')['features']       # same, for static.road_segments
@@ -131,6 +152,7 @@ class ApiStorage:
             p = x['properties']
             roads[p['id']] = {**p, 'from_node': int(p['from_node']), 'to_node': int(p['to_node'])}
 
+        road_geoms = {x['properties']['id']: shape(x['geometry']) for x in r}
         # StaticMap (sim/storage.py) keeps properties and geometry in separate dicts, all keyed by id
         # (building id bldg_<uuid>, road id u_v_key, facility id) -- the ids shared across map, graph and DB.
         return StaticMap(
@@ -140,7 +162,8 @@ class ApiStorage:
             {x['id']: {**{k: v for k, v in x.items() if k != 'geometry'},  # facilities: id -> columns + lon/lat
                        'lon': x['geometry']['coordinates'][0], 'lat': x['geometry']['coordinates'][1]} for x in f},
             roads,                                                         # roads: id -> columns
-            {x['properties']['id']: shape(x['geometry']) for x in r})      # roads: id -> LineString
+            road_geoms,                                                    # roads: id -> LineString
+            build_graph(roads, road_geoms))                                # NetworkX graph for routing
 
     # =========================================================================
     # 4. WRITING A RUN
@@ -174,9 +197,22 @@ class ApiStorage:
         (repository.save_observation, step 2). The first observation of a run also flips the run
         from 'created' to 'running'.
         """
+        if self.defer_observations:
+            self.pending_observations.append(obs)
+            return None
         row = self._call('POST', f'/runs/{obs["run_id"]}/observations', observation_body(obs))
         self.truth_storage.save_observation(obs)   # local copy only once Neon has accepted it
         return row
+
+    def post_pending_observations(self):
+        """Send the queued reports, in release order. Returns how many were posted."""
+        self.defer_observations = False
+        n = 0
+        while self.pending_observations:
+            self.save_observation(self.pending_observations[0])
+            self.pending_observations.pop(0)   # only drop it once Neon has it, so a retry resumes here
+            n += 1
+        return n
 
     def end_run(self, run_id, status='completed', sim_time_s=None):
         """Mark the run 'completed' (or 'failed') and stamp ended_at (POST /runs/{id}/end).

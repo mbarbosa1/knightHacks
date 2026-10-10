@@ -78,28 +78,30 @@ The shorter version, without step-by-step output:
 almost no reports (seed 7 alone gives Mw 6.4 and a single report). `--end` marks the run completed,
 after which the backend refuses all writes to it, the agents' included.
 
-## Automatic: starting a simulation from the UI
+## Automatic: the map's "New earthquake" button
 
-`sim/service.py` is a small simulator service, so nobody runs commands by hand. Each request is a new
-run with a new run uuid from Neon.
+Gerard's simulator service (`sim/server.py`, from the `3DMAP` branch) stores every run in Neon when
+`BACKEND_URL` is set. Each click is a new run with a new run uuid from Neon. Three servers:
 
 ```bash
-cd backend && .venv/bin/uvicorn app.asgi:app --port 8000                                       # backend
-cd simulation && BACKEND_URL=http://127.0.0.1:8000 ../.venv/bin/uvicorn sim.service:app --port 8100   # simulator
+cd backend && .venv/bin/uvicorn app.asgi:app --port 8000                                                # backend
+cd simulation && BACKEND_URL=http://127.0.0.1:8000 ../.venv/bin/python -m uvicorn sim.server:app --port 8100   # simulator
+cd frontend && npx vite --port 5173                                                                     # website
 ```
 
-| Endpoint | What it does |
-|---|---|
-| `POST /simulations` `{"seed"?: int, "mw"?: 5.8-8.0}` | Starts a run. Returns `202` with `run_id` in ~3 s, once the run exists in Neon; reports post in the background |
-| `GET /simulations/{run_id}` | Progress: `posting` → `done` / `failed`, and how many reports are posted |
+`frontend/.env` needs `VITE_API_BASE=http://127.0.0.1:8000` (the map loads from Neon; there are no local
+map files without `simulation/data/`) and `VITE_SIM_BASE=http://127.0.0.1:8100`.
 
-In the frontend: `startSimulation({ mw: 7.3 })` from `frontend/src/api/simulator.ts`, then use the
-returned `run_id` with the backend (`GET /runs/{id}`, observations, ...). `VITE_SIMULATOR_URL` overrides
-the service URL.
+What one click does:
+1. The website sends `POST /runs {"mw": ...}` to the simulator.
+2. The simulator creates the run in `ops.simulation_runs` (Neon's uuid), computes the truth, and answers
+   in ~3 s with the truth for the map (and the stand-in dispatcher's units, routed on a road graph built
+   from Neon's `road_segments`).
+3. After answering, it posts the reports to `ops.observations` in the background (~1.5-3 min). The run
+   turns `running` on the first one. If posting fails, the run is marked `failed`.
+4. Check it: `backend/.venv/bin/python scripts/check_sim_run.py --latest`
 
-If a simulation fails after the run was created, the service marks the run `failed` in Neon instead
-of leaving it `created`. The map is downloaded once per service process and reused. Progress is kept in
-memory, so `GET /simulations/{id}` only knows runs started since the service last started.
+Without `BACKEND_URL` the simulator works as before, from local files only.
 
 ## Checking a run
 

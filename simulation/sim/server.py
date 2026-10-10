@@ -8,9 +8,14 @@
     GET  /runs/{id}/dispatch units sent by a stand-in dispatcher (sim/standin.py), for designing the map
 
 This serves hidden ground truth and has no login: keep it on localhost. Agents must never call it.
+
+With BACKEND_URL set (e.g. http://127.0.0.1:8000), the map comes from Neon through the backend and every
+new run is stored there: POST /runs creates ops.simulation_runs (the returned run_id is Neon's), answers
+right away, and the reports go to ops.observations in the background. Without it, local files as before.
 """
-import collections, random
-from fastapi import FastAPI, HTTPException
+import collections, logging, os, random
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from .api_storage import ApiStorage
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from .export import run_truth
@@ -21,6 +26,8 @@ from .standin import standin_dispatch
 from .storage import LocalStorage
 
 KEEP_RUNS = 20   # truth of the most recent runs stays in memory
+BACKEND_URL = os.environ.get('BACKEND_URL')
+log = logging.getLogger('uvicorn.error')
 
 app = FastAPI(title='Shinjuku simulator', version='0.1.0')
 app.add_middleware(CORSMiddleware, allow_origin_regex=r'http://(localhost|127\.0\.0\.1):\d+',
@@ -29,10 +36,23 @@ _state = {'storage': None, 'map': None, 'router': None, 'runs': collections.Orde
 
 
 def _map():
-    if _state['map'] is None:   # loaded on first use: about a second
-        _state['storage'] = LocalStorage()
+    if _state['map'] is None:   # loaded on first use: about a second (a few from Neon)
+        _state['storage'] = ApiStorage(BACKEND_URL) if BACKEND_URL else LocalStorage()
         _state['map'] = _state['storage'].load_static_map()
     return _state['storage'], _state['map']
+
+
+def _post_reports(storage, run_id):
+    """Background task: the run's reports into Neon. A failure marks the run failed instead of leaving it half-filled."""
+    try:
+        n = storage.post_pending_observations()
+        log.info('run %s: %d reports stored in Neon', run_id, n)
+    except Exception as e:
+        log.error('run %s: storing reports failed (%s); marking the run failed', run_id, e)
+        try:
+            storage.end_run(run_id, status='failed')
+        except Exception:
+            pass
 
 
 class NewRun(BaseModel):
@@ -46,11 +66,15 @@ def health():
 
 
 @app.post('/runs', status_code=201)
-def new_run(body: NewRun):
+def new_run(body: NewRun, background: BackgroundTasks):
     """The seed decides depth, epicentre and every damage roll; mw only overrides the magnitude."""
     storage, static_map = _map()
+    if BACKEND_URL:   # one storage per run, holding its reports until the background task sends them
+        storage = ApiStorage(BACKEND_URL, defer_observations=True)
     seed = body.seed if body.seed is not None else random.SystemRandom().randrange(1, 2**31)
     truth, sc, _ = start_run(seed, storage=storage, static_map=static_map, mw=body.mw)
+    if BACKEND_URL:
+        background.add_task(_post_reports, storage, truth.run_id)   # runs after the response is sent
     data = run_truth(truth, sc, static_map)
     _state['runs'][truth.run_id] = data
     _state['reports'][truth.run_id] = [_with_answer(item) for item in truth.reports]

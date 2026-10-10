@@ -1,6 +1,6 @@
 """Check that a simulator run landed in Neon exactly as the simulator produced it.
 
-usage (from the project root):  backend/.venv/bin/python scripts/check_sim_run.py <run_id> [--delete]
+usage (from the project root):  backend/.venv/bin/python scripts/check_sim_run.py <run_id | --latest> [--delete]
 
 Compares Neon (DATABASE_URL in backend/.env, the simulator login) with the simulator's local copy in
 simulation/runs/<run_id>/: the run row, every observation field by field, the event log, that every
@@ -23,9 +23,16 @@ def lines(path):
 
 
 ap = argparse.ArgumentParser()
-ap.add_argument('run_id')
+ap.add_argument('run_id', nargs='?')
+ap.add_argument('--latest', action='store_true', help='check the most recently started run')
 ap.add_argument('--delete', action='store_true')
 a = ap.parse_args()
+url = dotenv_values(ROOT / 'backend' / '.env').get('DATABASE_URL')
+if a.latest:
+    with psycopg.connect(url) as conn:
+        a.run_id = str(conn.execute('SELECT id FROM ops.simulation_runs ORDER BY started_at DESC LIMIT 1').fetchone()[0])
+if not a.run_id:
+    ap.error('give a run_id or --latest')
 
 local = ROOT / 'simulation' / 'runs' / a.run_id
 run_local = json.load(open(local / 'simulation_run.json'))
@@ -33,7 +40,6 @@ obs_local = {o['id']: o for o in lines(local / 'observations.jsonl')}
 links = lines(local / 'truth_links.jsonl')
 errors = []
 
-url = dotenv_values(ROOT / 'backend' / '.env').get('DATABASE_URL')
 with psycopg.connect(url, row_factory=dict_row) as conn:
     run = conn.execute('SELECT * FROM ops.simulation_runs WHERE id=%s', (a.run_id,)).fetchone()
     if run is None:

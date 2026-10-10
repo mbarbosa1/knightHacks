@@ -65,3 +65,28 @@ def test_backend_errors_are_raised_with_detail(backend, tmp_path):
     s = ApiStorage(url, truth_storage=LocalStorage(runs_dir=tmp_path))
     with pytest.raises(ApiError, match='422.*bad channel'):
         s.save_observation({**OBS, 'run_id': 'r', 'channel': 'bad'})
+
+
+def test_graph_built_from_road_segments_routes_like_the_osmnx_one():
+    from shapely.geometry import LineString
+    from sim.api_storage import build_graph
+    from sim.routing import Router
+    a, b, c = (139.700, 35.690), (139.701, 35.690), (139.701, 35.691)
+    segs = {'1_2_0': (a, b, 100.0), '2_1_0': (b, a, 100.0), '2_3_0': (b, c, 110.0), '3_2_0': (c, b, 110.0)}
+    roads = {rid: {'id': rid, 'from_node': int(rid.split('_')[0]), 'to_node': int(rid.split('_')[1]),
+                   'length_m': L, 'speed_kmh': 36.0} for rid, (_, _, L) in segs.items()}
+    G = build_graph(roads, {rid: LineString([p, q]) for rid, (p, q, _) in segs.items()})
+    assert {f'{u}_{v}_{k}' for u, v, k in G.edges(keys=True)} == set(segs)   # ids match road ids
+    assert G.nodes[3]['x'] == c[0] and G.edges[1, 2, 0]['travel_time'] == 10.0   # 100 m at 10 m/s
+    r = Router(G)
+    assert r.node((139.7009, 35.6909)) == 3 and r.is_reachable(1, 3, {})
+    assert not r.is_reachable(1, 3, {'2_3_0': 'BLOCKED'})
+
+
+def test_deferred_reports_are_sent_only_when_asked(backend, tmp_path):
+    url, calls, _ = backend
+    s = ApiStorage(url, truth_storage=LocalStorage(runs_dir=tmp_path), defer_observations=True)
+    s.save_observation({**OBS, 'run_id': 'r'})
+    assert calls == [] and len(s.pending_observations) == 1
+    assert s.post_pending_observations() == 1
+    assert calls[0][0] == '/runs/r/observations' and s.pending_observations == []
