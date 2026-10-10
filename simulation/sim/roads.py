@@ -13,6 +13,7 @@ MIN_REACH_M, MAX_REACH_M = 2.0, 20.0   # tall buildings don't topple full length
 RANK = {'OPEN': 0, 'LIMITED': 1, 'BLOCKED': 2}
 KX, KY = 111320 * math.cos(math.radians(CENTER[1])), 110570
 
+#which roads in the map are damaged
 
 def to_metres(geom):
     """Local flat projection around Shinjuku Station; fine over a 2 km box."""

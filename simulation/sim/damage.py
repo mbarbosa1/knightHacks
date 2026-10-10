@@ -11,6 +11,7 @@ SEVERE_SHARE_OF_HALF = 0.4   # 'half' (official partial damage) -> severe, else 
 LIGHT_LAMBDA_SHIFT = 0.7     # P(light or worse) = the collapse+half curve at about half the PGV (e^-0.7)
 DEBRIS_LEVELS = ('severe', 'collapsed')
 
+#each of the 5k buildings in the static map data in the neon database are getting a damage level label
 
 def level_probs(structure, era, pgv_surf):
     """P(each of the five levels). collapsed and severe+moderate match damage_model.damage_probs exactly."""
