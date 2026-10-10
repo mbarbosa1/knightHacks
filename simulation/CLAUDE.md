@@ -85,22 +85,18 @@ Agent tool functions (plain Python, called by agents):
 - Start of run: load static map -> create simulation_runs + scenarios rows -> sample eras, compute damage/roads/people -> schedule observations -> tick loop.
 - Storage interface: `save_truth_batch(rows)`, `save_observation(obs)`, `load_static_map(version)`. **Implement local-file (JSON/GeoJSON) version first**; swap to Neon/Databricks without touching sim logic.
 
-## 9. Database summary (full spec: `docs/final-database.md`)
-**Reality check (10 Oct, from Camila's `origin/database-setup` branch, commit 6a780f8):** two database designs exist.
-- **Old design, live on Neon main and dev** (`database/001`, `002` on her branch, marked "RECORD - DON'T RUN"): schema `"staticMapData"` (must be double-quoted), text ids, different ops column names (`language`, `location`, `simulation_time_s`, `road_graph_version` NOT NULL). Versus our data files it lacks buildings `height_source, floors_source, basement_floors, footprint_m2, usage_source, era, zoning, zoning_ja, facility_subtype, facility_name_en, plateau_building_id` and facilities `access_node, subtype, building_match, source, note`. It does have `era_probs`, `soil_amp`, `structure` and all road columns.
-- **Agreed design, not yet applied** (`database/schema.sql` on her branch, identical to our `sql/schema.sql`): schema `static`. Her FastAPI backend (`backend/app/repository.py`) already queries `static.*` with the agreed columns. Her `scripts/apply_schema.py` drops the old design and applies it; it had not been run when she reported the mismatch.
-- Her branch has no map data (`data/` is gitignored; README says Neon had zero map rows).
-Confirm which design is live before writing the Neon version of `sim/storage.py`. Observations should go through her API (`POST /runs`, `POST /runs/{id}/observations`), not straight into Neon.
+## 9. Database summary (full spec: `../database/final-database.md`)
+**State on 10 Oct, afternoon (from `main`'s README, not tested from here):** Neon's dev branch is on the agreed design (`../database/schema.sql`) with map version `shinjuku-v1` loaded (5,335 buildings, 1,818 roads, 13 facilities). Camila's FastAPI backend in `../backend/` is the simulator's way in: bulk GeoJSON at `GET /map/versions/{id}/buildings|roads|facilities` (every column in `properties`, road node ids as strings), `POST /runs`, `POST /runs/{id}/observations`, `PUT /runs/{id}/resources/{id}`, `PUT .../road-restrictions/{road_id}`, `POST /runs/{id}/end`. Arwa's Databricks truth tables (`knighthacks.truth.*`) exist in the team workspace; they need `event_id` on `truth_links` rows and `scenarios.params` as a JSON string, which `sim/truth.py` does not do yet.
+**The map data is not in the repo** (team convention: `data/` is gitignored; decided with Gerard 10 Oct). `simulation/data/` exists only on machines that already have it. Next step: an API-backed storage that fetches the map from the backend and caches it locally, creates the run through the API and posts observations there.
 - Neon `static` (agents read-only): map_versions, buildings, road_segments, facilities (type hospital/fire_station/police/shelter, `access_node`, capacity).
 - Neon `ops`: simulation_runs (seed, map_version_id), observations, incidents, road_restrictions (OPEN/LIMITED/BLOCKED; change triggers reroute), resources, decisions (versioned, invalidated_reason), agent_runs, notifications, operational_events (outbox).
 - Databricks (agents have no credentials): scenarios, truth_building_damage, truth_road_status, truth_people, truth_links, simulation_events, scorecards.
 - Simulator writes: ops.simulation_runs, ops.observations, ops.resources, all Databricks truth tables.
-- SQL: `sql/schema.sql` matches final-database.md (static + ops, roles `map_import` / `simulator` / `agents`; ops->static ids checked by trigger against the run's map version). Tested on local PostGIS 16. Load data with `scripts/load_static.py` (map version `shinjuku-v1`).
+- SQL: `../database/schema.sql` (static + ops, roles `map_import` / `simulator` / `agents`; ops->static ids checked by trigger against the run's map version). Data is loaded with the repo's `../scripts/load_static.py` (map version `shinjuku-v1`).
 
 ## 10. Open TODOs
-- Note (10 Oct): `scripts/plateau/`, `scripts/load_static.py` and `scripts/validate.py` were removed from the repo; `docs/PROVENANCE.md` records what they did (inference rules, era priors, validator checks). `map_id` is NOT unique, never key on it.
-- The DB teammate loads Neon by hand and does not want generated loader scripts; ignore references to the removed scripts in this file and in `README.md`.
-- [x] J-SHIS surface-soil mesh loaded (10 Oct): `data/jshis/` CSV -> `soil_amp` on all 5,335 buildings, ARV 1.29-1.64. DB teammate still has to run `load_static.py --replace`.
+- Note (10 Oct): this folder was renamed from `sim-data-package/` to `simulation/` when it was merged with `main`. `scripts/plateau/` was removed (see `docs/PROVENANCE.md`); the loader and validator now live at the repo root in `../scripts/`; the duplicate schema and design doc were removed in favour of `../database/`. `map_id` is NOT unique, never key on it.
+- [x] J-SHIS surface-soil mesh loaded (10 Oct): `data/jshis/` CSV -> `soil_amp` on all 5,335 buildings, ARV 1.29-1.64. Loaded into Neon by Camila.
 - [x] `scripts/build_road_graph.py` run (10 Oct): 844 nodes, 1,818 edges; graph ids == `road_segments.geojson` ids. 54 nodes are outside the largest strongly connected component.
 - [x] Facility `access_node` filled and verified (all 13 in the graph core). Facility `capacity` is NULL for all 13.
 - [ ] Tune fragility/era priors vs TMG 2022 Shinjuku estimate (Monte Carlo).
@@ -130,7 +126,7 @@ Paths are relative to this package (copy it into the repo as-is). Originals live
 | Package README (setup, missing pieces) | `README.md` | — |
 | Python deps | `requirements.txt` | — |
 | Project context (partly stale) | `docs/project-context.md` | `project-context.md` |
-| Final DB design | `docs/final-database.md` | `database/final-database.md` |
+| Final DB design | `../database/final-database.md` | `database/final-database.md` |
 | Simulator runtime | `docs/simulator-runtime.md` | `simulation/simulator-runtime.md` |
 | Data coverage | `docs/COVERAGE.md` | `data/plateau/COVERAGE.md` |
 | Damage formulas | `docs/REFERENCE.md` | `data/plateau/REFERENCE.md` |
@@ -140,7 +136,7 @@ Paths are relative to this package (copy it into the repo as-is). Originals live
 | Facilities (13) | `data/facilities.geojson` | `data/facilities/facilities.geojson` |
 | Bounding boxes | `data/bbox.json` | — |
 | Road graph outputs (after running the script) | `data/road_graph.graphml`, `data/road_segments.geojson`, `data/road_segments.meta.json` | — |
-| SQL schema | `sql/schema.sql` | — |
-| Static loader / validator | `scripts/load_static.py`, `scripts/validate.py` | — |
+| SQL schema | `../database/schema.sql` | — |
+| Static loader / validator | `../scripts/load_static.py`, `../scripts/validate.py` | — |
 | Road graph builder / J-SHIS soil loader | `scripts/build_road_graph.py`, `scripts/load_jshis_soil.py` | — |
 | Demo prototype (approx. roads) + demo attributes | `demo/` | `demo/`, `data/plateau/demo_building_attributes.json` |

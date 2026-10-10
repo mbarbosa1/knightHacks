@@ -1,6 +1,6 @@
 """Hidden ground truth for one run, held in memory (docs/simulator-runtime.md). Agents never read this.
 
-Every change also appends a row shaped like the Databricks truth table (docs/final-database.md) to
+Every change also appends a row shaped like the Databricks truth table (database/final-database.md) to
 pending_truth_writes; flush() hands them to storage.
 """
 import json, uuid

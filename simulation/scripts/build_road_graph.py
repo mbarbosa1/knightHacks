@@ -10,7 +10,7 @@ Writes:
     data/road_segments.meta.json   download date, osmnx version, counts
     data/facilities.geojson        access_node filled with the nearest routable graph node (updated in place)
 
-Then run scripts/load_static.py --replace to load roads into Neon.
+Then run the repo's scripts/load_static.py --replace to load roads into Neon.
 """
 import json, math, pathlib, datetime
 import networkx as nx

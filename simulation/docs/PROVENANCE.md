@@ -7,6 +7,15 @@ Everything removed is still in the original data package, `sim-data-package.zip`
 SHA-256 `094e4e8b25929bc7f97ff2739b2a91512b6d8035d0e40e18b6fdbc3e087bd00d`). That zip is not in the
 repo. Gerard has a copy; keep one somewhere the team can reach.
 
+## Update, later on 10 October 2026
+
+- This folder was renamed from `sim-data-package/` to `simulation/` when the branch was merged with `main`.
+- The map data files (`data/`) were taken out of the repo. The map now lives in Neon and is served by the
+  backend API; the team keeps data folders out of git. The files described below still exist on Gerard's
+  machine and in the original zip.
+- The database loader and validator described below are back in the repo, at the top level in `scripts/`,
+  maintained with the backend. The schema and design doc live in `database/`.
+
 ## What was removed
 
 | Removed | What it was | Why it went |

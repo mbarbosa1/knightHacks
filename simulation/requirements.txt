@@ -1,4 +1,3 @@
-psycopg[binary]>=3.1   # load_static.py
 shapely>=2.0           # build_road_graph.py
 osmnx>=1.9             # build_road_graph.py (laptop only; pulls networkx, geopandas)
 networkx>=3.0          # routing in the simulator

@@ -6,7 +6,7 @@ Download on a laptop (blocked from the build sandbox): J-SHIS Map > Download > "
 usage: python3 scripts/load_jshis_soil.py data/jshis/<file>.csv [--code-col CODE] [--arv-col ARV]
 
 Writes soil_amp (J-SHIS ARV, relative to Vs=400 m/s) into data/buildings.geojson in place, using the
-250 m mesh cell of each building's centroid. Then reload: python3 scripts/load_static.py --replace
+250 m mesh cell of each building's centroid. Then reload Neon with the repo's scripts/load_static.py --replace
 Use in the simulator as PGV_surface = PGV600 * 1.31 * soil_amp (docs/REFERENCE.md section 2).
 Not yet run against a real J-SHIS file: check the printed column names and match counts.
 """

@@ -16,9 +16,9 @@ data/
 .vscode/
 
 # simulation
-sim-data-package/runs/
-sim-data-package/cache/
+simulation/runs/
+simulation/cache/
 # reference prototype from the data package (9 MB, not used by the simulator); delete this line to track it
-sim-data-package/demo/
+simulation/demo/
 db-handoff.zip
 gemini-handoff.zip
