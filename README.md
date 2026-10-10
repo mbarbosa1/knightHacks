@@ -58,10 +58,8 @@ Run creation body after a real map has been imported:
 ```json
 {
   "map_version_id": "YOUR_IMPORTED_MAP_VERSION",
-  "road_graph_version": "YOUR_ROAD_GRAPH_VERSION",
   "seed": 42,
-  "hazard_types": ["earthquake"],
-  "simulator_version": "unity-dev"
+  "hazard_types": ["earthquake"]
 }
 ```
 
@@ -69,12 +67,12 @@ An explicitly labeled manual development observation:
 
 ```json
 {
-  "id": "test-fixture-observation-001",
+  "id": "00000000-0000-4000-8000-000000000001",
   "channel": "eyewitness_text",
   "format": "text",
   "original_text": "TEST FIXTURE: smoke reported near a building",
-  "language": "en",
-  "simulation_time_s": 10
+  "lang": "en",
+  "sim_time_s": 10
 }
 ```
 
@@ -127,8 +125,8 @@ one transaction. A source fingerprint will make map versions safe to rerun.
 After import, prove the building/facility lookup against real data. Then add
 incident updates, planning tools, decision validation/version approval, agent
 execution, and Databricks export. Observation storage currently does not
-schedule agent processing. `road_graph_version` is recorded but cannot be
-validated against a graph registry because that registry does not exist yet.
+schedule agent processing. `road_graph_version` is not stored yet: the
+simulation_runs table has no column for it.
 
 References: [Neon connection pooling](https://neon.com/docs/connect/connection-pooling),
 [Psycopg pool lifecycle](https://www.psycopg.org/psycopg3/docs/advanced/pool.html),

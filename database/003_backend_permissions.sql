@@ -4,10 +4,10 @@
 -- It must NOT be a member of neon_superuser or another privileged role.
 BEGIN;
 GRANT CONNECT ON DATABASE neondb TO knighthacks_backend;
-GRANT USAGE ON SCHEMA "staticMapData", ops, public TO knighthacks_backend;
-GRANT SELECT ON ALL TABLES IN SCHEMA "staticMapData" TO knighthacks_backend;
+GRANT USAGE ON SCHEMA static, ops, public TO knighthacks_backend;
+GRANT SELECT ON ALL TABLES IN SCHEMA static TO knighthacks_backend;
 GRANT SELECT, INSERT, UPDATE ON ops.simulation_runs, ops.observations TO knighthacks_backend;
 GRANT SELECT ON ops.incidents, ops.resources TO knighthacks_backend;
--- Required by existing event triggers (which use the caller's privileges).
+-- Lets the backend append to the outbox directly if it ever needs to.
 GRANT INSERT ON ops.operational_events TO knighthacks_backend;
 COMMIT;
