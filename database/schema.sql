@@ -225,7 +225,9 @@ CREATE TABLE IF NOT EXISTS ops.operational_events (
     table_name text NOT NULL,
     row_id     text,
     payload    jsonb,
-    created_at timestamptz NOT NULL DEFAULT now()
+    -- clock_timestamp(), not now(): now() is fixed for a whole transaction, so several
+    -- events written in one request would tie and lose their order.
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 CREATE INDEX IF NOT EXISTS operational_events_run_idx ON ops.operational_events (run_id, created_at);
 
