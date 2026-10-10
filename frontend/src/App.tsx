@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Antenna,
@@ -14,8 +14,6 @@ import {
   Filter,
   ExternalLink,
   Layers,
-  LocateFixed,
-  Map,
   MapPin,
   Maximize2,
   Menu,
@@ -39,6 +37,7 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { mockReports, type MockReport, type ReportKind } from "./data/mockReports";
+import { ShinjukuMap, type ShinjukuMapHandle } from "./map/ShinjukuMap";
 
 interface Incident {
   id: string;
@@ -124,11 +123,9 @@ function App() {
   const [selectedReportId, setSelectedReportId] = useState("R-1042");
   const [reportOpen, setReportOpen] = useState(false);
   const [playing, setPlaying] = useState(false);
-  const [terrain, setTerrain] = useState(true);
-  const [roads, setRoads] = useState(false);
   const [dispatched, setDispatched] = useState(false);
   const [utc, setUtc] = useState(new Date());
-  const [zoom, setZoom] = useState(1);
+  const mapRef = useRef<ShinjukuMapHandle>(null);
   const incident =
     incidents.find((item) => item.id === selected) ?? incidents[0];
   const selectedReport: MockReport =
@@ -333,88 +330,24 @@ function App() {
           </div>
           <section
             className="map-panel"
-            aria-label="3D simulation map placeholder"
+            aria-label="3D simulation map"
           >
-            {/* TODO: Mount a CesiumJS or MapLibre canvas in this map stage when map data is connected. */}
-            <MapIllustration zoom={zoom} />
-            <div className="map-header">
-              <div className="map-place">
-                <MapPin size={15} />
-                <div>
-                  <strong>Tokyo, Japan</strong>
-                  <small>SHINJUKU · SATELLITE · TERRAIN</small>
-                </div>
-              </div>
-              <span className="map-3d">3D</span>
-            </div>
-            <div className="map-layer-card">
-              <div className="layer-title">
-                Map layers{" "}
-                <button aria-label="Layer settings">
-                  <Settings2 size={13} />
-                </button>
-              </div>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={terrain}
-                  onChange={(event) => setTerrain(event.target.checked)}
-                />{" "}
-                <span>Terrain elevation</span>
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={roads}
-                  onChange={(event) => setRoads(event.target.checked)}
-                />{" "}
-                <span>Road graph</span>
-              </label>
-              <button className="geography-button">
-                <LocateFixed size={12} /> Use local geography
-              </button>
-            </div>
+            <ShinjukuMap ref={mapRef} />
             <div className="map-toolbar">
-              <button
-                aria-label="Zoom in"
-                onClick={() => setZoom((value) => Math.min(1.4, value + 0.1))}
-              >
+              <button aria-label="Zoom in" onClick={() => mapRef.current?.zoomIn()}>
                 <PlusIcon />
               </button>
-              <button
-                aria-label="Zoom out"
-                onClick={() => setZoom((value) => Math.max(0.8, value - 0.1))}
-              >
+              <button aria-label="Zoom out" onClick={() => mapRef.current?.zoomOut()}>
                 <Minus size={15} />
               </button>
               <span />
-              <button aria-label="Locate">
+              <button aria-label="Recentre on Shinjuku Station" onClick={() => mapRef.current?.recenter()}>
                 <Crosshair size={15} />
-              </button>
-              <button aria-label="Navigation">
-                <Navigation size={15} />
-              </button>
-              <button aria-label="Terrain">
-                <Map size={15} />
-              </button>
-              <button aria-label="Layers">
-                <Layers size={15} />
               </button>
             </div>
             <div className="map-attribution">
-              © OpenStreetMap contributors · GeoFabrik · ODbL{" "}
-              <span>10.61° N　66.84° W</span>
-            </div>
-            <div className="map-legend">
-              <span>
-                <i className="legend-critical" /> Critical
-              </span>
-              <span>
-                <i className="legend-reported" /> Reported
-              </span>
-              <span>
-                <i className="legend-clear" /> Cleared
-              </span>
+              © OpenStreetMap contributors · OpenFreeMap · Buildings: Project PLATEAU (MLIT){" "}
+              <span>35.69° N　139.70° E</span>
             </div>
           </section>
         </section>
