@@ -19,10 +19,11 @@ def start_run(seed, storage=None, static_map=None, scenario=None, map_version='s
     storage = storage or LocalStorage()
     static_map = static_map or storage.load_static_map(map_version)
     sc = scenario or random_scenario(seed, mw=mw)
-    run_id, now = str(uuid.uuid4()), datetime.datetime.now(datetime.timezone.utc).isoformat()
-    storage.save_run({'id': run_id, 'map_version_id': static_map.version, 'seed': sc.seed,
-                      'hazard_types': list(sc.hazard_types), 'status': 'running',
-                      'started_at': now, 'ended_at': None})
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    # The storage may assign its own id (Neon does); everything after this uses the one it returns.
+    run_id = storage.save_run({'id': str(uuid.uuid4()), 'map_version_id': static_map.version, 'seed': sc.seed,
+                               'hazard_types': list(sc.hazard_types), 'status': 'running',
+                               'started_at': now, 'ended_at': None})
     truth = TruthState(run_id)
     truth.set_scenario({'seed': sc.seed, 'hazard_types': list(sc.hazard_types), 'params': sc.params(),
                         'map_version_id': static_map.version, 'simulator_version': SIMULATOR_VERSION,
@@ -32,7 +33,8 @@ def start_run(seed, storage=None, static_map=None, scenario=None, map_version='s
     compute_people(static_map, sc, truth)
     # Until the live loop exists, every report is released at once, stamped with the time it would arrive.
     start = datetime.datetime.fromisoformat(now)
-    for item in generate_reports(static_map, sc, truth):
+    truth.reports = generate_reports(static_map, sc, truth)
+    for item in truth.reports:
         obs = item['observation']
         storage.save_observation({**obs, 'received_at': (start + datetime.timedelta(seconds=obs['sim_time_s'])).isoformat()})
         for link in item['links']:
@@ -46,8 +48,16 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--seed', type=int, required=True)
     ap.add_argument('--mw', type=float, help='fix the magnitude instead of drawing it from the seed')
+    ap.add_argument('--api', help='backend URL (e.g. http://127.0.0.1:8000): read the map from Neon and write the run there')
+    ap.add_argument('--end', action='store_true', help='mark the run completed afterwards (no more writes, agents included)')
     a = ap.parse_args()
-    truth, sc, _ = start_run(a.seed, mw=a.mw)
+    storage = None
+    if a.api:
+        from .api_storage import ApiStorage
+        storage = ApiStorage(a.api)
+    truth, sc, _ = start_run(a.seed, storage=storage, mw=a.mw)
+    if a.end:
+        (storage or LocalStorage()).end_run(truth.run_id)
     i = [d['intensity'] for d in truth.building_damage.values()]
     print(f'run {truth.run_id}  seed {sc.seed}  {sc.params()}')
     print(f'Intensity {shindo_class(min(i))} to {shindo_class(max(i))} (Japan scale), {min(i)}-{max(i)}')

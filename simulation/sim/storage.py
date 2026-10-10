@@ -3,7 +3,7 @@
 Simulation code only calls load_static_map / save_run / save_truth_batch / save_observation, so the
 Neon + Databricks implementation can replace LocalStorage without touching it.
 """
-import json, pathlib
+import datetime, json, pathlib
 from dataclasses import dataclass, field
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -59,10 +59,17 @@ class LocalStorage:
                 fh.write(json.dumps(row, ensure_ascii=False) + '\n')
 
     def save_run(self, run):
-        """ops.simulation_runs row; rewritten on status change."""
+        """ops.simulation_runs row; rewritten on status change. Returns the run id (ApiStorage gets it from Neon)."""
         d = self.runs_dir / str(run['id'])
         d.mkdir(parents=True, exist_ok=True)
         json.dump(run, open(d / 'simulation_run.json', 'w'), indent=1)
+        return run['id']
+
+    def end_run(self, run_id, status='completed', sim_time_s=None):
+        run = json.load(open(self.runs_dir / str(run_id) / 'simulation_run.json'))
+        run.update(status=status, ended_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+        self.save_run(run)
+        return run
 
     def save_truth_batch(self, rows):
         """Rows carry 'table' (Databricks table name); one file per table. Dedupes on event_id like Databricks."""

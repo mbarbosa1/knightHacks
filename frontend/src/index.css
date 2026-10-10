@@ -2263,3 +2263,194 @@ detail-tags span {
     color: #a90d27;
     font-size: 10px;
 }
+
+/* ---- 3D map (src/map/ShinjukuMap.tsx) ---- */
+.map-canvas {
+    position: absolute;
+    inset: 0;
+}
+
+.map-bar {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    right: 56px;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 8px 10px;
+    background: #ffffffed;
+    border: 1px solid #d7dfe3;
+    border-radius: 6px;
+    box-shadow: 0 4px 14px #18212b12;
+    font: 12.5px/1.5 "DM Mono", monospace;
+    color: var(--text-secondary);
+}
+
+.map-bar-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px 14px;
+}
+
+.map-view-switch {
+    display: flex;
+    border: 1px solid #d7dfe3;
+    border-radius: 5px;
+    overflow: hidden;
+}
+
+.map-view-switch button {
+    border: 0;
+    background: transparent;
+    padding: 7px 12px;
+    font: 500 12.5px "DM Mono", monospace;
+    color: var(--text-secondary);
+    cursor: pointer;
+}
+
+.map-view-switch button.active {
+    background: var(--accent);
+    color: #ffffff;
+}
+
+.map-quake {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.map-quake input[type="range"] {
+    width: 140px;
+    accent-color: var(--accent);
+}
+
+.map-quake-random {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.map-quake-random input {
+    accent-color: var(--accent);
+}
+
+.map-quake button {
+    border: 0;
+    border-radius: 4px;
+    padding: 7px 12px;
+    background: var(--accent);
+    color: #ffffff;
+    font: 600 12.5px "DM Mono", monospace;
+    cursor: pointer;
+}
+
+.map-quake button.map-quake-reset {
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid #d7dfe3;
+}
+
+.map-quake button:disabled,
+.map-quake input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.map-status b {
+    color: var(--text-primary);
+}
+
+.map-status-error {
+    color: var(--accent-dark);
+}
+
+.map-facility {
+    /* No `position` here: MapLibre positions the marker element itself (absolute), and overriding
+       that leaves the pins stranded away from their buildings when the map moves. */
+    display: flex;
+    align-items: center;
+    cursor: default;
+    outline: none;
+}
+
+.map-facility b {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 19px;
+    height: 19px;
+    border-radius: 50%;
+    border: 2px solid #ffffff;
+    background: var(--facility);
+    color: #ffffff;
+    font: 600 10px "DM Mono", monospace;
+    box-shadow: 0 1px 4px #18212b55;
+}
+
+.map-facility span {
+    display: none;
+    position: absolute;
+    left: 25px;
+    padding: 3px 8px;
+    background: #ffffffee;
+    border: 1px solid var(--facility);
+    border-radius: 9px;
+    font: 500 12px "DM Mono", monospace;
+    color: var(--text-primary);
+    white-space: nowrap;
+}
+
+.map-facility:hover,
+.map-facility:focus-visible {
+    z-index: 5;
+}
+
+.map-facility:hover span,
+.map-facility:focus-visible span {
+    display: block;
+}
+
+.map-facility:focus-visible b {
+    box-shadow: 0 0 0 2px var(--facility);
+}
+
+.map-legend i.legend-facility {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    color: #ffffff;
+    font: 600 8px/12px "DM Mono", monospace;
+    font-style: normal;
+    text-align: center;
+}
+
+.map-tip .maplibregl-popup-content {
+    padding: 8px 10px;
+    font: 12.5px/1.5 "DM Mono", monospace;
+    color: var(--text-primary);
+    border-radius: 5px;
+    text-transform: none;
+}
+
+.map-legend.damage-legend {
+    bottom: 30px;
+    gap: 6px 12px;
+    padding: 7px 10px;
+    font-size: 10.5px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    max-width: 70%;
+}
+
+.map-legend.damage-legend i {
+    width: 9px;
+    height: 9px;
+}
+
+.map-panel .map-attribution {
+    font-size: 9px;
+}
