@@ -5,6 +5,8 @@
 import argparse, collections, datetime, uuid
 from .damage import compute_building_damage
 from .damage_model import shindo_class
+from .people import compute_people
+from .reports import generate_reports
 from .roads import compute_road_damage
 from .scenario import random_scenario
 from .storage import LocalStorage
@@ -27,6 +29,15 @@ def start_run(seed, storage=None, static_map=None, scenario=None, map_version='s
                         'started_at': now, 'ended_at': None})
     compute_building_damage(static_map, sc, truth)
     compute_road_damage(static_map, truth)
+    compute_people(static_map, sc, truth)
+    # Until the live loop exists, every report is released at once, stamped with the time it would arrive.
+    start = datetime.datetime.fromisoformat(now)
+    for item in generate_reports(static_map, sc, truth):
+        obs = item['observation']
+        storage.save_observation({**obs, 'received_at': (start + datetime.timedelta(seconds=obs['sim_time_s'])).isoformat()})
+        for link in item['links']:
+            truth.add_link(obs['id'], link['match_type'], link['truth_entity_type'], link['truth_entity_id'],
+                           link['truth_simulation_time_s'])
     truth.flush(storage)
     return truth, sc, static_map
 
@@ -42,3 +53,9 @@ if __name__ == '__main__':
     print(f'Intensity {shindo_class(min(i))} to {shindo_class(max(i))} (Japan scale), {min(i)}-{max(i)}')
     print(dict(collections.Counter(d['damage_level'] for d in truth.building_damage.values())))
     print('roads', dict(collections.Counter(r['status'] for r in truth.road_status.values())))
+    people = collections.Counter()
+    for g in truth.people.values():
+        people[g['condition']] += g['count']
+    print('people', dict(people))
+    print('reports', len({l['observation_id'] for l in truth.truth_links}),
+          dict(collections.Counter(l['match_type'] for l in truth.truth_links)))

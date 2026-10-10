@@ -22,6 +22,7 @@ class Scenario:
     epicenter_lat: float
     fault_type: str = 'crustal'
     pgv_log10_offset: float = 0.0   # one draw per scenario, added to log10 PGV600 everywhere
+    local_time: str = 'weekday 12:00'   # fixed for the demo; sets who is in which building (people.py)
     hazard_types: tuple = ('earthquake',)
 
     def params(self):
