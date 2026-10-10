@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  Activity,
   AlertTriangle,
   Antenna,
   ArrowDownRight,
@@ -13,6 +12,7 @@ import {
   Clock3,
   Crosshair,
   Filter,
+  ExternalLink,
   Layers,
   LocateFixed,
   Map,
@@ -34,14 +34,12 @@ import {
   Users,
   Volume2,
   Waves,
-  Wind,
   X,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
+import { mockReports, type MockReport, type ReportKind } from "./data/mockReports";
 
-type ReportKind = "Social" | "Drone" | "Radio";
-type ReportStatus = "Processed" | "Replay";
 interface Incident {
   id: string;
   title: string;
@@ -49,16 +47,6 @@ interface Incident {
   severity: "Critical" | "High" | "Moderate";
   tags: string[];
   verified: boolean;
-}
-interface Report {
-  id: string;
-  kind: ReportKind;
-  time: string;
-  status: ReportStatus;
-  text: string;
-  location: string;
-  verified: boolean;
-  incidentId: string;
 }
 interface Dispatch {
   id: string;
@@ -96,53 +84,11 @@ const incidents: Incident[] = [
   },
 ];
 
-// Mock API-shaped data: these models can be mapped directly to FastAPI / Neon records.
-const reports: Report[] = [
-  {
-    id: "R-1042",
-    kind: "Social",
-    time: "10:03",
-    status: "Processed",
-    text: "“Someone said children may be trapped at Shinjuku Mayor's Office. I didn’t see it myself.”",
-    location: "Colegio Tanagueranas",
-    verified: true,
-    incidentId: "INC-042",
-  },
-  {
-    id: "R-1041",
-    kind: "Drone",
-    time: "10:02",
-    status: "Processed",
-    text: "“Drone scan: confirmed multiple. Reported count: 6. Structure: severe collapse. Access: limited.”",
-    location: "Residencias Caribe A",
-    verified: true,
-    incidentId: "INC-038",
-  },
-  {
-    id: "R-1040",
-    kind: "Radio",
-    time: "10:00",
-    status: "Replay",
-    text: "“Command, Rescue Team Alpha: partial collapse at Residencias Caribe. Avenida Principal is blocked.”",
-    location: "Avenida Principal",
-    verified: false,
-    incidentId: "INC-038",
-  },
-  {
-    id: "R-1039",
-    kind: "Social",
-    time: "09:58",
-    status: "Processed",
-    text: "“Road is clear up to the plaza. Debris is covering the north entrance.”",
-    location: "Plaza Bolívar",
-    verified: false,
-    incidentId: "INC-031",
-  },
-];
+const reports = mockReports;
 const dispatches: Dispatch[] = [
   {
     id: "D-01",
-    team: "Rescue Team Alpha",
+    team: "Rescue Fire Department",
     state: "En route",
     destination: "Residencias Caribe",
     eta: "0:16",
@@ -150,7 +96,7 @@ const dispatches: Dispatch[] = [
   },
   {
     id: "D-02",
-    team: "Rescue Team Bravo",
+    team: "Rescue Medical Team",
     state: "Available",
     destination: "Colegio Tanagueranas",
     eta: "—",
@@ -158,27 +104,25 @@ const dispatches: Dispatch[] = [
   },
   {
     id: "D-03",
-    team: "Rescue Team Charlie",
+    team: "Rescue Police Department",
     state: "Available",
     destination: "Standby · Sector 4",
     eta: "—",
     color: "green",
   },
 ];
-const eventSteps = [
-  "Social report arrives · building turns yellow",
-  "Belief opens an uncertain worksite · Search launches a drone",
-  "Radio corroborates · Save dispatches a rescue team",
-  "Later social reports add more yellow targets",
-  "Drone scans resolve buildings red or green",
-  "Rumoured site cleared by a negative scan",
-  "Limited road segments show yellow",
+const routeUpdates = [
+  { label: "Current route", title: "Rescue Fire Department → Residencias Caribe", meta: "En route · ETA 16 min", status: "ACTIVE" },
+  { label: "Expected next", title: "Recalculate after road status update", meta: "Uses live unit position and road conditions", status: "NEXT" },
+  { label: "Fallback route", title: "Alternate path retained", meta: "Ready if the primary route is blocked", status: "READY" },
 ];
 
 function App() {
   const [filter, setFilter] = useState<"All" | ReportKind>("All");
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState("INC-042");
+  const [selectedReportId, setSelectedReportId] = useState("R-1042");
+  const [reportOpen, setReportOpen] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [terrain, setTerrain] = useState(true);
   const [roads, setRoads] = useState(false);
@@ -187,6 +131,8 @@ function App() {
   const [zoom, setZoom] = useState(1);
   const incident =
     incidents.find((item) => item.id === selected) ?? incidents[0];
+  const selectedReport: MockReport =
+    reports.find((report) => report.id === selectedReportId) ?? reports[0];
   const visibleReports = useMemo(
     () =>
       reports.filter(
@@ -279,7 +225,7 @@ function App() {
             </span>
           </div>
           <div className="filter-row">
-            {(["All", "Radio", "Social", "Drone"] as const).map((item) => (
+            {(["All", "Radio", "Social"] as const).map((item) => (
               <button
                 key={item}
                 className={`filter-pill ${filter === item ? "active" : ""}`}
@@ -320,14 +266,15 @@ function App() {
               <button
                 key={report.id}
                 className={`report-card ${selected === report.incidentId ? "selected" : ""} ${report.kind.toLowerCase()}`}
-                onClick={() => setSelected(report.incidentId)}
+                onClick={() => {
+                  setSelected(report.incidentId);
+                  setSelectedReportId(report.id);
+                }}
               >
                 <div className="report-top">
                   <div className="report-type">
                     {report.kind === "Social" ? (
                       <Square size={13} />
-                    ) : report.kind === "Drone" ? (
-                      <Wind size={14} />
                     ) : (
                       <Radio size={13} />
                     )}
@@ -470,111 +417,31 @@ function App() {
               </span>
             </div>
           </section>
-          <section className="drone-panel panel">
-            <div className="drone-header">
-              <div className="panel-heading">
-                <div>
-                  <Wind size={14} />
-                  <span>DRONE PROGRESS</span>
-                </div>
-                <CircleHelp size={14} className="muted-icon" />
-              </div>
-              <span className="mini-live">
-                <i /> LIVE
-              </span>
-            </div>
-            <div className="drone-units">
-              <div className="unit">
-                <div className="unit-heading">
-                  <strong>Drone Unit 1</strong>
-                  <span className="state-enroute">En route</span>
-                </div>
-                <span className="unit-destination">Shinjuku Mayor's Office</span>
-                <div className="progress-track">
-                  <i />
-                </div>
-                <div className="unit-foot">
-                  <span>ETA 1:37</span>
-                  <span>72% battery</span>
-                </div>
-              </div>
-              <div className="unit">
-                <div className="unit-heading">
-                  <strong>Drone Unit 2</strong>
-                  <span className="state-ready">Ready to fly</span>
-                </div>
-                <span className="unit-destination">
-                  Available for a search task
-                </span>
-                <div className="progress-track idle">
-                  <i />
-                </div>
-                <div className="unit-foot">
-                  <span>Ready to fly</span>
-                  <span>94% battery</span>
-                </div>
-              </div>
-            </div>
-            <div className="drone-footer">
-              <span className="flying">
-                <i /> FLYING
-              </span>
-              <span>
-                1 drone mission running · 2 worksites in canonical belief.
-              </span>
-              <button>
-                View mission <ChevronRight size={12} />
-              </button>
-            </div>
-          </section>
         </section>
 
         <aside className="right-column">
           <section className="panel progress-panel">
             <div className="panel-heading">
               <div>
-                <Activity size={14} />
-                <span>DEMO PROGRESS</span>
+                <Navigation size={14} />
+                <span>ROUTE STATUS</span>
               </div>
-              <span className="observed">6/8 OBSERVED</span>
+              <span className="observed">LIVE</span>
             </div>
-            <ol className="timeline">
-              {eventSteps.map((step, index) => (
-                <li
-                  key={step}
-                  className={index < 3 ? "done" : index === 3 ? "current" : ""}
-                >
-                  <span className="timeline-dot" />
-                  <span>
-                    {index + 1}. {step}
-                  </span>
-                </li>
+            <div className="route-status-list">
+              {routeUpdates.map((route) => (
+                <div className="route-status-item" key={route.label}>
+                  <div className="route-status-top">
+                    <span>{route.label}</span>
+                    <b>{route.status}</b>
+                  </div>
+                  <strong>{route.title}</strong>
+                  <small>{route.meta}</small>
+                </div>
               ))}
-            </ol>
-            <div className="map-summary">
-              <strong>BUILDINGS</strong>
-              <span>
-                <i className="orange" /> 1 reported
-              </span>
-              <span>
-                <i className="red" /> 1 people
-              </span>
-              <span>
-                <i className="green" /> 0 clear
-              </span>
-            </div>
-            <div className="map-summary roads-summary">
-              <strong>ROADS</strong>
-              <span>
-                <i className="yellow" /> 2 limited
-              </span>
-              <span>
-                <i className="red" /> 1 blocked
-              </span>
             </div>
             <p className="canonical-note">
-              Canonical belief state version 9 · colours follow drone findings,
-              not a safety clearance.
+              Route plans use the current road state and may change when conditions update.
             </p>
           </section>
           <section className="panel details-panel">
@@ -587,7 +454,7 @@ function App() {
             </div>
             <div className="detail-source">
               <span>
-                <Wind size={12} /> DRONE REPORT
+                <Radio size={12} /> {reports.find((report) => report.incidentId === incident.id)?.kind.toUpperCase() ?? "INCIDENT REPORT"}
               </span>
               <span className="unverified">
                 {incident.verified ? "VERIFIED" : "UNVERIFIED"}
@@ -611,6 +478,13 @@ function App() {
               </span>
               <ChevronRight size={13} />
             </div>
+            <button
+              className="open-report-button"
+              onClick={() => setReportOpen(true)}
+            >
+              <ExternalLink size={13} /> Open full report
+              <ChevronRight size={13} />
+            </button>
           </section>
           <section className="panel dispatch-panel">
             <div className="dispatch-heading">
@@ -675,6 +549,52 @@ function App() {
           </section>
         </aside>
       </main>
+      {reportOpen && (
+        <div
+          className="report-modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setReportOpen(false);
+          }}
+        >
+          <section
+            className="report-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="report-modal-title"
+          >
+            <div className="report-modal-header">
+              <div>
+                <span className="report-modal-kicker">{selectedReport.kind} report</span>
+                <h2 id="report-modal-title">Report {selectedReport.id}</h2>
+              </div>
+              <button
+                className="report-modal-close"
+                aria-label="Close report"
+                onClick={() => setReportOpen(false)}
+              >
+                <X size={17} />
+              </button>
+            </div>
+            <div className="report-modal-meta">
+              <span><Clock3 size={13} /> {selectedReport.time} UTC</span>
+              <span><MapPin size={13} /> {selectedReport.location}</span>
+              <span className={`tiny-state ${selectedReport.status.toLowerCase()}`}>
+                {selectedReport.status}
+              </span>
+            </div>
+            <blockquote className="report-full-text">“{selectedReport.text}”</blockquote>
+            <div className="report-modal-incident">
+              <span>Linked incident</span>
+              <strong>{incident.id} · {incident.title}</strong>
+              <small>{incident.address}</small>
+            </div>
+            <div className="report-modal-footer">
+              <span>{selectedReport.verified ? "Source marked verified" : "Awaiting source confirmation"}</span>
+              <button onClick={() => setReportOpen(false)}>Done</button>
+            </div>
+          </section>
+        </div>
+      )}
       <footer className="app-footer">
         <div>
           <Waves size={13} />
@@ -796,10 +716,7 @@ function MapIllustration({ zoom }: { zoom: number }) {
         </div>
         <div className="map-pin pin-team">
           <MapPin size={19} fill="currentColor" />
-          <span>RESCUE TEAM ALPHA</span>
-        </div>
-        <div className="drone-cluster">
-          ✣<i>✣</i>
+          <span>RESCUE FIRE DEPARTMENT</span>
         </div>
         <div className="map-label label-main">AVENIDA PRINCIPAL DE CARIBE</div>
         <div className="map-label label-old">OLD PLAZA</div>
