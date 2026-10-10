@@ -21,6 +21,46 @@ def run():
     return m, sc, t, generate_reports(m, sc, t)
 
 
+def test_truth_rows_match_the_databricks_tables(run, tmp_path):
+    """Column names per table in databricks/tables.sql; NOT NULL ones must be filled."""
+    import json
+    tables = {
+        'scenarios': ({'id', 'seed', 'hazard_types', 'params', 'map_version_id', 'simulator_version', 'started_at', 'ended_at'}, {'id'}),
+        'truth_building_damage': ({'event_id', 'scenario_id', 'building_id', 'intensity', 'damage_level', 'simulation_time_s',
+                                   'sampled_attributes'}, {'event_id', 'scenario_id', 'building_id', 'damage_level'}),
+        'truth_road_status': ({'event_id', 'scenario_id', 'road_id', 'status', 'cause', 'simulation_time_s'},
+                              {'event_id', 'scenario_id', 'road_id'}),
+        'truth_people': ({'event_id', 'id', 'scenario_id', 'building_id', 'count', 'condition', 'mobility', 'language',
+                          'simulation_time_s'}, {'event_id', 'id', 'scenario_id'}),
+        'truth_links': ({'event_id', 'scenario_id', 'observation_id', 'truth_entity_type', 'truth_entity_id',
+                         'truth_simulation_time_s', 'match_type'}, {'event_id', 'scenario_id', 'observation_id'}),
+    }
+    m, sc, t, reports = run
+    fresh = TruthState(t.run_id)
+    fresh.set_scenario({'seed': sc.seed, 'hazard_types': list(sc.hazard_types), 'params': sc.params(), 'map_version_id': m.version,
+                        'simulator_version': 'test', 'started_at': '2026-10-10T00:00:00+00:00', 'ended_at': None})
+    compute_building_damage(m, sc, fresh); compute_road_damage(m, fresh); compute_people(m, sc, fresh)
+    for r in reports[:50]:
+        for l in r['links']:
+            fresh.add_link(r['observation']['id'], l['match_type'], l['truth_entity_type'], l['truth_entity_id'], l['truth_simulation_time_s'])
+    seen, event_ids = set(), []
+    for row in fresh.pending_truth_writes:
+        cols, required = tables[row['table']]
+        assert set(row) - {'table'} == cols, row['table']
+        assert all(row[c] is not None for c in required), row['table']
+        seen.add(row['table'])
+        if 'event_id' in row:
+            event_ids.append(row['event_id'])
+    assert seen == set(tables) and len(event_ids) == len(set(event_ids))
+    scenario = next(r for r in fresh.pending_truth_writes if r['table'] == 'scenarios')
+    assert isinstance(scenario['params'], str) and json.loads(scenario['params'])['mw'] == sc.mw
+    # a retried batch must not double count links any more than the other tables
+    st = LocalStorage(runs_dir=tmp_path)
+    rows = list(fresh.pending_truth_writes)
+    st.save_truth_batch(rows); st.save_truth_batch(rows)
+    assert sum(1 for _ in open(tmp_path / t.run_id / 'truth_links.jsonl')) == sum(r['table'] == 'truth_links' for r in rows)
+
+
 def test_same_seed_same_reports(run):
     m, sc, t, reports = run
     assert generate_reports(m, sc, t) == reports
