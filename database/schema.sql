@@ -1,5 +1,6 @@
 -- Neon Postgres + PostGIS schema, matching database/final-database.md (v1).
--- Run once as the database owner:  psql "$DATABASE_URL" -f database/schema.sql
+-- Run as the database owner:  backend/.venv/bin/python scripts/apply_schema.py
+-- (uses MIGRATION_DATABASE_URL), or paste into the Neon SQL Editor.
 -- Safe to re-run: everything is IF NOT EXISTS / idempotent.
 
 CREATE EXTENSION IF NOT EXISTS postgis;

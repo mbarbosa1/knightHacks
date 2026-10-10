@@ -15,10 +15,9 @@ python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `backend/.env` with a pooled connection for a restricted backend role and
-a direct owner/migration connection for the **same development branch**. The
-API only reads `DATABASE_URL`; it never uses the migration credentials. Neon
-project: `soft-mountain-91298548`, database: `neondb`.
+Edit `backend/.env` with one connection string per login, all for the **same
+development branch** (see [Database logins](#database-logins)). Neon project:
+`soft-mountain-91298548`, database: `neondb`.
 
 The existing `dev` branch is `br-royal-flower-b4y1ucfi`. It expires October 11,
 2026 at 5:22 AM Eastern. Extend its lifetime in Neon or select a longer-lived
@@ -78,25 +77,37 @@ An explicitly labeled manual development observation:
 }
 ```
 
-## Database baseline and permissions
+## Database logins
 
-`database/001` and `002` preserve the initial schema scripts from the project.
-The tables and event triggers already exist on main and dev. **Do not replay
-these scripts on those branches.** They are historical baseline files, not
-startup tasks. There is no automatic migration runner yet.
+`database/schema.sql` is the agreed design (`database/final-database.md`). It
+creates the `static` and `ops` schemas, the tables, and three login roles with
+their grants. Each program has its own login and its own variable in
+`backend/.env`:
 
-`database/003_backend_permissions.sql` contains grants for this starter's
-endpoints. It has not been applied. Provision a plain LOGIN role named
-`knighthacks_backend` with a password through secure administrative tooling
-first. Ensure it has no privileged role memberships, ownership, schema CREATE
-rights, or additional grants. Role creation through Neon management tools can
-give broader access; inspect memberships before using such a role in the API.
-Apply the grants using the direct owner connection on your dev branch.
+| Variable | Role | Read by |
+|---|---|---|
+| `DATABASE_URL` | `simulator` | the FastAPI backend |
+| `MIGRATION_DATABASE_URL` | `neondb_owner` | `scripts/apply_schema.py` |
+| `MAP_IMPORT_DATABASE_URL` | `map_import` | `scripts/load_static.py` |
 
-The API role reads static map tables, writes runs/observations, reads
-incidents/resources, and inserts trigger-generated operational events. It
-cannot be treated as restricted until its effective privileges are checked.
-Importer and simulator/export roles remain separate future setup work.
+The `agents` role is for the agent code, which keeps its own connection string.
+Never put the owner login in `DATABASE_URL`.
+
+The roles are created without passwords, and Neon's "Reset password" does not
+work for roles created by SQL. Set each one in the Neon SQL Editor, as the
+owner, on the same branch, when a program first needs it:
+
+```sql
+ALTER ROLE simulator WITH PASSWORD '<long random password>';
+```
+
+Generate passwords with `python3 -c "import secrets; print(secrets.token_hex(24))"`
+and use a different one per role.
+
+To rebuild the schema on a dev branch, run
+`backend/.venv/bin/python scripts/apply_schema.py`. It drops `ops` (all run
+data) and re-applies `schema.sql` in one transaction; `static` tables and role
+passwords are kept, and the grants are re-applied.
 
 ## Verification
 
