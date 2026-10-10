@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+sim-data-package/runs/
+.pytest_cache/
+db-handoff.zip
+# reference prototype from the data package (9 MB, not used by the simulator); delete this line to track it
+sim-data-package/demo/
+sim-data-package/cache/

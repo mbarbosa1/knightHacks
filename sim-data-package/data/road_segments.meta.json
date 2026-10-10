@@ -1,0 +1,15 @@
+{
+  "osm_version": "OpenStreetMap via Overpass, downloaded 2026-10-10",
+  "osmnx_version": "2.1.1",
+  "network_type": "drive",
+  "bbox": {
+    "west": 139.69278,
+    "south": 35.68522,
+    "east": 139.713964,
+    "north": 35.703158
+  },
+  "nodes": 844,
+  "edges": 1818,
+  "largest_scc_nodes": 790,
+  "edge_id_format": "<u>_<v>_<key>"
+}
