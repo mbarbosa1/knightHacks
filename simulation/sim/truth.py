@@ -26,6 +26,8 @@ class TruthState:
         self.pending_truth_writes.append(row)
 
     def set_scenario(self, row):
+        """scenarios has no event_id (one row per run, keyed by id); params is stored as JSON text."""
+        row = {**row, 'params': json.dumps(row['params'])} if isinstance(row.get('params'), dict) else row
         self._queue('scenarios', {'id': self.run_id, **row}, event_id=False)
         self.pending_truth_writes[-1].pop('scenario_id')
 
@@ -58,7 +60,7 @@ class TruthState:
         link = {'observation_id': str(observation_id), 'truth_entity_type': entity_type,
                 'truth_entity_id': entity_id, 'truth_simulation_time_s': truth_time_s, 'match_type': match_type}
         self.truth_links.append(link)
-        self._queue('truth_links', link, event_id=False)
+        self._queue('truth_links', link)   # event_id: every truth table dedupes on it (databricks/tables.sql)
 
     def flush(self, storage):
         """Hand pending rows to storage; keep them if the write fails so the next flush retries."""
