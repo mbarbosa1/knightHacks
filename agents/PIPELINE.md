@@ -1,70 +1,111 @@
 # Agent pipeline: agents → orchestrator → llm.py
 
 ```
-run_pipeline(raw_input)                         orchestrator.py
+orchestrator.py   Orchestrator(run_id).cycle()  /  --watch
    │
-   ├─► run_agent("in-agent", handoff)     ─┐
-   ├─► run_agent("detect-agent", handoff)  ├──► llm.chat(messages, tools) ──► Qwen server
-   └─► run_agent("route-agent", handoff)  ─┘        llm.py                     (SSH tunnel)
+   ├─ stage 1  InAgent.process(report)            one per new report, 6 in parallel
+   │              └─► llm.ask_json(...)           one model call, no tool loop
+   │
+   └─ stage 2  detect ‖ medical ‖ verify          same batch of 5 records, in parallel
+                  └─► llm.run_agent(...)          tool loop: model ⇄ agents/tools.py
+                                                        │
+                                       httpx POST /chat/completions
+                                                        ▼
+                         localhost:8001 ══ SSH tunnel ══► GPU box :8000 (Qwen3-VL-8B)
 ```
 
-An agent is not code that calls the orchestrator. An agent is just **a prompt file plus a
-list of tool functions**. The orchestrator runs each agent and does all the calling; the
-agent's only "actions" are the tool calls the model asks for.
+The orchestrator does no AI work. It decides which agent runs when and passes each one's
+output to the next. An agent is **an instructions `.md` file + a list of tool names**; the
+only Python agent is `in_agent.py`, because its tools are called by code, not by the model.
 
-## 1. What each agent gives the orchestrator
+## Ports
 
-| Agent | System prompt | Tools | Status |
+| Port | Where | What |
+|---|---|---|
+| **8000** | GPU box | the Qwen model server (`transformers serve`). Stays on 8000. |
+| 8001 | your laptop | local end of the SSH tunnel → GPU box :8000. `llm.py` calls this. |
+| 8000 | your laptop | the backend API from `./dev.sh`. `tools.py` reads runs and reports here. |
+
+Open the tunnel before running any agent:
+
+```bash
+ssh -N -o ServerAliveInterval=30 -L 8001:localhost:8000 root@36.150.116.206 -p 36756
+```
+
+The two 8000s don't clash: one is on the GPU box, the other on your laptop. Pointing
+`LLM_BASE_URL` at `localhost:8000` would send model requests to the backend instead.
+
+## 1. How each agent plugs into the orchestrator
+
+| Agent | Instructions | Tools | How it runs |
 |---|---|---|---|
-| in-agent | `assesmentAgent/in-agent.md` | its own list (TBD) | prompt empty |
-| detect-agent | `assesmentAgent/detect-agent/detect-agent.md` | every function in `detect_tools.py` | written |
-| route-agent | `responseAgent/route-agent.md` | its own list (TBD) | prompt empty |
+| in_agent | `assesmentAgent/in-agent.md` | `find_nearby_buildings`, `find_nearest_road` (called by `in_agent.py`) | `InAgent.process(obs)` → `ask_json` |
+| detect_agent | `assesmentAgent/detect-agent.md` | read + `upsert_incident`, `set_road_restriction`, `log_agent_run` | `run_agent` |
+| medical_agent | `assesmentAgent/medical-agent.md` | read + `upsert_incident`, `log_agent_run` | `run_agent` |
+| verify_agent | `assesmentAgent/verify-agent.md` | read + `find_nearby_buildings`, `upsert_incident`, `log_agent_run` | `run_agent` |
 
-Rules every agent's tools follow, so the orchestrator can treat them all the same:
+The tool lists live in `ASSESSMENT_AGENTS` in `orchestrator.py`. An agent takes part once its
+`.md` exists at that path; until then it's skipped, so agents can be added one at a time.
+Try a draft without moving it: `--instructions detect_agent=/path/to/detect-agent.md`.
 
-- Signature starts with `(connection, run_id, ...)`. The orchestrator fills both in with
-  `functools.partial`, so the model only supplies the rest (`lon`, `lat`, `radius_m`, ...)
-  and can't reach another run.
-- Return plain dicts/lists (UUIDs and datetimes are fine; they're serialized with `default=str`).
-- The agent's final answer is **JSON in the message content**, and it becomes the next
-  agent's handoff (e.g. detect-agent returns `run_id`, `cursor`, `situation_summary`,
-  `incidents`, `road_restrictions`).
-- On failure the output carries `"error": "neon_unavailable"` or `"llm_unavailable"`.
+What an agent's `.md` can rely on:
 
-## 2. What the orchestrator does for one agent (`run_agent`)
+- **Input:** `{"run_id", "observation_ids", "cursor", "normalized": [in_agent records]}`.
+  The record format is in `in-agent.md` under "For developers".
+- **Tools** come from `RunTools` in `agents/tools.py`, already scoped to the run, so the
+  model never passes a `run_id`. `get_last_agent_run` and `log_agent_run` are also bound to
+  the agent's name by `RunTools.toolbox()`.
+- **A tool that raises** (`ToolError`, bad arguments, unknown tool) is not fatal: the error
+  goes back to the model as the tool result so it can fix its input.
+- **Final answer:** a JSON object in the message content, with no further tool calls.
+  The orchestrator reads `incidents` and `situation_summary` from it.
 
-1. `load_agent(name)` → `(system_prompt, tools)`.
-2. Take one DB connection from the agents-role pool; `bind_tools(tools, connection, run_id)`.
-3. `messages = [system prompt, user message = handoff as JSON]`.
-4. Loop up to `MAX_TURNS` (15):
-   - `reply = await llm.chat(messages, tool_schemas(tools))`
-   - `reply.tool_calls` → append `reply.message`, run each call with `execute_tool_call`,
-     append one `{"role": "tool", "tool_call_id": call.id, "content": result}` per call.
-   - no tool calls → `json.loads(reply.content)` and return it.
-5. Out of turns or bad JSON → retry once asking for JSON only, or return `{"error": ...}`.
+## 2. What the orchestrator does
 
-`run_pipeline` chains the agents with plain `if`s: in → detect → route, stop on any
-`"error"` (keep the old cursor so the caller retries), and skip route-agent when
-detect-agent found no incidents and no road changes.
+1. `new_reports()`: every report in the run that `in_agent` hasn't processed yet, oldest first.
+2. `normalize()`: `InAgent.process` on each, in parallel. Failed reports are dropped and
+   retried next cycle.
+3. `assess()`: for each batch of 5 records, runs every existing assessment agent in parallel:
+   ```python
+   specs, functions = self.tools.toolbox(name, tool_names)
+   result = run_agent(instructions, payload, specs, functions)
+   ```
+   One agent failing doesn't stop the others; its result becomes `{"error": ...}`.
+4. Logs each batch to Neon `ops.agent_runs` (agent `orchestrator`) and moves the cursor on.
+
+```bash
+.venv/bin/python -m agents.orchestrator <run_id>            # everything new, then stop
+.venv/bin/python -m agents.orchestrator <run_id> --watch    # live loop, checks every 10s
+```
 
 ## 3. What the orchestrator uses from llm.py
 
-| From llm.py | Used for |
-|---|---|
-| `chat(messages, tools=None, temperature=0.2, max_tokens=2048)` | the one call per turn |
-| `Reply.content` | the final JSON answer (`None` when the model only called tools) |
-| `Reply.tool_calls` | the tools to run this turn, or `None` |
-| `Reply.finish_reason` | `"length"` means the answer was cut off at `max_tokens` |
-| `Reply.message` | the assistant turn as a dict, appended to `messages` before tool results |
-| `LLMUnavailable` | catch it in `run_agent` → return `{"error": "llm_unavailable"}` |
+| From llm.py | Used by | Does |
+|---|---|---|
+| `ask_json(system, user, image_url=None)` | `in_agent.py` | one call → parsed JSON dict; retries bad JSON and dropped connections twice |
+| `run_agent(instructions, user_input, tool_specs, tool_functions)` | orchestrator stage 2 | tool loop, up to 30 steps → `{"output", "tool_calls", "steps"}` |
+| `LLMError` | both | model unreachable, server error, or never returned valid JSON |
+| `setting(name, default)` | `llm.py`, `tools.py` | environment variable, else `backend/.env`, else default |
 
-```python
-try:
-    reply = await llm.chat(messages, schemas)
-except llm.LLMUnavailable:
-    return {"error": "llm_unavailable"}
+`llm.py` is synchronous (`httpx`); parallelism comes from the orchestrator's thread pools.
+It runs at temperature 0 and cuts tool results at 8000 characters.
+
+Settings (`backend/.env` or environment; the defaults already match the tunnel above):
+
+```
+LLM_BASE_URL=http://localhost:8001/v1
+LLM_API_KEY=none
+LLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
 ```
 
-llm.py holds no agent logic. It keeps one shared `AsyncOpenAI` client (created on the first
-call; it retries connection errors and 5xx twice with a 120s timeout) and reads
-`QWEN_BASE_URL`, `QWEN_MODEL` and `QWEN_API_KEY` from `agents/.env`.
+`agents/.env` and its `QWEN_*` settings are no longer read by anything.
+
+## Not wired up yet
+
+- `detect-agent.md` is at `assesmentAgent/detect-agent/detect-agent.md`, but the
+  orchestrator looks for `assesmentAgent/detect-agent.md`, so detect_agent is skipped.
+  Move the file or change the path in `ASSESSMENT_AGENTS`.
+- `medical-agent.md` and `verify-agent.md` don't exist yet.
+- Response agents (route, resource, plan, report) aren't in the orchestrator yet;
+  `responseAgent/route-agent.md` is empty.
+- `assesmentAgent/detect-agent/detect_tools.py` is replaced by `agents/tools.py`.
