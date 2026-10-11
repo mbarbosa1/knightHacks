@@ -516,7 +516,7 @@ button {
 
 .metrics-row {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 8px;
 }
 
@@ -1858,7 +1858,7 @@ body,
         padding: 6px;
     }
     .metrics-row {
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-columns: repeat(2, minmax(0, 1fr));
     }
     .metric-card {
         padding-inline: 5px;
@@ -2554,4 +2554,79 @@ detail-tags span {
     width: 9px;
     height: 9px;
     border-radius: 50%;
+}
+
+/* ---- live side panels (src/App.tsx) ---- */
+.strip-stats {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 18px;
+    padding: 6px 0;
+}
+
+.strip-stats b {
+    color: var(--text-primary);
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+}
+
+.strip-stats .strip-loss,
+.strip-stats .strip-loss b {
+    color: var(--accent-dark);
+}
+
+.panel-empty {
+    padding: 10px 2px 12px;
+    color: #74808c;
+    font-size: 9px;
+    line-height: 1.5;
+}
+
+.detail-text {
+    margin: 0 0 8px;
+    color: #303943;
+    font-size: 9px;
+    line-height: 1.5;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 5;
+    overflow: hidden;
+}
+
+.details-panel h2 {
+    text-transform: none;
+}
+
+.route-status-list,
+.unit-list {
+    max-height: 250px;
+    overflow-y: auto;
+}
+
+.unit-row {
+    width: 100%;
+    border: 0;
+    border-bottom: 1px solid #e7ebee;
+    background: transparent;
+    text-align: left;
+}
+
+.unit-row:hover {
+    background: #fff8f9;
+}
+
+.unit-row strong {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.unit-row .team-route b:empty {
+    display: none;
+}
+
+.search-box + .report-list {
+    margin-top: 9px;
 }

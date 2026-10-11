@@ -38,6 +38,7 @@ def queue_orchestrator(records, assessed=()):
     orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
     orch.run_id, orch.cursor, orch.batch_size, orch.in_workers, orch.parallel_batches = 'run', None, 2, 1, 3
     orch.tools = QueueTools(records, assessed)
+    orch.response, orch._responded_to = {}, None   # no response agent in these tests
     orch.assessment = {n: ('instructions', ['log_agent_run']) for n in ('detect_agent', 'medical_agent')}
     return orch
 
@@ -80,80 +81,14 @@ def test_one_agent_failing_still_completes_the_batch(monkeypatch):
     assert orch.cycle() == 2
 
 
-# ---- response tools ------------------------------------------------------------------
-
-@pytest.fixture
-def rt(monkeypatch):
-    t = RunTools.__new__(RunTools)
-    t.run_id = 'run'
-    t.map = type('Map', (), {'buildings': {'b1': {}}, 'facilities': {
-        'h1': {'type': 'hospital', 'lon': 1.0, 'lat': 2.0, 'name_en': 'H1', 'capacity': None},
-        'h2': {'type': 'hospital', 'lon': 3.0, 'lat': 4.0, 'name_en': 'H2', 'capacity': 50},
-        's1': {'type': 'shelter', 'lon': 5.0, 'lat': 6.0, 'name_en': 'S1', 'capacity': None}}})()
-    t.list_incidents = lambda: [{'id': 'i1', 'building_id': 'b1', 'location': {'longitude': 9.0, 'latitude': 8.0}},
-                                {'id': 'i2', 'building_id': None, 'location': {'longitude': 7.0, 'latitude': 6.0}}]
-    return t
+# ---- response side (Gerard's tools are tested in test_response_tools.py) ----------------
 
 
-def test_places_turn_into_simulator_fields(rt):
-    assert rt._place({'incident_id': 'i1'}) == {'building_id': 'b1'}
-    assert rt._place({'incident_id': 'i2'}) == {'lon': 7.0, 'lat': 6.0}
-    assert rt._place({'incident_id': 'i1'}, prefix='from_') == {'from_lon': 9.0, 'from_lat': 8.0}
-    assert rt._place({'facility_id': 'h2'}) == {'lon': 3.0, 'lat': 4.0}
-    assert rt._place({'unit_id': 'u1'}, prefix='from_') == {'unit_id': 'u1'}
-    assert rt._place({'longitude': 1, 'latitude': 2}) == {'lon': 1, 'lat': 2}
-    for bad in ({'incident_id': 'nope'}, {'facility_id': 'nope'}, {'building_id': 'nope'}, {}):
-        with pytest.raises(ToolError):
-            rt._place(bad)
 
 
-def test_simulator_refusals_become_tool_errors(monkeypatch):
-    def refuse(method, url, **kw):
-        return httpx.Response(409, json={'detail': 'unit u1 is busy'}, request=httpx.Request(method, url))
-    monkeypatch.setattr(tools_mod.httpx, 'request', refuse)
-    with pytest.raises(ToolError, match='unit u1 is busy'):
-        tools_mod._sim('POST', '/tools/route', {'unit_id': 'u1'})
 
 
-def test_simulator_down_is_a_clear_tool_error(monkeypatch):
-    def down(method, url, **kw):
-        raise httpx.ConnectError('refused')
-    monkeypatch.setattr(tools_mod.httpx, 'request', down)
-    with pytest.raises(ToolError, match='dev.sh'):
-        tools_mod._sim('GET', '/units')
 
-
-def test_facility_options_ranks_reachable_by_drive_time(rt, monkeypatch):
-    times = {'h1': None, 'h2': 300}
-    monkeypatch.setattr(rt, 'plan_route', lambda o, d: {'reachable': times[d['facility_id']] is not None,
-                                                        'travel_time_s': times[d['facility_id']]}, raising=False)
-    out = rt.facility_options(0, 0, 'hospital')
-    assert [o['facility_id'] for o in out] == ['h2', 'h1'] and out[1]['reachable'] is False
-    with pytest.raises(ToolError, match='types on this map'):
-        rt.facility_options(0, 0, 'airport')
-
-
-def test_assign_units_never_reuses_a_unit(rt, monkeypatch):
-    fleet = [{'unit_id': 'u1', 'travel_time_s': 60}, {'unit_id': 'u2', 'travel_time_s': 90}]
-    monkeypatch.setattr(rt, 'nearest_units', lambda incident_id, type, k: fleet, raising=False)
-    out = rt.assign_units(['i1', 'i2', 'i3'], 'ambulance')
-    assert [a['unit_id'] for a in out['assignments']] == ['u1', 'u2'] and out['unassigned'] == ['i3']
-
-
-def test_upsert_decision_checks_units_before_writing(rt, monkeypatch):
-    monkeypatch.setattr(rt, 'list_resources', lambda: [{'id': 'u1'}], raising=False)
-    iid = '00000000-0000-0000-0000-0000000000a1'
-    with pytest.raises(ToolError, match='not an incident id'):
-        rt.upsert_decision('i1', [{'unit_id': 'u1'}])
-    with pytest.raises(ToolError, match='list of'):
-        rt.upsert_decision(iid, [{'role': 'transport'}])
-    with pytest.raises(ToolError, match='unknown unit ids'):
-        rt.upsert_decision(iid, [{'unit_id': 'u9'}])
-
-
-def test_no_agent_can_dispatch():
-    """A human approves every dispatch: /dispatch is not an agent tool."""
-    assert 'dispatch' not in tools_mod.TOOL_SPECS and not hasattr(RunTools, 'dispatch')
 
 
 def test_batches_run_at_the_same_time(monkeypatch):

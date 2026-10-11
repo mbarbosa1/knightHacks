@@ -301,7 +301,8 @@ class Fleet:
         observation = {
             'id': str(uuid.uuid5(uuid.UUID(self.run_id), f"{unit.id}:{unit.task['decision_id']}:left")), 'run_id': self.run_id,
             'channel': 'responder_update', 'source_reliability': RESPONDER_RELIABILITY, 'format': 'structured', 'lang': 'en',
-            'original_text': json.dumps({'unit_id': unit.id, 'building_id': building_id, **facts}),
+            'original_text': json.dumps({'unit_id': unit.id, 'incident_id': unit.task['destination']['incident_id'],
+                                         'building_id': building_id, **facts}),
             'text_en': text, 'media_url': None, 'claimed_location': None,
             'claimed_geom': {'type': 'Point', 'coordinates': [round(unit.lon, 6), round(unit.lat, 6)]},
             'location_precision': 'gps', 'sim_time_s': round(at_s, 1)}

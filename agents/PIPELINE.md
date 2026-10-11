@@ -105,7 +105,29 @@ LLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
 
 `agents/.env` and its `QWEN_*` settings are no longer read by anything.
 
-## Not wired up yet
+## Response stage (wired up)
+
+`response_agent` (`responseAgent/response-agent/response-agent.md`) is resource + plan in one agent, with no
+drafts and no approval: what it dispatches sets off at once. Routing is code. `Orchestrator.respond()` runs it
+after each assessment batch, and in `--watch` whenever a unit comes free or reports from the scene.
+
+Each model turn is slow, so code does everything except the decision:
+
+1. `tools.incidents_to_cover()` reads the unresolved incidents, works out which unit types each `could_use`
+   (an engine frees the trapped, an ambulance treats the critical, a patrol checks what is unclear; first-hand
+   reports from units override the estimate), asks the simulator for the nearest free units, and drafts a
+   `suggested` plan.
+2. The model is skipped when nobody can go or nothing changed since it last looked.
+3. The model gets that picture with short names (`I1`, `F2`, `A1`), reviews the plan and calls
+   `dispatch_units` once. Two turns, about 15 seconds.
+4. The orchestrator logs what was really sent (`dispatched`, `refused`) next to the model's summary.
+
+Response tools in `tools.py`, all asking the simulator service (`SIM_URL`, default `http://127.0.0.1:8100`),
+which plans on believed road status: `incidents_to_cover`, `dispatch_units`, `dispatch_unit`, `nearest_units`,
+`plan_route`, `list_resources`, `list_decisions`, `list_field_reports`. The older `resource-agent.md` and
+`plan-agent.md` templates are not used.
+
+## Not wired up yet (superseded by the response stage above)
 
 - Response agents (resource ‖ route → plan → report) have instructions but aren't in the
   orchestrator yet. Each `.md` documents its input: the assessment agents' outputs plus
