@@ -161,8 +161,8 @@ export async function createEarthquake(magnitude: number | null, speed: number =
 }
 
 /** How many simulated seconds pass per real second. */
-export const SPEEDS = [10, 20] as const;
-export const DEFAULT_SPEED = 10;   // at 20x a big earthquake's reports reach Neon late
+export const SPEEDS = [5, 10] as const;
+export const DEFAULT_SPEED = 10;   // faster than this, a big earthquake's reports reach Neon late
 
 /** The live run's clock, kept by the simulator. run_id is null when nothing is playing. */
 export interface RunClock {

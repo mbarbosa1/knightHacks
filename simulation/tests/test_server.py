@@ -63,12 +63,12 @@ def test_random_earthquake_and_limits(client):
 
 def test_reports_arrive_on_the_clock_and_one_run_plays_at_a_time(client):
     import json, time
-    first = client.post('/runs', json={'seed': 42, 'mw': 7.4, 'speed': 20}).json()
+    first = client.post('/runs', json={'seed': 42, 'mw': 7.4, 'speed': 10}).json()
     assert first['clock']['run_id'] == first['run_id'] and first['clock']['reports_total'] == 507
-    assert first['clock']['speed'] == 20 and first['clock']['playing']
+    assert first['clock']['speed'] == 10 and first['clock']['playing']
     saved = server._state['storage'].runs_dir / first['run_id'] / 'observations.jsonl'
     assert not saved.exists()                                     # nothing is released at Generate
-    time.sleep(1.8)                                               # ~36 simulated seconds at 20x
+    time.sleep(3.6)                                               # ~36 simulated seconds at 10x
     clock = client.get('/clock').json()
     assert 20 < clock['sim_time_s'] < 80 and 0 < clock['reports_released'] < 30
     released = [json.loads(l) for l in open(saved)]
@@ -76,9 +76,9 @@ def test_reports_arrive_on_the_clock_and_one_run_plays_at_a_time(client):
     assert all(r['sim_time_s'] <= client.get('/clock').json()['sim_time_s'] for r in released)
     assert [r['sim_time_s'] for r in released] == sorted(r['sim_time_s'] for r in released)
 
-    assert client.post('/clock', json={'speed': 30}).status_code == 422
-    paused = client.post('/clock', json={'playing': False, 'speed': 10}).json()
-    assert paused['speed'] == 10 and not paused['playing']
+    assert client.post('/clock', json={'speed': 20}).status_code == 422
+    paused = client.post('/clock', json={'playing': False, 'speed': 5}).json()
+    assert paused['speed'] == 5 and not paused['playing']
     time.sleep(0.4)
     assert client.get('/clock').json()['sim_time_s'] == paused['sim_time_s']
 
@@ -99,7 +99,7 @@ def test_agents_can_find_route_and_send_units(client):
     import json, time
     assert client.get('/units').json() == []                      # nothing is being played
     assert client.post('/tools/nearest-units', json={'lon': 139.7, 'lat': 35.69}).status_code == 409
-    run = client.post('/runs', json={'seed': 42, 'mw': 7.4, 'speed': 20}).json()
+    run = client.post('/runs', json={'seed': 42, 'mw': 7.4, 'speed': 10}).json()
     units = client.get('/units').json()
     assert len(units) == 13 and {u['status'] for u in units} == {'available'}
     assert run['clock']['units'] == {'available': 13, 'en_route': 0, 'busy': 0}
@@ -130,7 +130,7 @@ def test_agents_can_find_route_and_send_units(client):
     assert unit not in {n['unit_id'] for n in client.post('/tools/nearest-units', json={'building_id': target, 'k': 20}).json()}
 
     start = next(u for u in units if u['id'] == unit)
-    time.sleep(1.5)                                                # ~30 simulated seconds at 20x
+    time.sleep(3.0)                                                # ~30 simulated seconds at 10x
     now = next(u for u in client.get('/units').json() if u['id'] == unit)
     assert (now['lon'], now['lat']) != (start['lon'], start['lat']) and now['destination']['building_id'] == target
     assert now['decision']['id'] == decision['id'] and len(now['trail']) >= 2

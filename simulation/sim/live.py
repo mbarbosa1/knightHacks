@@ -4,15 +4,15 @@ A LiveRun owns the simulation clock for one run and makes things happen when the
 Each tick it releases the reports that are due, moves the responder units, and writes down what they
 do: where they are, and any road they find blocked.
 
-    simulated seconds = real seconds elapsed x speed        (speed is 10 or 20 in the UI)
+    simulated seconds = real seconds elapsed x speed        (speed is 5 or 10 in the UI)
 
 Only one run is live at a time (see sim/server.py): starting another stops this one.
 Nothing here knows whether the storage is local files or the backend API.
 """
 import threading, time
 
-SPEEDS = (10, 20)         # 30x was dropped: a big earthquake's reports could not all be saved in time
-DEFAULT_SPEED = 10       # at 20x a big earthquake's reports reach Neon late (about 3 a second can be saved)
+SPEEDS = (5, 10)          # 20x and 30x were dropped: a big earthquake's reports could not all be saved in time
+DEFAULT_SPEED = 10       # the fastest that keeps up: about 3 reports a second can be saved to Neon
 TICK_S = 0.25            # real seconds between ticks
 TAIL_S = 60              # simulated seconds the clock keeps running after the last scheduled thing
 SAVE_UNIT_EVERY_S = 2.0  # real seconds between saved positions of a moving unit (each save is a request)
@@ -78,7 +78,7 @@ class LiveRun:
     def tick(self):
         """Move the units and save what they did. Reports that are due are saved too, unless the
         run is playing on its own threads (start()), where a second thread does nothing else: each
-        save is a request, and at 20x reports come due faster than one thread can save them and
+        save is a request, and reports can come due faster than one thread can save them and
         keep the units moving."""
         with self._lock:
             now_s = self._advance()
