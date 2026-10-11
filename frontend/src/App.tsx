@@ -15,6 +15,7 @@ import {
   Menu,
   Minus,
   Navigation,
+  Plane,
   Radio,
   Search,
   Settings2,
@@ -30,9 +31,14 @@ import {
 import { type MockReport, type ReportKind } from "./data/mockReports";
 import { CHANNELS, UNIT_COLOR, UNIT_LABEL, ShinjukuMap, formatClock, type ShinjukuMapHandle } from "./map/ShinjukuMap";
 import type { MapState } from "./map/ShinjukuMap";
-import type { Decision, LiveUnit, OperationalState, Report } from "./map/dataSource";
+import type { Decision, LiveUnit, OperationalState, ReconResult, Report } from "./map/dataSource";
+import { ReconPage } from "./Recon";
 import { approveProposal, incidentPriority, rejectProposal } from "./map/dataSource";
 
+const DBX = "https://dbc-87980e9b-e483.cloud.databricks.com", DBX_ORG = "7474645633187109";
+const EMBED_URL = `${DBX}/embed/dashboardsv3/01f1c57b716915d8b00465003e793b28?o=${DBX_ORG}`;
+const DASHBOARD_URL = `${DBX}/dashboardsv3/01f1c57b716915d8b00465003e793b28/published?o=${DBX_ORG}`;
+const GENIE_URL = `${DBX}/genie/rooms/01f1c580620a1d308658e770ef4e127c?o=${DBX_ORG}`;
 type BelievedIncident = OperationalState["incidents"][number];
 
 /** Units that are doing something come first: driving, then working, then free again, then never sent. */
@@ -150,6 +156,11 @@ function App() {
     const unit = approve && !problem ? units.find((u) => u.id === d.assignments?.[0]?.resource_id) : null;
     if (unit) mapRef.current?.focus(unit.lon, unit.lat);
   };
+  // Drone recon page: kept beside the dashboard (which stays mounted, so the map keeps its state).
+  const [page, setPage] = useState<"ops" | "recon" | "analytics">("ops");
+  const [reconFor, setReconFor] = useState<string | null>(null);
+  const [recons, setRecons] = useState<Record<string, ReconResult>>({});
+  const openRecon = (incidentId: string) => { setReconFor(incidentId); setPage("recon"); };
   const destinationName = (unit: LiveUnit) =>
     unit.destination
       ? (unit.destination.building_id && mapRef.current?.buildingName(unit.destination.building_id)) ||
@@ -184,9 +195,18 @@ function App() {
           </div>
         </div>
         <div className="scenario">
-          <span className="eyebrow">OPERATIONS OVERVIEW</span>
+          <span className="eyebrow">{page === "ops" ? "OPERATIONS OVERVIEW" : page === "recon" ? "DRONE RECON" : "ANALYTICS · DATABRICKS"}</span>
           <span className="scenario-name">Tokyo earthquake scenario</span>
         </div>
+        <nav className="page-tabs">
+          <button className={page === "ops" ? "active" : ""} onClick={() => setPage("ops")}><MapPin size={13} /> Operations</button>
+          <button className={page === "recon" ? "active" : ""} onClick={() => setPage("recon")}>
+            <Plane size={13} /> Drone recon{Object.keys(recons).length ? <small>{Object.keys(recons).length}</small> : null}
+          </button>
+          <button className={page === "analytics" ? "active" : ""} onClick={() => setPage("analytics")}>
+            <Layers size={13} /> Analytics
+          </button>
+        </nav>
         <div className="top-actions">
           <span className="live-badge">
             <i /> SIMULATION
@@ -225,7 +245,25 @@ function App() {
           </div>
         )}
       </div>
-      <main className="dashboard">
+      {page === "analytics" && (
+        <main className="analytics-page">
+          <div className="analytics-bar">
+            <span>History of every simulated earthquake: damage, people, reports and how well the agents did (Databricks).</span>
+            <a className="recon-fly" href={GENIE_URL} target="_blank" rel="noreferrer">Ask Genie ↗</a>
+            <a className="analytics-link" href={DASHBOARD_URL} target="_blank" rel="noreferrer">Open in Databricks ↗</a>
+          </div>
+          <iframe className="analytics-frame" src={EMBED_URL} title="Databricks dashboard" />
+        </main>
+      )}
+      {page === "recon" && (
+        <ReconPage queue={queue} reports={observations ?? []} decisions={decisions} results={recons}
+          onResult={(id, r) => setRecons((all) => ({ ...all, [id]: r }))}
+          selectedId={reconFor} onSelect={setReconFor} runId={runId}
+          acting={acting} onDecide={decide} unitName={unitName}
+          buildingName={(id) => mapRef.current?.buildingName(id)}
+          onShowOnMap={(lon, lat) => { setPage("ops"); window.setTimeout(() => mapRef.current?.focus(lon, lat), 50); }} />
+      )}
+      <main className="dashboard" style={page === "ops" ? undefined : { display: "none" }}>
         <aside className="panel incoming-panel">
           <div className="panel-heading">
             <div>
@@ -390,6 +428,10 @@ function App() {
                         {(incident.evidence?.supports.length ?? 0) === 1 ? "" : "s"}
                         {onIt.length ? ` · ${onIt.map((u) => UNIT_LABEL[u.type] ?? u.type).join(", ")} on it` : ""}
                       </small>
+                    </button>
+                    <button className={`recon-link${recons[incident.id] ? " flown" : ""}`} title="Drone recon: see the block from above"
+                      onClick={() => openRecon(incident.id)}>
+                      <Plane size={11} /> {recons[incident.id] ? "Drone ✓" : "Drone"}
                     </button>
                     {jobs.length > 0 && (
                       <div className="incident-jobs">
