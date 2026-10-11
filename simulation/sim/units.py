@@ -7,7 +7,7 @@ gets there. It then reports it first-hand and takes another way.
 
 Planning uses what is *believed* about the roads. Driving meets what is *true*.
 """
-import json, math, uuid
+import json, math, threading, uuid
 from dataclasses import dataclass, field
 from .routing import LIMITED_FACTOR, statuses
 
@@ -49,12 +49,16 @@ def _along(coords, fraction):
 
 
 class Fleet:
-    def __init__(self, run_id, static_map, router, truth, resources, beliefs=None, emit=None, on_blocked=None):
+    def __init__(self, run_id, static_map, router, truth, resources, beliefs=None, emit=None, on_blocked=None, on_decision=None):
         """resources: the run's units as saved to ops.resources (id, type, name, home_facility_id, location).
         beliefs(): {road_id: status} that agents currently hold. emit(observation): a first-hand report
-        to release. on_blocked(road_ids, observation_id, sim_time_s): record the belief."""
+        to release. on_blocked(road_ids, observation_id, sim_time_s): record the belief.
+        on_decision(row): keep the record of a decision that was made or replaced."""
         self.run_id, self.m, self.router, self.truth = run_id, static_map, router, truth
         self._beliefs, self._emit, self._on_blocked = beliefs or (lambda: {}), emit or (lambda obs: None), on_blocked or (lambda *a: None)
+        self.lock = threading.RLock()   # the clock thread moves units while requests dispatch and read them
+        self._on_decision = on_decision or (lambda row: None)
+        self._versions = {}        # incident_id -> last decision version used
         self.found = {}            # road_id -> sim time a unit found it blocked
         self.log = []              # what happened, newest last: dispatched / blocked / arrived / stuck
         self.units = {}
@@ -78,6 +82,10 @@ class Fleet:
 
     def dispatch(self, unit_id, now_s, lon=None, lat=None, building_id=None, incident_id=None):
         """Send a free unit somewhere. Returns the decision it is now following."""
+        with self.lock:
+            return self._dispatch(unit_id, now_s, lon, lat, building_id, incident_id)
+
+    def _dispatch(self, unit_id, now_s, lon, lat, building_id, incident_id):
         unit = self.units.get(unit_id)
         if unit is None:
             raise DispatchError(f'No unit {unit_id} in this run')
@@ -95,12 +103,28 @@ class Fleet:
         route = self.router.route(unit.node, destination['node'], self.believed())
         if route is None:
             raise DispatchError(f'{unit.name} has no way to get there on the roads believed open')
-        self._follow(unit, route, destination, now_s, decision_id=str(uuid.uuid4()), version=1, reason=None)
+        self._follow(unit, route, destination, now_s, reason=None)
         unit.status = 'en_route'
+        self._record(unit, now_s)
         self.log.append({'t': now_s, 'kind': 'dispatched', 'unit_id': unit.id, 'text': f'{unit.name} dispatched'})
         return self.decision(unit)
 
-    def _follow(self, unit, route, destination, start_s, decision_id, version, reason):
+    def _next_version(self, incident_id, previous):
+        """Versions count up per incident (the table allows one row per incident and version), so a second
+        unit sent to the same incident, or a reroute, takes the next number."""
+        if incident_id is None:
+            return previous.get('version', 0) + 1
+        self._versions[incident_id] = self._versions.get(incident_id, 0) + 1
+        return self._versions[incident_id]
+
+    def _record(self, unit, at_s, status='sent', invalidated_reason=None):
+        """Hand the unit's current decision to whoever keeps the record (ops.decisions)."""
+        row = {**self.decision(unit), 'status': status, 'invalidated_reason': invalidated_reason, 'sim_time_s': round(at_s, 1)}
+        self._on_decision(row)
+
+    def _follow(self, unit, route, destination, start_s, reason):
+        decision_id = str(uuid.uuid4())   # a changed route is a new decision, not an edit of the old one
+        version = self._next_version(destination['incident_id'], unit.task or {})
         legs = [(road_id, u, v) for road_id, (u, v) in zip(route['edge_ids'], zip(route['nodes'], route['nodes'][1:]))]
         previous = unit.task or {}
         unit.task = {'decision_id': decision_id, 'version': version, 'reason': reason, 'destination': destination,
@@ -121,13 +145,14 @@ class Fleet:
                 'route_geojson': {'type': 'Feature', 'geometry': {'type': 'LineString', 'coordinates': t['route']},
                                   'properties': {'road_ids': t['road_ids']}},
                 'fallback_route_geojson': {'type': 'LineString', 'coordinates': t['fallback']} if t['fallback'] else None,
-                'eta_s': round(t['eta_s'], 1), 'status': 'sent', 'invalidated_reason': t['reason']}
+                'eta_s': round(t['eta_s'], 1), 'status': 'sent', 'invalidated_reason': None}
 
     # --- time passing ------------------------------------------------------------------------------
     def tick(self, now_s):
-        for unit in self.units.values():
-            if unit.status == 'en_route':
-                self._advance(unit, now_s)
+        with self.lock:
+            for unit in self.units.values():
+                if unit.status == 'en_route':
+                    self._advance(unit, now_s)
 
     def _advance(self, unit, now_s):
         t, G = unit.task, self.router.G
@@ -186,14 +211,17 @@ class Fleet:
         t = unit.task
         route = self.router.route(unit.node, t['destination']['node'], self.believed())
         if route is None:
+            self._record(unit, at_s, 'invalidated', f'{unit.name}: every way in is blocked')
             unit.status, unit.task['gave_up_s'] = 'available', at_s
             self.log.append({'t': at_s, 'kind': 'stuck', 'unit_id': unit.id, 'road_ids': roads,
                              'text': f'{unit.name} cannot reach the incident: every way in is blocked'})
             return False
         reason = f"{unit.name} found {street or 'a road'} blocked by debris"
-        self._follow(unit, route, t['destination'], at_s + REROUTE_PAUSE_S, t['decision_id'], t['version'] + 1, reason)
+        self._record(unit, at_s, 'invalidated', reason)
+        self._follow(unit, route, t['destination'], at_s + REROUTE_PAUSE_S, reason)
+        self._record(unit, at_s)
         self.log.append({'t': at_s, 'kind': 'blocked', 'unit_id': unit.id, 'road_ids': roads,
-                         'text': f'{reason}. Plan v{t["version"]} invalidated, rerouting (v{t["version"] + 1}).'})
+                         'text': f'{reason}. Plan v{t["version"]} invalidated, rerouting (v{unit.task["version"]}).'})
         return True
 
     # --- what others see ---------------------------------------------------------------------------
@@ -205,6 +233,10 @@ class Fleet:
 
     def view(self):
         """Everything the map needs to draw the units: where each is, where it has been, where it is going."""
+        with self.lock:
+            return self._view()
+
+    def _view(self):
         out = []
         for unit in self.units.values():
             t = unit.task
@@ -216,3 +248,52 @@ class Fleet:
                         'destination': {k: t['destination'][k] for k in ('lon', 'lat', 'building_id', 'incident_id')} if t else None,
                         'decision': {'id': t['decision_id'], 'version': t['version'], 'reason': t['reason']} if t else None})
         return out
+
+    # --- questions agents ask before deciding (always on believed road status) ----------------------
+    def place(self, lon=None, lat=None, building_id=None):
+        """(lon, lat) of a destination given as a building or a point."""
+        if building_id is not None:
+            if building_id not in self.m.building_geoms:
+                raise DispatchError(f'No building {building_id} on this map')
+            c = self.m.building_geoms[building_id].centroid
+            return c.x, c.y
+        if lon is None or lat is None:
+            raise DispatchError('A place is needed: building_id, or lon and lat')
+        return lon, lat
+
+    def nearest(self, lon=None, lat=None, building_id=None, type=None, k=3):
+        """The free units that can reach a place soonest: the resource agent's shortlist.
+        Units with no way there on the roads believed open are left out."""
+        with self.lock:
+            lon, lat = self.place(lon, lat, building_id)
+            candidates = [{'id': u.id, 'type': u.type, 'status': u.status, 'node': u.node} for u in self.units.values()]
+            ranked = self.router.nearest_units((lon, lat), candidates, type=type, k=k, status=self.believed())
+            return [{'unit_id': r['unit_id'], 'name': self.units[r['unit_id']].name, 'type': r['type'],
+                     'skills': self.units[r['unit_id']].skills, 'travel_time_s': r['travel_time_s']} for r in ranked]
+
+    def plan_route(self, unit_id=None, from_lon=None, from_lat=None, lon=None, lat=None, building_id=None):
+        """How to get from a unit (or a point) to a place, without sending anyone."""
+        with self.lock:
+            if unit_id is not None:
+                if unit_id not in self.units:
+                    raise DispatchError(f'No unit {unit_id} in this run')
+                origin = self.units[unit_id].node
+            elif from_lon is not None and from_lat is not None:
+                origin = (from_lon, from_lat)
+            else:
+                raise DispatchError('A start is needed: unit_id, or from_lon and from_lat')
+            route = self.router.route(origin, self.place(lon, lat, building_id), self.believed())
+        if route is None:
+            return {'reachable': False}
+        fallback = route.get('fallback')
+        return {'reachable': True, 'travel_time_s': route['travel_time_s'], 'length_m': route['length_m'],
+                'road_ids': route['edge_ids'], 'geometry': route['geojson'],
+                'fallback': {'travel_time_s': fallback['travel_time_s'], 'length_m': fallback['length_m'],
+                             'road_ids': fallback['edge_ids'], 'geometry': fallback['geojson']} if fallback else None}
+
+    def counts(self):
+        with self.lock:
+            out = {'available': 0, 'en_route': 0, 'busy': 0}
+            for u in self.units.values():
+                out[u.status] = out.get(u.status, 0) + 1
+            return out

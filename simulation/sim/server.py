@@ -9,6 +9,14 @@
     GET  /clock             the live run's clock: simulated time, speed, reports released so far
     POST /clock             {"speed": 10|20, "playing": true|false}
     POST /stop              stop the live run and close it
+    GET  /units             every responder unit: where it is, where it has been, where it is going
+
+Tools for the response agents. They answer from what is *believed* about the roads (ops.road_restrictions
+plus anything units have found), never from the truth:
+    POST /tools/nearest-units   {building_id | lon+lat, type?, k?}   free units that can get there soonest
+    POST /tools/route           {unit_id | from_lon+from_lat, building_id | lon+lat}   how to get there
+    POST /dispatch              {unit_id, building_id | lon+lat, incident_id?}         send the unit
+Each takes an optional run_id and refuses if that is not the run being played.
 
 This serves hidden ground truth and has no login: keep it on localhost. Agents must never call it.
 
@@ -19,7 +27,8 @@ Reports are not part of that snapshot: the live loop (sim/live.py) releases each
 clock reaches it. One run is live at a time; starting another stops and closes the one before.
 The default is Neon mode; SIM_LOCAL_ONLY=1 explicitly selects a local-only developer demo.
 """
-import asyncio, collections, json, logging, os, random, uuid
+import asyncio, collections, json, logging, os, random, time, uuid
+from types import SimpleNamespace
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from .api_storage import ApiStorage
@@ -33,11 +42,14 @@ from .run import start_run
 from .scenario import MW_RANGE
 from .standin import standin_dispatch, UNITS_PER_FACILITY
 from .submission import atomic_json, read_job
+from .units import DispatchError, Fleet
 from .storage import LocalStorage
 
 KEEP_RUNS = 20   # truth of the most recent runs stays in memory
 BACKEND_URL = None if os.environ.get('SIM_LOCAL_ONLY') == '1' else os.environ.get('BACKEND_URL', 'http://127.0.0.1:8000')
 log = logging.getLogger('uvicorn.error')
+AUTO_DISPATCH = os.environ.get('SIM_AUTO_DISPATCH') == '1'   # stand-in dispatcher for testing without agents
+BELIEFS_TTL_S = 3.0
 
 @asynccontextmanager
 async def lifespan(app):
@@ -53,7 +65,7 @@ app = FastAPI(title='Shinjuku simulator', version='0.2.0', lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origin_regex=r'http://(localhost|127\.0\.0\.1):\d+',
                    allow_methods=['GET', 'POST'], allow_headers=['Content-Type'])
 _state = {'storage': None, 'map': None, 'router': None, 'runs': collections.OrderedDict(), 'reports': {}, 'dispatch': {},
-          'live': None, 'live_storage': None}
+          'live': None, 'live_storage': None, 'fleet': None, 'beliefs': (0.0, {})}
 
 
 def _map():
@@ -101,6 +113,8 @@ def stop_live():
     if live is None:
         return None
     live.stop()
+    _state['fleet'] = None
+    databricks_sink.upload_in_background(live.run_id)   # the truth gained rows while the run played
     try:
         storage.end_run(live.run_id, sim_time_s=live.state()['sim_time_s'])
     except Exception as exc:   # closing is tidying up; never let it block the next earthquake
@@ -108,14 +122,80 @@ def stop_live():
     return live.state()
 
 
-def start_live(run_id, reports, speed):
-    """Start the clock for a run. Reports go to the same place the run was created: Neon through the
-    backend, or local files."""
+def _beliefs():
+    """Road status the agents believe for the live run, re-read every few seconds."""
+    live, storage = _state['live'], _state['live_storage']
+    at, known = _state['beliefs']
+    if live is None or storage is None:
+        return {}
+    if time.monotonic() - at > BELIEFS_TTL_S:
+        try:
+            known = storage.load_road_restrictions(live.run_id)
+        except Exception as exc:   # keep planning on what was last known
+            log.warning('road beliefs could not be refreshed (%s)', exc)
+        _state['beliefs'] = (time.monotonic(), known)
+    return known
+
+
+def start_live(run_id, reports, speed, static_map=None, truth=None, auto_dispatch=None):
+    """Start the clock for a run. Reports and unit state go to the same place the run was created:
+    Neon through the backend, or local files. With a map and the truth, the run also gets its units."""
     stop_live()
     storage = ApiStorage(BACKEND_URL) if BACKEND_URL else _map()[0]
-    _state['live_storage'] = storage
-    _state['live'] = LiveRun(run_id, reports, storage, speed=speed).start()
+    fleet, schedule, on_due = None, None, None
+    if static_map is not None and truth is not None and getattr(static_map, 'graph', None) is not None:
+        if not isinstance(_state['router'], Router):
+            _state['router'] = Router(static_map.graph)
+        fleet = Fleet(run_id, static_map, _state['router'], truth, initial_resources(static_map, run_id), beliefs=_beliefs)
+        if auto_dispatch:
+            schedule, on_due = [(u['depart_s'], u['building_id']) for u in auto_dispatch], _standin_send
+    _state['live_storage'], _state['fleet'], _state['beliefs'] = storage, fleet, (0.0, {})
+    _state['live'] = LiveRun(run_id, reports, storage, speed=speed, fleet=fleet, schedule=schedule, on_due=on_due).start()
     return _state['live'].state()
+
+
+def _standin_send(building_id, now_s):
+    """Stand-in for the agents (SIM_AUTO_DISPATCH=1): send the nearest free unit. Not used when agents decide."""
+    fleet = _state['fleet']
+    try:
+        nearest = fleet.nearest(building_id=building_id, k=1)
+        if nearest:
+            fleet.dispatch(nearest[0]['unit_id'], now_s, building_id=building_id)
+    except DispatchError as exc:
+        log.info('stand-in dispatch skipped: %s', exc)
+
+
+def _live_fleet(run_id=None):
+    live, fleet = _state['live'], _state['fleet']
+    if live is None or fleet is None:
+        raise HTTPException(409, 'No run is being played. Generate an earthquake first.')
+    if run_id is not None and str(run_id) != live.run_id:
+        raise HTTPException(409, f'Run {run_id} is not the run being played ({live.run_id}).')
+    return live, fleet
+
+
+class Place(BaseModel):
+    """A destination: a building on the map, or a point."""
+    run_id: str | None = None
+    building_id: str | None = None
+    lon: float | None = Field(default=None, ge=-180, le=180)
+    lat: float | None = Field(default=None, ge=-90, le=90)
+
+
+class NearestUnits(Place):
+    type: str | None = Field(default=None, description='fire_engine, ambulance or police; omit for any')
+    k: int = Field(default=3, ge=1, le=20)
+
+
+class RouteQuestion(Place):
+    unit_id: str | None = None
+    from_lon: float | None = Field(default=None, ge=-180, le=180)
+    from_lat: float | None = Field(default=None, ge=-90, le=90)
+
+
+class Dispatch(Place):
+    unit_id: str
+    incident_id: str | None = None
 
 
 class ClockChange(BaseModel):
@@ -167,7 +247,8 @@ def new_run(body: NewRun):
         _state['reports'][truth.run_id] = report_view
         _state['dispatch'][truth.run_id] = dispatch_view
         # Only now, with the run confirmed saved, does its clock start and the previous run's stop.
-        data['clock'] = start_live(truth.run_id, truth.reports, body.speed)
+        data['clock'] = start_live(truth.run_id, truth.reports, body.speed, static_map, truth,
+                                   auto_dispatch=dispatch_view if AUTO_DISPATCH else None)
     except Exception as exc:
         log.error('Simulation submission failed: %s',exc)
         raise submission_error(storage,exc) from exc
@@ -234,6 +315,45 @@ def change_clock(body: ClockChange):
     return live.set(speed=body.speed, playing=body.playing)
 
 
+@app.get('/units')
+def units():
+    """Every unit in the live run, for the map: position, trail, planned route, the decision it follows."""
+    fleet = _state['fleet']
+    return fleet.view() if fleet else []
+
+
+@app.post('/tools/nearest-units')
+def nearest_units(body: NearestUnits):
+    """Resource agent: which free units can reach this place soonest, on the roads believed open."""
+    _, fleet = _live_fleet(body.run_id)
+    try:
+        return fleet.nearest(body.lon, body.lat, body.building_id, type=body.type, k=body.k)
+    except DispatchError as exc:
+        raise HTTPException(422, str(exc))
+
+
+@app.post('/tools/route')
+def route(body: RouteQuestion):
+    """Routing: how a unit (or a point) would get to a place. Sends nobody."""
+    _, fleet = _live_fleet(body.run_id)
+    try:
+        return fleet.plan_route(body.unit_id, body.from_lon, body.from_lat, body.lon, body.lat, body.building_id)
+    except DispatchError as exc:
+        raise HTTPException(422, str(exc))
+
+
+@app.post('/dispatch', status_code=201)
+def dispatch_unit(body: Dispatch):
+    """Plan agent: send this unit there. Returns the decision it now follows, or 409 with the reason
+    it cannot go (not free, or no way there)."""
+    live, fleet = _live_fleet(body.run_id)
+    try:
+        return fleet.dispatch(body.unit_id, live.state()['sim_time_s'], lon=body.lon, lat=body.lat,
+                              building_id=body.building_id, incident_id=body.incident_id)
+    except DispatchError as exc:
+        raise HTTPException(409, str(exc))
+
+
 @app.post('/stop')
 def stop():
     """Stop the live run and close it (the map's Reset). Safe to call when nothing is playing."""
@@ -252,7 +372,9 @@ def retry_submission(run_id: str):
         _state['runs'][run_id] = data
         # The save went through this time, so the run's clock starts now, as it would have at Generate.
         reports = [{'observation': {k: v for k, v in r.items() if k != 'answer'}} for r in saved_view(run_id, 'reports_view.json')]
-        data['clock'] = start_live(run_id, reports, DEFAULT_SPEED)
+        roads = {r: {'status': v['status'], 'sim_time_s': 0.0} for r, v in data.get('road_status', {}).items()}
+        truth = SimpleNamespace(road_status=roads, add_link=lambda *a: None)   # enough for units to drive on
+        data['clock'] = start_live(run_id, reports, DEFAULT_SPEED, _map()[1], truth)
         return data
     except HTTPException:
         raise

@@ -125,6 +125,15 @@ Use this description only. A diagram of it was also shared, but its extra boxes 
 6. **Plan agent:** the overall response and the report.
 Agreed order of work (11 Oct): finish the live loop first, talk about the agents after. What the simulation side has to offer them, whatever their internals: reports arriving over time (done), `ops.resources` kept current, and routing callable on believed road status.
 
+## 9f. Response side, step 1: units and agent tools (branch `response-side`, 11 Oct)
+- Each run played by the simulator service gets a `Fleet` (`sim/units.py`) of the 13 units. The clock (`sim/live.py`) moves them every tick and saves each unit to `ops.resources` when its status changes and about every 2 real seconds while it drives.
+- A unit that drives into a truly blocked road stops, posts a `responder_update` observation (`original_text` is JSON: `unit_id, road_id, road_ids, status`), writes `ops.road_restrictions` with that observation as the source, then reroutes (decision version + 1) or, with no way through, goes back to `available`. On arrival it becomes `busy` and stays there: the rescue model is parked.
+- Tools for the response agents on the simulator service (port 8100), all planning on believed road status (`ops.road_restrictions`, re-read every 3 s, plus what units found), never the truth:
+  `POST /tools/nearest-units {building_id | lon+lat, type?, k?}`, `POST /tools/route {unit_id | from_lon+from_lat, building_id | lon+lat}`, `POST /dispatch {unit_id, building_id | lon+lat, incident_id?}` (201 with the decision, 409 with the reason), `GET /units` for the map. Optional `run_id` on each; 409 if it is not the run being played.
+- `SIM_AUTO_DISPATCH=1` sends the nearest free unit to the stand-in's targets, for testing without agents. Off by default.
+- Every decision is saved to `ops.decisions` through `PUT /runs/{id}/decisions/{decision_id}` (added to the backend with `GET /runs/{id}/decisions`). A reroute marks the old row `invalidated` with the reason and writes a new row (new id, next version). Versions count up per incident because the table allows one row per incident and version. A decision the backend refuses (an `incident_id` not in the run) is dropped, not retried, so it cannot hold up unit positions.
+- Not done: the map does not draw moving units yet; step 2 is adding these tools to `agents/tools.py`, step 3 the resource and plan agents.
+
 ## 10. Open TODOs
 - Note (10 Oct): this folder was renamed from `sim-data-package/` to `simulation/` when it was merged with `main`. `scripts/plateau/` was removed (see `docs/PROVENANCE.md`); the loader and validator now live at the repo root in `../scripts/`; the duplicate schema and design doc were removed in favour of `../database/`. `map_id` is NOT unique, never key on it.
 - [x] J-SHIS surface-soil mesh loaded (10 Oct): `data/jshis/` CSV -> `soil_amp` on all 5,335 buildings, ARV 1.29-1.64. Loaded into Neon by Camila.

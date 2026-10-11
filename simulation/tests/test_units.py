@@ -54,6 +54,8 @@ def test_a_limited_road_is_driven_slowly():
 
 def test_a_blocked_road_is_found_on_arrival_reported_and_routed_around():
     f, unit, G, reports, links, beliefs = fleet(blocked=['B_C_0', 'C_B_0'])
+    decisions = []
+    f._on_decision = decisions.append
     f.dispatch(unit.id, now_s=0, building_id='bldg_x')   # planned on beliefs: nobody knows it is blocked
     f.tick(9)
     assert reports == [] and unit.task['version'] == 1
@@ -70,7 +72,9 @@ def test_a_blocked_road_is_found_on_arrival_reported_and_routed_around():
     f.tick(10_000)                                       # back B -> A -> D -> C: 10 + 15 + 15
     assert unit.status == 'busy' and unit.task['arrived_s'] == 10 + REROUTE_PAUSE_S + 40
     assert [e['kind'] for e in f.log] == ['dispatched', 'blocked', 'arrived']
-    assert len(f.view()[0]['abandoned_routes']) == 1 and f.decision(unit)['invalidated_reason']
+    assert [(d['version'], d['status']) for d in decisions] == [(1, 'sent'), (1, 'invalidated'), (2, 'sent')]
+    assert decisions[0]['id'] == decisions[1]['id'] != decisions[2]['id'] and decisions[1]['invalidated_reason']
+    assert len(f.view()[0]['abandoned_routes']) == 1 and f.view()[0]['decision']['reason']
     f.tick(20_000)
     assert len(reports) == 1                             # reported once
 

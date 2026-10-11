@@ -95,6 +95,52 @@ def test_reports_arrive_on_the_clock_and_one_run_plays_at_a_time(client):
     assert client.post('/runs', json={'speed': 7}).status_code == 422
 
 
+def test_agents_can_find_route_and_send_units(client):
+    import json, time
+    assert client.get('/units').json() == []                      # nothing is being played
+    assert client.post('/tools/nearest-units', json={'lon': 139.7, 'lat': 35.69}).status_code == 409
+    run = client.post('/runs', json={'seed': 42, 'mw': 7.4, 'speed': 20}).json()
+    units = client.get('/units').json()
+    assert len(units) == 13 and {u['status'] for u in units} == {'available'}
+    assert run['clock']['units'] == {'available': 13, 'en_route': 0, 'busy': 0}
+
+    target = next(b for b, d in run['building_damage'].items() if d['damage_level'] == 'collapsed')
+    near = client.post('/tools/nearest-units', json={'building_id': target, 'type': 'fire_engine', 'k': 2}).json()
+    assert len(near) == 2 and {n['type'] for n in near} == {'fire_engine'}
+    assert near[0]['travel_time_s'] <= near[1]['travel_time_s'] and near[0]['skills'] == ['rescue']
+    unit = near[0]['unit_id']
+
+    route = client.post('/tools/route', json={'unit_id': unit, 'building_id': target}).json()
+    assert route['reachable'] and route['road_ids'] and route['geometry']['type'] == 'LineString'
+    assert abs(route['travel_time_s'] - near[0]['travel_time_s']) < 1
+    assert client.get('/units').json() == units                    # asking sends nobody
+
+    assert client.post('/tools/route', json={'building_id': target}).status_code == 422       # no start
+    assert client.post('/tools/nearest-units', json={'building_id': 'nope'}).status_code == 422
+    assert client.post('/dispatch', json={'unit_id': unit, 'building_id': target, 'run_id': 'other'}).status_code == 409
+    assert client.post('/dispatch', json={'unit_id': 'nope', 'building_id': target}).status_code == 409
+
+    sent = client.post('/dispatch', json={'unit_id': unit, 'building_id': target, 'run_id': run['run_id']})
+    assert sent.status_code == 201
+    decision = sent.json()
+    assert decision['status'] == 'sent' and decision['version'] == 1 and decision['eta_s'] > 0
+    assert decision['route_geojson']['properties']['road_ids']
+    again = client.post('/dispatch', json={'unit_id': unit, 'building_id': target})
+    assert again.status_code == 409 and 'detail' in again.json()   # already on a job
+    assert unit not in {n['unit_id'] for n in client.post('/tools/nearest-units', json={'building_id': target, 'k': 20}).json()}
+
+    start = next(u for u in units if u['id'] == unit)
+    time.sleep(1.5)                                                # ~30 simulated seconds at 20x
+    now = next(u for u in client.get('/units').json() if u['id'] == unit)
+    assert (now['lon'], now['lat']) != (start['lon'], start['lat']) and now['destination']['building_id'] == target
+    assert now['decision']['id'] == decision['id'] and len(now['trail']) >= 2
+    saved = [json.loads(l) for l in open(server._state['storage'].runs_dir / run['run_id'] / 'resources.jsonl')]
+    assert saved and saved[0]['status'] == 'en_route'              # its position is saved as it drives
+    kept = [json.loads(l) for l in open(server._state['storage'].runs_dir / run['run_id'] / 'decisions.jsonl')]
+    assert kept[0]['id'] == decision['id'] and kept[0]['status'] == 'sent' and kept[0]['assignments'] == [{'resource_id': unit}]
+    assert client.post('/stop').json()['finished'] and client.get('/units').json() == []
+
+
 @pytest.fixture
 def neon_client(monkeypatch,tmp_path):
     from types import SimpleNamespace

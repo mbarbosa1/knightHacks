@@ -1,7 +1,8 @@
 """The live loop: one run playing out on a clock.
 
 A LiveRun owns the simulation clock for one run and makes things happen when their time comes.
-For now that is releasing reports; unit movement and mid-run events hook into the same tick.
+Each tick it releases the reports that are due, moves the responder units, and writes down what they
+do: where they are, and any road they find blocked.
 
     simulated seconds = real seconds elapsed x speed        (speed is 10 or 20 in the UI)
 
@@ -14,12 +15,16 @@ SPEEDS = (10, 20)         # 30x was dropped: a big earthquake's reports could no
 DEFAULT_SPEED = 20
 TICK_S = 0.25            # real seconds between ticks
 TAIL_S = 60              # simulated seconds the clock keeps running after the last scheduled thing
+SAVE_UNIT_EVERY_S = 2.0  # real seconds between saved positions of a moving unit (each save is a request)
 
 
 class LiveRun:
-    def __init__(self, run_id, reports, storage, speed=DEFAULT_SPEED, clock=time.monotonic, on_finish=None):
+    def __init__(self, run_id, reports, storage, speed=DEFAULT_SPEED, clock=time.monotonic, on_finish=None, fleet=None,
+                 schedule=None, on_due=None):
         """reports: [{'observation': {...}, ...}] in any order; each is released at its sim_time_s.
-        storage: anything with save_observation(obs). clock: injectable for tests."""
+        storage: anything with save_observation(obs). clock: injectable for tests.
+        fleet: the run's units (sim/units.py); moved every tick, their changes saved through storage.
+        schedule + on_due: [(sim_time_s, what)] and a callback, for things that should happen at a set time."""
         self.run_id = run_id
         self._queue = sorted((item['observation'] for item in reports), key=lambda o: o['sim_time_s'])
         self.total = len(self._queue)
@@ -30,6 +35,16 @@ class LiveRun:
         self._sim_s, self._last = 0.0, None     # simulated time banked so far, and when we last banked it
         self._released, self._last_error = 0, None
         self._stop, self._thread, self.finished = threading.Event(), None, False
+        self.fleet = fleet
+        self._outbox = []          # writes waiting to be saved, in order: nothing overtakes anything else
+        self._unit_saved = {}      # unit id -> (status, real time, location) as last saved
+        self._unit_reports = 0
+        self._schedule, self._on_due = sorted(schedule or [], key=lambda x: x[0]), on_due
+        if fleet is not None:
+            fleet._emit, fleet._on_blocked = self._unit_report, self._road_found_blocked
+            fleet._on_decision = self._decision_made
+            for u in fleet.units.values():   # the starting state is already saved with the run
+                self._unit_saved[u.id] = (u.status, self._clock(), fleet.resource_body(u, 0)['location'])
 
     # --- the clock ---------------------------------------------------------------------------------
     def _advance(self):
@@ -51,8 +66,10 @@ class LiveRun:
         return self.state()
 
     def state(self):
+        units = self.fleet.counts() if self.fleet is not None else None
         with self._lock:
-            return {'run_id': self.run_id, 'sim_time_s': round(self._advance(), 1), 'end_s': round(self.end_s, 1),
+            return {'units': units, 'unit_reports': self._unit_reports,
+                    'run_id': self.run_id, 'sim_time_s': round(self._advance(), 1), 'end_s': round(self.end_s, 1),
                     'speed': self._speed, 'playing': self._playing, 'finished': self.finished,
                     'reports_released': self._released, 'reports_total': self.total, 'last_error': self._last_error}
 
@@ -75,10 +92,65 @@ class LiveRun:
             with self._lock:
                 self._released += 1
                 self._last_error = None
+        while self._schedule and self._schedule[0][0] <= now_s:
+            _, what = self._schedule.pop(0)
+            if self._on_due:
+                self._on_due(what, now_s)
+        if self.fleet is not None:
+            self._move_units(now_s)
+        self._flush()
+        if self.fleet is not None and getattr(self.fleet.truth, 'pending_truth_writes', None):
+            self.fleet.truth.flush(self._storage)   # answer-key links for the units' own reports
+        moving = self.fleet is not None and self.fleet.counts()['en_route'] > 0
         with self._lock:
-            done = self._sim_s >= self.end_s and self._released == self.total
+            done = self._sim_s >= self.end_s and self._released == self.total and not moving and not self._outbox
         if done:
             self._finish()
+
+    # --- units -------------------------------------------------------------------------------------
+    def _move_units(self, now_s):
+        fleet = self.fleet
+        with fleet.lock:
+            fleet.tick(now_s)
+            snapshot = [(u.id, u.status, fleet.resource_body(u, now_s)) for u in fleet.units.values()]
+        real = self._clock()
+        for unit_id, status, body in snapshot:
+            last_status, last_real, last_location = self._unit_saved[unit_id]
+            changed = status != last_status or (status != 'en_route' and body['location'] != last_location)
+            if changed or (status == 'en_route' and real - last_real >= SAVE_UNIT_EVERY_S):
+                # Only the newest position of a unit is worth saving: drop any older one still waiting.
+                self._outbox = [w for w in self._outbox if not (w[0] == 'save_resource' and w[1][1] == unit_id)]
+                self._outbox.append(('save_resource', (self.run_id, unit_id, body)))
+                self._unit_saved[unit_id] = (status, real, body['location'])
+
+    def _unit_report(self, observation):
+        self._outbox.append(('save_observation', (observation,)))
+        self._unit_reports += 1
+
+    def _decision_made(self, row):
+        body = {k: v for k, v in row.items() if k not in ('id', 'run_id')}
+        self._outbox.append(('save_decision', (self.run_id, row['id'], body)))
+
+    def _road_found_blocked(self, road_ids, observation_id, sim_time_s):
+        # After the report it came from: the backend checks the report exists before accepting the belief.
+        for road_id in road_ids:
+            self._outbox.append(('save_road_restriction', (self.run_id, road_id, {
+                'status': 'BLOCKED', 'source_observation_id': observation_id, 'sim_time_s': round(sim_time_s, 1)})))
+
+    def _flush(self):
+        """Save what is waiting, oldest first. On a failure, stop and try again next tick from the same place."""
+        while self._outbox:
+            method, args = self._outbox[0]
+            try:
+                getattr(self._storage, method)(*args)
+            except Exception as exc:
+                with self._lock:
+                    self._last_error = str(exc)
+                if method != 'save_decision':
+                    return
+                # A decision is a record, not something the run depends on: one that is refused
+                # (say, an incident id that is not in the run) must not hold up everything behind it.
+            self._outbox.pop(0)
 
     def _finish(self):
         with self._lock:

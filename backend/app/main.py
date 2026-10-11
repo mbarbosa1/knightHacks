@@ -13,7 +13,7 @@ from psycopg_pool import PoolTimeout
 from . import repository
 from .config import Settings
 from .db import get_connection, make_pool
-from .models import IncidentPut, ObservationCreate, ResourcePut, RoadRestrictionPut, RunCreate, RunEnd, SimulationIngest
+from .models import DecisionPut, IncidentPut, ObservationCreate, ResourcePut, RoadRestrictionPut, RunCreate, RunEnd, SimulationIngest
 
 
 def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
@@ -107,6 +107,19 @@ def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
     @app.put("/runs/{run_id}/incidents/{incident_id}")
     async def incident(run_id: UUID, incident_id: UUID, body: IncidentPut, connection: Connection):
         return await repository.put_incident(connection, run_id, incident_id, body)
+
+    @app.put("/runs/{run_id}/decisions/{decision_id}")
+    async def decision(run_id: UUID, decision_id: UUID, body: DecisionPut, connection: Connection):
+        return await repository.put_decision(connection, run_id, decision_id, body)
+
+    @app.get("/runs/{run_id}/decisions")
+    async def decisions(run_id: UUID, connection: Connection,
+                        limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
+        await repository.require_run(connection, run_id)
+        return await (await connection.execute(
+            f"SELECT {repository.DECISION_COLUMNS} FROM ops.decisions WHERE run_id=%s ORDER BY incident_id, version, id LIMIT %s OFFSET %s",
+            (run_id, limit, offset),
+        )).fetchall()
 
     @app.put("/runs/{run_id}/road-restrictions/{road_id}")
     async def road_restriction(run_id: UUID, road_id: str, body: RoadRestrictionPut, connection: Connection):

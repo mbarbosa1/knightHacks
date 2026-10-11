@@ -114,6 +114,22 @@ class LocalStorage:
         self.save_run(run)
         return run
 
+    def save_resource(self, run_id, resource_id, body):
+        """A unit's current position and status (ops.resources). Locally: one line per change."""
+        self._append(run_id, 'resources.jsonl', [{'id': resource_id, **body}])
+
+    def save_road_restriction(self, run_id, road_id, body):
+        """A road belief (ops.road_restrictions). Locally: one line per change."""
+        self._append(run_id, 'road_restrictions.jsonl', [{'road_id': road_id, **body}])
+
+    def save_decision(self, run_id, decision_id, body):
+        """A dispatch decision (ops.decisions). Locally: one line per change."""
+        self._append(run_id, 'decisions.jsonl', [{'id': decision_id, **body}])
+
+    def load_road_restrictions(self, run_id):
+        """{road_id: status} agents believe. Local runs have no agents writing beliefs."""
+        return {}
+
     def save_truth_batch(self, rows):
         """Rows carry 'table' (Databricks table name); one file per table. Dedupes on event_id like Databricks."""
         by_file = {}
