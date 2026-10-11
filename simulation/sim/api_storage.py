@@ -39,7 +39,7 @@ import json, urllib.error, urllib.request, time, uuid
 from pathlib import Path
 from .submission import append_report, atomic_json, lock_for, read_job, write_job   # urllib is Python's built-in HTTP client: no extra package needed
 from shapely.geometry import shape          # turns GeoJSON geometry dicts into shapely shapes (the simulator does geometry math on them)
-from .storage import LocalStorage, StaticMap
+from .storage import LocalStorage, build_graph, make_static_map   # build_graph is re-exported for callers of this module
 
 
 # =============================================================================
@@ -76,26 +76,6 @@ def observation_body(obs):
     # Vague reports ("somewhere near the station") have no point at all -> location null.
     body['location'] = {'longitude': geom['coordinates'][0], 'latitude': geom['coordinates'][1]} if geom else None
     return body
-
-
-def build_graph(roads, road_geoms):
-    """The road graph sim/routing.py needs, rebuilt from static.road_segments instead of the local
-    road_graph.graphml (which only exists on machines with simulation/data/).
-
-    Same shape as the OSMnx graph: a MultiDiGraph whose edge (u, v, key) is road id "u_v_key", nodes
-    with x/y (lon/lat), and edges with length (m), travel_time (s) and geometry. travel_time is
-    length / speed, the same formula OSMnx's add_edge_travel_times uses.
-    """
-    import networkx as nx
-    G = nx.MultiDiGraph()
-    for rid, p in roads.items():
-        line = road_geoms[rid]
-        # An OSMnx edge geometry runs from node u to node v, so its ends give the node coordinates.
-        G.add_node(p['from_node'], x=line.coords[0][0], y=line.coords[0][1])
-        G.add_node(p['to_node'], x=line.coords[-1][0], y=line.coords[-1][1])
-        G.add_edge(p['from_node'], p['to_node'], key=int(rid.rsplit('_', 1)[1]), length=p['length_m'],
-                   travel_time=p['length_m'] / (p['speed_kmh'] / 3.6), geometry=line)
-    return G
 
 
 class ApiStorage:
@@ -162,15 +142,16 @@ class ApiStorage:
         road_geoms = {x['properties']['id']: shape(x['geometry']) for x in r}
         # StaticMap (sim/storage.py) keeps properties and geometry in separate dicts, all keyed by id
         # (building id bldg_<uuid>, road id u_v_key, facility id) -- the ids shared across map, graph and DB.
-        return StaticMap(
+        # make_static_map (sim/storage.py) puts everything in a fixed order and rounds Postgres REAL values,
+        # so a seed gives the same earthquake from Neon as from local files. It also builds the road graph.
+        return make_static_map(
             version,
             {x['properties']['id']: x['properties'] for x in b},           # buildings: id -> columns
             {x['properties']['id']: shape(x['geometry']) for x in b},      # buildings: id -> Polygon
             {x['id']: {**{k: v for k, v in x.items() if k != 'geometry'},  # facilities: id -> columns + lon/lat
                        'lon': x['geometry']['coordinates'][0], 'lat': x['geometry']['coordinates'][1]} for x in f},
             roads,                                                         # roads: id -> columns
-            road_geoms,                                                    # roads: id -> LineString
-            build_graph(roads, road_geoms))                                # NetworkX graph for routing
+            road_geoms)                                                    # roads: id -> LineString
 
     # =========================================================================
     # 4. WRITING A RUN

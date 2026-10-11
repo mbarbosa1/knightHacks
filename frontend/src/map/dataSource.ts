@@ -22,6 +22,11 @@ function rememberedRun(): string | undefined {
 }
 export const RUN_ID: string | undefined = env.VITE_RUN_ID ?? rememberedRun();
 
+/** Stop following the remembered run (Reset), so a reload does not bring its units back either. */
+export function forgetRun(): void {
+  try { window.sessionStorage.removeItem(RUN_KEY); } catch { /* storage may be disabled */ }
+}
+
 export type DamageLevel = "none" | "light" | "moderate" | "severe" | "collapsed";
 export type RoadStatus = "OPEN" | "LIMITED" | "BLOCKED";
 

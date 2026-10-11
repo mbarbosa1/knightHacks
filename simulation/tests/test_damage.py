@@ -113,3 +113,34 @@ def test_debris_blocks_only_nearby_roads():
     # collapsed 20 m building reaches 10 m, severe reaches 5 m, light sheds nothing
     assert {r: s['status'] for r, s in t.road_status.items()} == {'near_collapse': 'BLOCKED', 'near_severe': 'LIMITED'}
     assert 'tall' in t.road_status['near_collapse']['cause']
+
+
+def test_same_earthquake_whatever_the_map_source(static_map):
+    """Neon hands the same map back in id order, with float32 noise in REAL columns and era_probs keys
+    reordered by jsonb. make_static_map has to undo all three, or a seed means a different earthquake."""
+    import struct
+    from sim.people import compute_people
+    from sim.reports import generate_reports
+    from sim.roads import compute_road_damage
+    from sim.storage import make_static_map
+    f32 = lambda v: v if v is None else struct.unpack('f', struct.pack('f', v))[0]
+    jsonb = lambda d: {k: d[k] for k in sorted(d, key=lambda k: (len(k), k))}
+    local = LocalStorage().load_static_map()
+    buildings = {b: {**p, 'soil_amp': f32(p['soil_amp']), 'height_m': f32(p['height_m']), 'footprint_m2': f32(p['footprint_m2']),
+                     'era_probs': jsonb(p['era_probs'])} for b, p in reversed(list(local.buildings.items()))}
+    roads = {r: {**p, 'length_m': f32(p['length_m']), 'speed_kmh': f32(p['speed_kmh'])} for r, p in reversed(list(local.roads.items()))}
+    assert next(iter(buildings.values()))['soil_amp'] != next(reversed(local.buildings.values()))['soil_amp']   # the noise is real
+    from_db = make_static_map('shinjuku-v1', buildings, local.building_geoms, dict(reversed(list(local.facilities.items()))),
+                              roads, local.road_geoms)
+
+    def run(m):
+        t = TruthState('00000000-0000-4000-8000-000000000042')
+        sc = random_scenario(42, mw=7.4)
+        compute_building_damage(m, sc, t); compute_road_damage(m, t); compute_people(m, sc, t)
+        return t, generate_reports(m, sc, t)
+
+    (a, ra), (b, rb) = run(local), run(from_db)
+    assert a.building_damage == b.building_damage and a.sampled_attributes == b.sampled_attributes
+    assert a.road_status == b.road_status and a.people == b.people
+    assert ra == rb and len(ra) > 100
+    assert list(local.graph.edges(keys=True, data='travel_time')) == list(from_db.graph.edges(keys=True, data='travel_time'))
