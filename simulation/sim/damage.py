@@ -6,11 +6,13 @@ the split of Murao & Yamazaki's two damage states onto the five levels in truth_
 import math, random
 from . import damage_model as dm
 from .scenario import hypocentral_km
+from .storage import ERAS
 
 SEVERE_SHARE_OF_HALF = 0.4   # 'half' (official partial damage) -> severe, else moderate
 LIGHT_LAMBDA_SHIFT = 0.7     # P(light or worse) = the collapse+half curve at about half the PGV (e^-0.7)
 DEBRIS_LEVELS = ('severe', 'collapsed')
 
+#each of the 5k buildings in the static map data in the neon database are getting a damage level label
 
 def level_probs(structure, era, pgv_surf):
     """P(each of the five levels). collapsed and severe+moderate match damage_model.damage_probs exactly."""
@@ -26,9 +28,10 @@ def level_probs(structure, era, pgv_surf):
 
 def sample_era(props, rng):
     """Era is always inferred for Tokyo, so it is re-rolled from era_probs every run."""
+    probs = props.get('era_probs') or {}
     x, acc = rng.random(), 0
-    for era, v in (props.get('era_probs') or {}).items():
-        acc += v
+    for era in ERAS:   # fixed order: a source may list the keys differently (Postgres jsonb does)
+        acc += probs.get(era, 0)
         if x < acc:
             return era
     return props['era']

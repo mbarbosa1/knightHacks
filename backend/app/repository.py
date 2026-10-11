@@ -211,11 +211,19 @@ async def create_run(connection, body: RunCreate):
     await require_map(connection, body.map_version_id)
     # The seed is deliberately absent from the returned run context.
     row = await (await connection.execute(
-        '''INSERT INTO ops.simulation_runs (map_version_id, seed, hazard_types, status, started_at)
-           VALUES (%s,%s,%s,'created',now())
+        '''INSERT INTO ops.simulation_runs (id,map_version_id, seed, hazard_types, status, started_at)
+           VALUES (COALESCE(%s,gen_random_uuid()),%s,%s,%s,'created',now())
+           ON CONFLICT (id) DO NOTHING
            RETURNING id, map_version_id, hazard_types, status, started_at, ended_at''',
-        (body.map_version_id, body.seed, body.hazard_types),
+        (body.id, body.map_version_id, body.seed, body.hazard_types),
     )).fetchone()
+    if row is None:
+        stored = await (await connection.execute(
+            'SELECT map_version_id,seed,hazard_types FROM ops.simulation_runs WHERE id=%s', (body.id,)
+        )).fetchone()
+        if stored != {'map_version_id': body.map_version_id, 'seed': body.seed, 'hazard_types': body.hazard_types}:
+            raise HTTPException(409, 'Run ID already exists with a different configuration')
+        return await require_run(connection, body.id)
     await record_event(connection, row["id"], "simulation_runs", row["id"], "INSERT", row)
     return row
 
@@ -556,3 +564,112 @@ async def record_event(connection, run_id, table, row_id, operation, row, sim_ti
             "operation": operation, "row": row, "sim_time_s": sim_time_s,
         }))),
     )
+
+
+async def ingestion_status(connection, run_id):
+    await require_run(connection, run_id)
+    row = await (await connection.execute(
+        "SELECT payload FROM ops.operational_events WHERE run_id=%s AND table_name='simulation_ingestion' ORDER BY created_at DESC,event_id DESC LIMIT 1",
+        (run_id,),
+    )).fetchone()
+    counts = await (await connection.execute(
+        'SELECT (SELECT count(*) FROM ops.observations WHERE run_id=%s) AS observations, '
+        '(SELECT count(*) FROM ops.resources WHERE run_id=%s) AS resources', (run_id,run_id)
+    )).fetchone()
+    receipt = row['payload'] if row else None
+    return {'run_id': run_id, 'ready': receipt is not None,
+            'expected_observations': receipt['observations'] if receipt else None,
+            'expected_resources': receipt['resources'] if receipt else None,
+            'stored_observations': counts['observations'], 'stored_resources': counts['resources']}
+
+
+async def ingest_simulation(connection, run_id, body):
+    """Commit the initial reports, resources and readiness receipt atomically.
+
+    The receipt is only visible after commit. A retry of the same snapshot never
+    overwrites resource state that an agent may have updated afterwards.
+    """
+    import hashlib
+    import json
+    run = await require_run(connection, run_id, lock=True)
+    digest = hashlib.sha256(json.dumps(body.model_dump(mode='json'), sort_keys=True,
+                                     separators=(',', ':')).encode()).hexdigest()
+    receipt = await (await connection.execute(
+        "SELECT payload FROM ops.operational_events WHERE run_id=%s AND table_name='simulation_ingestion' LIMIT 1",
+        (run_id,),
+    )).fetchone()
+    if receipt:
+        if receipt['payload']['sha256'] != digest:
+            raise HTTPException(409, 'Run already initialized with a different snapshot')
+        return await ingestion_status(connection, run_id)
+    if run['ended_at'] is not None or run['status'] in {'completed','failed'}:
+        raise HTTPException(409, 'Run has ended')
+    obs_ids = [o.id for o in body.observations]
+    resource_ids = [r.id for r in body.resources]
+    if len(set(obs_ids)) != len(obs_ids) or len(set(resource_ids)) != len(resource_ids):
+        raise HTTPException(422, 'Snapshot IDs must be unique')
+    # One query reads all existing observations. Retrying an older per-report
+    # submission is supported, but conflicting IDs/content are rejected.
+    query = '''SELECT id,run_id,channel,format,original_text,lang,text_en,media_url,
+                      claimed_location,location_precision,source_reliability,received_at,sim_time_s,
+                      public.ST_X(claimed_geom) AS longitude,public.ST_Y(claimed_geom) AS latitude
+               FROM ops.observations WHERE id=ANY(%s::uuid[])'''
+    existing = {r['id']:r for r in await (await connection.execute(query,(obs_ids,))).fetchall()}
+    for obs in body.observations:
+        old = existing.get(obs.id)
+        if old and (old['run_id'] != run_id or not observation_matches(old,obs)):
+            raise HTTPException(409, 'Observation ID conflicts with stored data')
+    new_obs = [o for o in body.observations if o.id not in existing]
+    params = []
+    for o in new_obs:
+        lon = o.location.longitude if o.location else None
+        lat = o.location.latitude if o.location else None
+        params.append((o.id,run_id,o.channel,o.format,o.original_text,o.lang,o.text_en,o.media_url,
+                       o.claimed_location,lon,lon,lat,o.location_precision,o.source_reliability,o.sim_time_s))
+    if params:
+        async with connection.cursor() as cur:
+            await cur.executemany('''INSERT INTO ops.observations
+                (id,run_id,channel,format,original_text,lang,text_en,media_url,claimed_location,
+                 claimed_geom,location_precision,source_reliability,sim_time_s)
+                VALUES (%s,%s,%s::ops.observation_channel,%s,%s,%s,%s,%s,%s,
+                  CASE WHEN %s::double precision IS NULL THEN NULL ELSE
+                  public.ST_SetSRID(public.ST_MakePoint(%s,%s),4326) END,%s,%s,%s)''', params)
+        saved = await (await connection.execute(query,([o.id for o in new_obs],))).fetchall()
+        async with connection.cursor() as cur:
+            await cur.executemany(
+                'INSERT INTO ops.operational_events (run_id,table_name,row_id,payload) VALUES (%s,%s,%s,%s)',
+                [(run_id,'observations',str(r['id']),Jsonb(jsonable_encoder({
+                    'operation':'INSERT','row':r,'sim_time_s':r['sim_time_s']}))) for r in saved])
+    # Resource initialization uses the normal validated write layer, but only
+    # before the receipt exists. Once ready, snapshot retries never reset units.
+    for r in body.resources:
+        await put_resource(connection,run_id,r.id,r)
+    if run['status'] == 'created':
+        await connection.execute("UPDATE ops.simulation_runs SET status='running' WHERE id=%s",(run_id,))
+        await record_event(connection,run_id,'simulation_runs',run_id,'UPDATE',
+                           await require_run(connection,run_id))
+    await connection.execute(
+        'INSERT INTO ops.operational_events (run_id,table_name,row_id,payload) VALUES (%s,%s,%s,%s)',
+        (run_id,'simulation_ingestion',str(run_id),Jsonb({
+            'operation':'READY','sha256':digest,'observations':len(obs_ids),'resources':len(resource_ids)})))
+    return await ingestion_status(connection,run_id)
+
+
+async def list_observations(connection, run_id, limit, after=None):
+    """Stable cursor feed containing reports only, never simulator answer keys."""
+    await require_run(connection,run_id)
+    params = [run_id]
+    where = ''
+    if after is not None:
+        anchor = await (await connection.execute(
+            'SELECT received_at,id FROM ops.observations WHERE run_id=%s AND id=%s',(run_id,after)
+        )).fetchone()
+        if anchor is None:
+            raise HTTPException(404,'Observation cursor not found in this run')
+        where = ' AND (received_at,id) > (%s,%s)'
+        params.extend([anchor['received_at'],anchor['id']])
+    params.append(limit)
+    return await (await connection.execute('''SELECT id,run_id,channel,format,original_text,lang,text_en,
+        media_url,claimed_location,location_precision,source_reliability,received_at,sim_time_s,
+        public.ST_X(claimed_geom) AS longitude,public.ST_Y(claimed_geom) AS latitude
+        FROM ops.observations WHERE run_id=%s''' + where + ' ORDER BY received_at,id LIMIT %s',params)).fetchall()

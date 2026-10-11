@@ -26,10 +26,11 @@ def start_run(seed, storage=None, static_map=None, scenario=None, map_version='s
     storage = storage or LocalStorage()
     static_map = static_map or storage.load_static_map(map_version)
     sc = scenario or random_scenario(seed, mw=mw)
-    run_id, now = str(uuid.uuid4()), datetime.datetime.now(datetime.timezone.utc).isoformat()
-    storage.save_run({'id': run_id, 'map_version_id': static_map.version, 'seed': sc.seed,
-                      'hazard_types': list(sc.hazard_types), 'status': 'running',
-                      'started_at': now, 'ended_at': None})
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    # The storage may assign its own id (Neon does); everything after this uses the one it returns.
+    run_id = storage.save_run({'id': str(uuid.uuid4()), 'map_version_id': static_map.version, 'seed': sc.seed,
+                               'hazard_types': list(sc.hazard_types), 'status': 'running',
+                               'started_at': now, 'ended_at': None})
     truth = TruthState(run_id)
     truth.set_scenario({'seed': sc.seed, 'hazard_types': list(sc.hazard_types), 'params': sc.params(),
                         'map_version_id': static_map.version, 'simulator_version': SIMULATOR_VERSION,
@@ -39,11 +40,12 @@ def start_run(seed, storage=None, static_map=None, scenario=None, map_version='s
     compute_people(static_map, sc, truth)
     # Until the live loop exists, every report is released at once, stamped with the time it would arrive.
     start = datetime.datetime.fromisoformat(now)
-    reports = generate_reports(static_map, sc, truth, writer=writer)
+    truth.reports = generate_reports(static_map, sc, truth, writer=writer)
     if save_reports:
         with open(save_reports, 'w', encoding='utf-8') as f:
-            json.dump({'scenario': sc.params(), 'reports': reports}, f, ensure_ascii=False, indent=1)
-    for item in reports:
+            json.dump({'scenario': sc.params(), 'reports': truth.reports}, f, ensure_ascii=False, indent=1)
+    for item in truth.reports:
+
         obs = item['observation']
         storage.save_observation({**obs, 'received_at': (start + datetime.timedelta(seconds=obs['sim_time_s'])).isoformat()})
         for link in item['links']:
@@ -57,14 +59,22 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--seed', type=int, required=True)
     ap.add_argument('--mw', type=float, help='fix the magnitude instead of drawing it from the seed')
+    ap.add_argument('--api', help='backend URL (e.g. http://127.0.0.1:8000): read the map from Neon and write the run there')
+    ap.add_argument('--end', action='store_true', help='mark the run completed afterwards (no more writes, agents included)')
     ap.add_argument('--gemini', action='store_true', help='have Gemini write the report wording (opt-in)')
     ap.add_argument('--save-reports', metavar='PATH', help='also write reports + recipes + answer key to a JSON file')
     a = ap.parse_args()
+    storage = None
+    if a.api:
+        from .api_storage import ApiStorage
+        storage = ApiStorage(a.api)
     writer = None
     if a.gemini:
         from .report_writer import write_reports as writer
-    truth, sc, _ = start_run(a.seed, mw=a.mw, writer=writer, save_reports=a.save_reports)
-    i = [d['intensity'] for d in truth.building_damage.values()]
+    truth, sc, _ = start_run(a.seed, storage=storage, mw=a.mw, writer=writer, save_reports=a.save_reports)
+    if a.end:
+        (storage or LocalStorage()).end_run(truth.run_id)
+    i = [d['intensity'] for d in truth.building_damage.values()]    
     print(f'run {truth.run_id}  seed {sc.seed}  {sc.params()}')
     print(f'Intensity {shindo_class(min(i))} to {shindo_class(max(i))} (Japan scale), {min(i)}-{max(i)}')
     print(dict(collections.Counter(d['damage_level'] for d in truth.building_damage.values())))

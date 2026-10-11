@@ -13,7 +13,7 @@ from psycopg_pool import PoolTimeout
 from . import repository
 from .config import Settings
 from .db import get_connection, make_pool
-from .models import IncidentPut, ObservationCreate, ResourcePut, RoadRestrictionPut, RunCreate, RunEnd
+from .models import IncidentPut, ObservationCreate, ResourcePut, RoadRestrictionPut, RunCreate, RunEnd, SimulationIngest
 
 
 def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
@@ -47,7 +47,7 @@ def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
     for error in (ForeignKeyViolation, UniqueViolation, CheckViolation):
         app.add_exception_handler(error, conflict)
 
-    Connection = Annotated[object, Depends(get_connection)]
+    Connection = Annotated[object, Depends(get_connection, scope="function")]
 
     @app.get("/health/live")
     async def live():
@@ -124,6 +124,19 @@ def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
     @app.post("/runs/{run_id}/observations")
     async def observation(run_id: UUID, body: ObservationCreate, connection: Connection):
         return await repository.save_observation(connection, run_id, body)
+
+    @app.post("/runs/{run_id}/ingest")
+    async def ingest(run_id: UUID, body: SimulationIngest, connection: Connection):
+        return await repository.ingest_simulation(connection, run_id, body)
+
+    @app.get("/runs/{run_id}/ingestion")
+    async def ingestion(run_id: UUID, connection: Connection):
+        return await repository.ingestion_status(connection, run_id)
+
+    @app.get("/runs/{run_id}/observations")
+    async def observation_feed(run_id: UUID, connection: Connection,
+                               limit: int = Query(100, ge=1, le=1000), after: UUID | None = None):
+        return await repository.list_observations(connection, run_id, limit, after)
 
     @app.get("/runs/{run_id}/observations/{observation_id}")
     async def read_observation(run_id: UUID, observation_id: UUID, connection: Connection):

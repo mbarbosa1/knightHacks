@@ -226,6 +226,11 @@ def generate_reports(static_map, sc, truth, volume=1.0, writer=None):
     m, rng, places = static_map, random.Random(f'{sc.seed}:reports'), _Places(static_map)
     out, reposts = [], []
 
+    def new_id():
+        """Same seed -> same ids within a run, but different runs never share one (ops.observations.id is
+        unique across all runs). Still one draw from rng, so the rest of the stream doesn't shift."""
+        return str(uuid.uuid5(uuid.UUID(int=rng.getrandbits(128)), truth.run_id))
+
     def emit(kind, mix, pt, links, fields, props=None, match='matched', lang=None, when=None, allow_address=True, group=None):
         channel = _pick(rng, CHANNEL_MIX[mix])
         c = CHANNELS[channel]
@@ -248,7 +253,7 @@ def generate_reports(static_map, sc, truth, volume=1.0, writer=None):
             geom_pt = _offset(*geom_pt, rng.gauss(0, GEOM_ERROR_M[precision]), rng.gauss(0, GEOM_ERROR_M[precision]))
         lang = lang or _pick(rng, c['lang'])
         text, text_en = _render(kind, lang, c['style'], {**fields, 'place': (en, ja)})
-        obs = {'id': str(uuid.UUID(int=rng.getrandbits(128), version=4)), 'run_id': truth.run_id, 'channel': channel,
+        obs = {'id': new_id(), 'run_id': truth.run_id, 'channel': channel,
                'source_reliability': round(rng.uniform(*c['reliability']), 2), 'format': 'text', 'lang': lang,
                'original_text': text, 'text_en': text_en, 'media_url': None, 'claimed_location': stated,
                'claimed_geom': {'type': 'Point', 'coordinates': [round(geom_pt[0], 6), round(geom_pt[1], 6)]} if geom_pt else None,
@@ -266,7 +271,7 @@ def generate_reports(static_map, sc, truth, volume=1.0, writer=None):
                 'recipe': recipe}
         out.append(item)
         if channel == 'social_media' and rng.random() < REPOST:   # the same post again: a duplicate to merge
-            again = dict(obs, id=str(uuid.UUID(int=rng.getrandbits(128), version=4)),
+            again = dict(obs, id=new_id(),
                          original_text='RT ' + text, text_en='RT ' + text_en,
                          source_reliability=round(max(0.1, obs['source_reliability'] - 0.1), 2),
                          sim_time_s=round(obs['sim_time_s'] + rng.uniform(30, 300), 1))
