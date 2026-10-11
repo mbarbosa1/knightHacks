@@ -231,6 +231,11 @@ def generate_reports(static_map, sc, truth, volume=1.0, writer=None):
         unique across all runs). Still one draw from rng, so the rest of the stream doesn't shift."""
         return str(uuid.uuid5(uuid.UUID(int=rng.getrandbits(128)), truth.run_id))
 
+    def new_id():
+        """Same seed -> same ids within a run, but different runs never share one (ops.observations.id is
+        unique across all runs). Still one draw from rng, so the rest of the stream doesn't shift."""
+        return str(uuid.uuid5(uuid.UUID(int=rng.getrandbits(128)), truth.run_id))
+
     def emit(kind, mix, pt, links, fields, props=None, match='matched', lang=None, when=None, allow_address=True, group=None):
         channel = _pick(rng, CHANNEL_MIX[mix])
         c = CHANNELS[channel]

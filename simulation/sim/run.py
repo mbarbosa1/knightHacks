@@ -74,7 +74,8 @@ if __name__ == '__main__':
     truth, sc, _ = start_run(a.seed, storage=storage, mw=a.mw, writer=writer, save_reports=a.save_reports)
     if a.end:
         (storage or LocalStorage()).end_run(truth.run_id)
-    i = [d['intensity'] for d in truth.building_damage.values()]    
+    i = [d['intensity'] for d in truth.building_damage.values()]
+
     print(f'run {truth.run_id}  seed {sc.seed}  {sc.params()}')
     print(f'Intensity {shindo_class(min(i))} to {shindo_class(max(i))} (Japan scale), {min(i)}-{max(i)}')
     print(dict(collections.Counter(d['damage_level'] for d in truth.building_damage.values())))
