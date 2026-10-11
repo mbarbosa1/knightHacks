@@ -73,7 +73,7 @@ def test_the_run_finishes_once_everything_is_out_and_the_tail_has_passed():
     clock.t += 3
     run.tick()
     assert store.saved == ['r0'] and not run.finished
-    clock.t += 10                                       # far past 40 + TAIL_S simulated
+    clock.t += 1000                                     # far past 40 + TAIL_S simulated (TAIL_S is an hour now)
     run.tick()
     assert run.finished and ended == [run] and run.state()['sim_time_s'] == 40 + TAIL_S
     run.set(playing=True)

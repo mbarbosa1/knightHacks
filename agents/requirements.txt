@@ -2,3 +2,4 @@
 #   .venv/bin/pip install -r agents/requirements.txt
 -r ../simulation/requirements.txt
 psycopg[binary]>=3.1   # Neon as the agents role (agents/tools.py)
+pydantic>=2.0          # validates the medical agent's answer (agents/orchestrator.py)

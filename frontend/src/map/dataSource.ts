@@ -91,9 +91,69 @@ export interface OperationalState {
   }[];
   roadRestrictions: { road_id: string; status: RoadStatus }[];
   resources: { id: string; type: string; name: string | null; status: string; location: Point | null }[];
+  /** Dispatch decisions: the response agent's proposals (status "draft", awaiting the operator) and units sent. */
+  decisions: Decision[];
 }
 
-export const EMPTY_OPERATIONAL: OperationalState = { incidents: [], roadRestrictions: [], resources: [] };
+export interface Decision {
+  id: string;
+  incident_id: string | null;
+  version: number;
+  assignments: { resource_id: string; type?: string | null; why?: string }[] | null;
+  eta_s: number | null;
+  status: "draft" | "approved" | "invalidated" | "sent";
+  invalidated_reason: string | null;
+}
+
+export const EMPTY_OPERATIONAL: OperationalState = { incidents: [], roadRestrictions: [], resources: [], decisions: [] };
+
+export type Priority = "critical" | "high" | "medium" | "low";
+
+/** How urgent an incident is, from the people the agents believe are there: anyone critical or trapped first,
+ *  then injured, then damage with no casualties known; a disputed incident last. Lower rank = more urgent. */
+export function incidentPriority(incident: OperationalState["incidents"][number]):
+    { priority: Priority; rank: number; trapped: number; critical: number; injured: number } {
+  const count = (c: string) => (incident.person_groups ?? [])
+    .filter((g) => g.condition === c).reduce((n, g) => n + (g.est_count || 0), 0);
+  const trapped = count("trapped"), critical = count("critical"), injured = count("injured");
+  const priority: Priority = incident.status === "disputed" ? "low"
+    : critical || trapped ? "critical" : injured ? "high" : incident.status === "resolved" ? "low" : "medium";
+  const rank = ["critical", "high", "medium", "low"].indexOf(priority) * 1000 - (critical * 3 + trapped * 2 + injured);
+  return { priority, rank, trapped, critical, injured };
+}
+
+/** Approve a proposal: the simulator sends the unit (on the roads believed open), then the draft is marked
+ *  approved. Returns null, or the reason it could not go (unit no longer free, no way there). */
+export async function approveProposal(runId: string, decision: Decision,
+                                      incident: OperationalState["incidents"][number]): Promise<string | null> {
+  const unit = decision.assignments?.[0]?.resource_id;
+  const place = incident.building_id ? { building_id: incident.building_id }
+    : incident.location ? { lon: incident.location.coordinates[0], lat: incident.location.coordinates[1] } : null;
+  if (!unit || !place) return "This proposal has no unit or the incident has no location.";
+  const sent = await fetch(`${SIM_BASE}/dispatch`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ unit_id: unit, incident_id: incident.id, run_id: runId, ...place }),
+  });
+  if (!sent.ok) {
+    const detail = (await sent.json().catch(() => ({}))).detail;
+    await closeProposal(runId, decision, "invalidated", `Could not dispatch: ${detail ?? sent.statusText}`);
+    return typeof detail === "string" ? detail : "The simulator could not send this unit.";
+  }
+  await closeProposal(runId, decision, "approved", null);
+  return null;
+}
+
+export const rejectProposal = (runId: string, decision: Decision) =>
+  closeProposal(runId, decision, "invalidated", "Rejected by the operator");
+
+async function closeProposal(runId: string, d: Decision, status: Decision["status"], reason: string | null) {
+  if (!API_BASE) return;
+  await fetch(`${API_BASE}/runs/${runId}/decisions/${d.id}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ incident_id: d.incident_id, version: d.version, assignments: d.assignments ?? [],
+                           eta_s: d.eta_s, status, invalidated_reason: reason }),
+  });
+}
 
 async function getJson<T>(url: string): Promise<T> {
   const response = await fetch(url);
@@ -251,12 +311,13 @@ export async function loadOperationalState(runId: string | undefined = RUN_ID): 
   if (!operationalConnected || !runId) return EMPTY_OPERATIONAL;
   const run = `${API_BASE}/runs/${runId}`;
   // Field names follow the backend README; not yet exercised against a live run.
-  const [incidents, roadRestrictions, resources] = await Promise.all([
+  const [incidents, roadRestrictions, resources, decisions] = await Promise.all([
     getJson<OperationalState["incidents"]>(`${run}/incidents?limit=1000`),
     getJson<OperationalState["roadRestrictions"]>(`${run}/road-restrictions?limit=1000`),
     getJson<OperationalState["resources"]>(`${run}/resources?limit=1000`),
+    getJson<Decision[]>(`${run}/decisions?limit=1000`).catch(() => [] as Decision[]),
   ]);
-  return { incidents, roadRestrictions, resources };
+  return { incidents, roadRestrictions, resources, decisions };
 }
 
 /** A report as the backend's feed returns it (GET /runs/{id}/observations): what agents see, nothing more. */

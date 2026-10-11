@@ -100,7 +100,8 @@ def ask_json(system, user, image_url=None, max_tokens=500, retries=2, timeout=12
     last_error = None
     for attempt in range(retries + 1):
         try:
-            r = _post({'messages': messages, 'temperature': 0, 'max_tokens': max_tokens}, timeout)
+            r = _post({'messages': messages, 'temperature': 0, 'max_tokens': max_tokens}, timeout,
+                      AMD if os.environ.get('IN_AGENT_ON_AMD') == '1' or not AGENT else AGENT + AMD)
             r.raise_for_status()
             reply = r.json()['choices'][0]['message']['content']
         except (httpx.HTTPError, KeyError) as exc:

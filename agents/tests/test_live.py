@@ -33,5 +33,7 @@ def test_assessment_agents_run_on_one_report(agent):
     batch = [agent.normalize(report)]
     for name, result in orch.assess(batch).items():
         assert 'error' not in result, f'{name}: {result.get("error")}'
-        assert isinstance(result['output'], dict) and 'incidents' in result['output'], f'{name}: no hand-off JSON'
-        # log_agent_run(input_ref) is optional for the model: the runner writes every agent's ops.agent_runs entry
+        saved = orch.tools.get_last_agent_run(name)
+        assert saved and saved['id'] == result['audit_id'], f'{name} was not saved by the orchestrator'
+        assert saved['output'] == result['output']
+        assert saved['input_ref'] == report['id']

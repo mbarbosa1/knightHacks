@@ -14,7 +14,8 @@ import threading, time
 SPEEDS = (5, 10)          # 20x and 30x were dropped: a big earthquake's reports could not all be saved in time
 DEFAULT_SPEED = 10       # the fastest that keeps up: about 3 reports a second can be saved to Neon
 TICK_S = 0.25            # real seconds between ticks
-TAIL_S = 60              # simulated seconds the clock keeps running after the last scheduled thing
+TAIL_S = 3600            # simulated seconds the clock keeps running after the last report: rescues and the operator's
+                        # approvals happen after the reports stop (was 60, which froze units and controls)
 SAVE_UNIT_EVERY_S = 2.0  # real seconds between saved positions of a moving unit (each save is a request)
 
 
