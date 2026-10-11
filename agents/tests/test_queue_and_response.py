@@ -112,7 +112,7 @@ def test_batches_run_at_the_same_time(monkeypatch):
 
 def test_follow_switches_when_a_new_earthquake_is_generated(monkeypatch):
     runs = iter([None, 'run-A', 'run-A', 'run-B', 'stop'])
-    made, cycled = [], []
+    made, cycled, responding = [], [], []
 
     class Fake:
         def __init__(self, run_id, *a, **k):
@@ -125,9 +125,61 @@ def test_follow_switches_when_a_new_earthquake_is_generated(monkeypatch):
         def cycle(self, chunk):
             cycled.append(self.run_id)
             return 1
+
+        def keep_responding(self):      # the response agent's own loop starts with a run and stops when it is left
+            responding.append(self.run_id)
+
+        def stop_responding(self):
+            responding.remove(self.run_id)
+
+        def keep_reading(self):
+            pass
     monkeypatch.setattr(orchestrator, 'current_run', lambda: next(runs))
     monkeypatch.setattr(orchestrator, 'Orchestrator', Fake)
     monkeypatch.setattr(orchestrator.time, 'sleep', lambda s: None)
     with pytest.raises(KeyboardInterrupt):
         orchestrator.follow()
     assert made == ['run-A', 'run-B'] and cycled == ['run-A', 'run-A', 'run-B']
+    assert responding == ['run-B']                      # only the run on screen is being responded to
+
+
+def test_reports_of_trapped_people_open_an_incident_at_once_without_waiting_for_assessment():
+    """Triage is code: the in_agent has already read who is trapped and where."""
+    import threading
+    orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
+    incidents, logged = [], []
+
+    class Tools:
+        def find_nearby_incidents(self, lon, lat, radius_m):
+            return [i for i in incidents if abs(i['location']['longitude'] - lon) < 0.0003]
+        def upsert_incident(self, status, incident_id=None, **fields):
+            row = next((i for i in incidents if i['id'] == incident_id), None)
+            if row is None:
+                row = {'id': f'inc-{len(incidents) + 1}'}
+                incidents.append(row)
+            row.update(status=status, **fields)
+            return row
+        def log_agent_run(self, *a, **k): logged.append(a)
+    orch.tools = Tools()
+    record = lambda obs, lon, trapped, **more: {
+        'observation_id': obs, 'sim_time_s': 10, 'source_reliability': 0.9, 'urgency': 5,
+        'people': {'trapped': trapped, 'trapped_mentioned': True, **more.pop('people', {})},
+        'location': {'point': [lon, 35.69], 'uncertainty_m': 50,
+                     'building_candidates': [{'building_id': 'b-far', 'fits_description': False}, {'building_id': 'b-fits', 'fits_description': True}]}, **more}
+    out = orch.triage([record('o1', 139.700, 4), record('o2', 139.7001, 9), record('o3', 139.710, None),
+                       {'observation_id': 'o4', 'people': {'injured': 3}, 'location': {'point': [139.72, 35.69]}},   # nobody trapped
+                       {'observation_id': 'o5', 'people': {'trapped': 2, 'trapped_mentioned': True}, 'location': {}}])   # nowhere to send anyone
+    assert len(out['opened']) == 2 and out['reinforced'] == ['inc-1'] and len(incidents) == 2
+    first, second = incidents
+    assert first['status'] == 'corroborated' and first['building_id'] == 'b-fits' and first['evidence']['supports'] == ['o1', 'o2']
+    assert first['person_groups'][0]['condition'] == 'trapped' and first['person_groups'][0]['est_count'] == 9   # the larger count
+    assert second['status'] == 'reported' and second['person_groups'][0]['est_count'] is None
+    assert logged[0][0] == 'triage' and 'opened 2 incidents' in logged[0][2]['situation_summary']
+
+
+def test_the_most_urgent_reports_are_assessed_first():
+    orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
+    orch.tools = type('T', (), {'assessed_observations': lambda self: {'done'}, 'agent_outputs': lambda self, agent: [
+        {'observation_id': 'old-minor', 'urgency': 1, 'sim_time_s': 5}, {'observation_id': 'late-urgent', 'urgency': 5, 'sim_time_s': 90},
+        {'observation_id': 'done', 'urgency': 5, 'sim_time_s': 1}, {'observation_id': 'early-urgent', 'urgency': 5, 'sim_time_s': 20}]})()
+    assert [r['observation_id'] for r in orch.pending_assessment()] == ['early-urgent', 'late-urgent', 'old-minor']

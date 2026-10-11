@@ -28,7 +28,7 @@ Every batch is logged to Neon as an ops.agent_runs row (agent 'orchestrator') wi
 tool calls and errors. Each agent's own entry (agent = its name, output = its final answer, or its error) is
 written here too: the agent's log_agent_run(input_ref) call only tells us which report it got to.
 '''
-import argparse, concurrent.futures, pathlib, time
+import argparse, concurrent.futures, pathlib, threading, time
 from agents.llm import run_agent
 from agents.tools import RunTools
 from agents.loader import load_agent
@@ -55,7 +55,9 @@ RESPONSE_AGENTS = {
 
 
 class Orchestrator:
-    def __init__(self, run_id, instructions_override=None, batch_size=5, in_workers=6, parallel_batches=3):
+    _reading = False   # True while reports are read on their own thread (keep_reading)
+
+    def __init__(self, run_id, instructions_override=None, batch_size=5, in_workers=12, parallel_batches=3):
         self.in_agent = InAgent.for_run(run_id)
         self.tools = self.in_agent.tools          # one RunTools (map loaded once) shared by every agent
         self.run_id = run_id
@@ -74,6 +76,8 @@ class Orchestrator:
             if md.exists():
                 self.response[name] = (md.read_text(), tools)
         self._responded_to = None                 # the situation the response agent last acted on
+        self._responding = threading.Lock()       # one response round at a time
+        self._stop_responding = threading.Event()
         missing = sorted(set(ASSESSMENT_AGENTS) - set(self.assessment))
         print(f'Assessment agents: {sorted(self.assessment) or "none"}'
               + (f'; skipped (no .md yet): {missing}' if missing else ''), flush=True)
@@ -92,6 +96,77 @@ class Orchestrator:
         if failed:
             print(f'  in_agent: {len(failed)} failed (retried next cycle): {failed[0]["error"][:100]}', flush=True)
         return [r for r in records if not r['error']]
+
+    # ---- stage 1b: triage, by code ------------------------------------------
+    # A big earthquake sends hundreds of reports in minutes; detect and medical take a minute or more for five.
+    # A report that says people are trapped cannot wait for its turn. The in_agent has already read it (who,
+    # where, which building), so code opens the incident at once and the response agent can send help within
+    # seconds. Detect and medical still look at the report later and correct the incident.
+
+    def triage(self, records):
+        """Open or reinforce an incident for every record that reports trapped people. Returns what it did."""
+        opened, reinforced = [], []
+        for r in sorted(records, key=lambda r: r.get('sim_time_s') or 0):
+            people, where = r.get('people') or {}, r.get('location') or {}
+            point = where.get('point')
+            if not (people.get('trapped') or people.get('trapped_mentioned')) or not point:
+                continue
+            try:
+                candidates = where.get('building_candidates') or []
+                building = next((c for c in candidates if c.get('fits_description')), candidates[0] if candidates else None)
+                near = self.tools.find_nearby_incidents(point[0], point[1], TRIAGE_SAME_INCIDENT_M)
+                trapped = people.get('trapped')
+                if near:   # the same place is already known: one more report for it, and the larger count
+                    i = near[0]
+                    supports = list(dict.fromkeys(((i.get('evidence') or {}).get('supports') or []) + [r['observation_id']]))
+                    groups = [dict(g) for g in i.get('person_groups') or []]
+                    known = next((g for g in groups if g.get('condition') == 'trapped'), None)
+                    if known is None:
+                        groups.append(_trapped_group(trapped, r))
+                    elif trapped and trapped > (known.get('est_count') or 0):
+                        known['est_count'] = trapped
+                    self.tools.upsert_incident('corroborated' if len(supports) > 1 and i['status'] == 'reported' else i['status'],
+                                               location=i.get('location'), uncertainty_m=i.get('uncertainty_m'),
+                                               building_id=i.get('building_id'), person_groups=groups,
+                                               evidence={'supports': supports, 'contradicts': (i.get('evidence') or {}).get('contradicts') or []},
+                                               incident_id=i['id'], sim_time_s=r.get('sim_time_s'))
+                    reinforced.append(i['id'])
+                else:
+                    made = self.tools.upsert_incident('reported', location={'longitude': point[0], 'latitude': point[1]},
+                                                      uncertainty_m=where.get('uncertainty_m'),
+                                                      building_id=building['building_id'] if building else None,
+                                                      person_groups=[_trapped_group(trapped, r)],
+                                                      evidence={'supports': [r['observation_id']], 'contradicts': []},
+                                                      sim_time_s=r.get('sim_time_s'))
+                    opened.append(made['id'])
+            except Exception as exc:   # one report that cannot be triaged must not stop the others
+                print(f'  triage: skipped a report ({type(exc).__name__}: {str(exc)[:120]})', flush=True)
+        if opened or reinforced:
+            last = max(records, key=lambda r: r.get('sim_time_s') or 0)['observation_id']
+            n = len(opened) + len(reinforced)
+            self.tools.log_agent_run('triage', last, {
+                'situation_summary': f'{n} report{"" if n == 1 else "s"} of people trapped: opened {len(opened)} '
+                                     f'incident{"" if len(opened) == 1 else "s"}, added {len(reinforced)} to incidents already known.',
+                'incidents': opened + sorted(set(reinforced))}, run_key=f'triage:{last}')
+            print(f'  triage: {len(opened)} incidents opened, {len(reinforced)} reports added to known incidents', flush=True)
+        return {'opened': opened, 'reinforced': reinforced}
+
+    def keep_reading(self, interval_s=2, chunk=12):
+        """Read new reports continuously on their own thread (in_agent, then triage), so a slow assessment
+        batch never holds up the reading of the reports behind it. Small passes, so the first trapped people
+        are triaged a few seconds after their reports arrive instead of after a long first read."""
+        self._reading = True
+
+        def loop():
+            while not self._stop_responding.wait(interval_s):
+                try:
+                    reports = self.new_reports(chunk)
+                    if reports:
+                        print(f'{len(reports)} new reports -> in_agent', flush=True)
+                        self.triage(self.normalize(reports))
+                except Exception as exc:
+                    print(f'  reading failed, trying again: {type(exc).__name__}: {str(exc)[:160]}', flush=True)
+        threading.Thread(target=loop, name=f'read-{self.run_id[:8]}', daemon=True).start()
 
     # ---- stage 2: detect ‖ medical ‖ verify on one batch ---------------------
 
@@ -134,8 +209,30 @@ class Orchestrator:
     def respond(self):
         """Run the response agent if there is something it could do: an unresolved incident, a free unit,
         and a situation that has changed since it last looked. Returns its result, or None when skipped."""
-        if not self.response:
-            return None
+        if not self.response or not self._responding.acquire(blocking=False):
+            return None                            # a round is already under way; the next look catches up
+        try:
+            return self._respond()
+        finally:
+            self._responding.release()
+
+    def keep_responding(self, interval_s=5):
+        """Look for someone to send every few seconds, on its own thread, for as long as this run is worked on.
+        Assessment can take minutes for a batch; an incident it has already written should not wait for the
+        rest of the batch, and a unit that comes free should not wait either. A look costs no model time
+        unless there is a new need and a free unit."""
+        def loop():
+            while not self._stop_responding.wait(interval_s):
+                try:
+                    self.respond()
+                except Exception as exc:   # never let one bad look end the watching
+                    print(f'  response look failed: {type(exc).__name__}: {exc}', flush=True)
+        threading.Thread(target=loop, name=f'respond-{self.run_id[:8]}', daemon=True).start()
+
+    def stop_responding(self):
+        self._stop_responding.set()
+
+    def _respond(self):
         try:
             situation = self.tools.incidents_to_cover()
         except Exception as exc:   # no live run in the simulator, or it is not running: nothing to dispatch
@@ -193,15 +290,18 @@ class Orchestrator:
         """in_agent records not assessed yet, oldest first (also those left over from an earlier run of this)."""
         done = self.tools.assessed_observations()
         records = [r for r in self.tools.agent_outputs(IN_AGENT) if r.get('observation_id') not in done]
-        return sorted({r['observation_id']: r for r in records}.values(), key=lambda r: r.get('sim_time_s') or 0)
+        # Most urgent first (the in_agent rates each report 1-5), then oldest: with hundreds of reports waiting,
+        # the agents' time goes to the ones that matter.
+        return sorted({r['observation_id']: r for r in records}.values(),
+                      key=lambda r: (-(r.get('urgency') or 0), r.get('sim_time_s') or 0))
 
     def cycle(self, limit=None):
         """One pass: new reports -> in_agent, then every waiting in_agent record -> assessment, in batches.
         Returns how many items moved forward (0 = nothing to do)."""
-        reports = self.new_reports(limit)
+        reports = [] if self._reading else self.new_reports(limit)   # read on their own thread when watching
         if reports:
             print(f'{len(reports)} new reports -> in_agent', flush=True)
-            self.normalize(reports)
+            self.triage(self.normalize(reports))
         if not self.assessment:
             return len(reports)
         pending = self.pending_assessment()
@@ -220,10 +320,19 @@ class Orchestrator:
         """Keep going while reports arrive. Each cycle takes at most `chunk` new reports, so the first incidents
         appear after one small batch instead of after the in_agent has read the whole backlog."""
         print(f'Watching for new reports every {interval_s}s, {chunk} at a time (Ctrl+C to stop)...', flush=True)
+        self.keep_responding()   # the response agent does not wait for assessment batches
+        self.keep_reading()      # and neither does the reading of new reports
         while True:
             if not self.cycle(chunk):
-                self.respond()   # no new reports, but a unit may have come free or reported from the scene
                 time.sleep(interval_s)
+
+
+TRIAGE_SAME_INCIDENT_M = 60   # a report this close to a known incident is about the same place
+
+
+def _trapped_group(trapped, record):
+    return {'group_id': 'grp_trapped', 'est_count': trapped or None, 'condition': 'trapped',
+            'needs': ['extrication', 'medical'], 'confidence': record.get('source_reliability')}
 
 
 def _summary(result):
@@ -261,10 +370,12 @@ def follow(override=None, batch_size=5, parallel=3, chunk=10, interval_s=10):
                 print('   not ready for agents yet; checking again shortly', flush=True)
                 time.sleep(interval_s)
                 continue
-            orch = candidate
-        if orch is None or not orch.cycle(chunk):
             if orch is not None:
-                orch.respond()   # no new reports, but a unit may have come free or reported from the scene
+                orch.stop_responding()
+            orch = candidate
+            orch.keep_responding()   # the response agent does not wait for assessment batches
+            orch.keep_reading()      # and neither does the reading of new reports
+        if orch is None or not orch.cycle(chunk):
             time.sleep(interval_s)
 
 

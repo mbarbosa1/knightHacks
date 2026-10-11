@@ -202,3 +202,37 @@ def test_people_left_waiting_get_worse_unless_the_right_unit_is_working_there():
     f, unit, *_ = fleet(people={'trapped': 1})                            # a lone trapped person: critical, then dead
     f.tick(900)
     assert (count('trapped'), count('critical'), count('deceased')) == (0, 0, 1)
+
+
+def test_a_crew_that_finds_nobody_at_the_address_looks_around_and_helps_at_the_building_nearby():
+    """Reports give addresses, not exact buildings: the incident is often pinned on the neighbour."""
+    def with_neighbour(types, metres):
+        f, unit, G, reports, *_ = fleet(types=types)                        # nobody at bldg_x itself
+        c = G.nodes['C']
+        f.m.building_geoms['bldg_y'] = Point(c['x'] + metres / (111_320 * 0.812), c['y'])   # that far east of it
+        f.truth.building_damage['bldg_y'] = {'damage_level': 'collapsed'}
+        f.truth.set_people('bldg_y:g0', 'bldg_y', 2, 'trapped', 'immobile', 'ja', 0.0)
+        f._groups['bldg_y'] = {'trapped': 'bldg_y:g0'}
+        f.truth.changes.clear()
+        f.dispatch(unit.id, now_s=0, building_id='bldg_x')
+        return f, unit, reports
+
+    f, unit, reports = with_neighbour(('fire_engine',), 60)
+    f.tick(500)
+    said = json.loads(reports[-1]['original_text'])
+    assert said['action'] == 'rescued' and said['count'] == 2 and said['building_id'] == 'bldg_y' and 58 <= said['searched_m'] <= 62
+    assert 'from the reported address' in reports[-1]['text_en'] and f.outcomes['rescued'] == 2
+    assert f.truth.changes[0][0] == pytest.approx(20 + 30 + 60, abs=1)       # drive, half a minute on foot, then a minute a person
+
+    f, unit, reports = with_neighbour(('police',), 60)                       # a patrol reports what it finds nearby
+    f.tick(500)
+    said = json.loads(reports[-1]['original_text'])
+    assert said['action'] == 'assessed' and said['building_id'] == 'bldg_y' and said['trapped'] == 2
+
+    f, unit, reports = with_neighbour(('fire_engine',), 400)                 # too far to be the same incident
+    f.tick(500)
+    assert json.loads(reports[-1]['original_text'])['action'] == 'nothing_found' and f.outcomes['rescued'] == 0
+
+    f, unit, reports = with_neighbour(('ambulance',), 60)                    # nobody critical nearby: nothing for an ambulance
+    f.tick(500)
+    assert json.loads(reports[-1]['original_text'])['action'] == 'nothing_found'

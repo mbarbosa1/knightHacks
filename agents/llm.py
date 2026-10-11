@@ -98,12 +98,18 @@ def ask_json(system, user, image_url=None, max_tokens=500, retries=2, timeout=12
         {'type': 'text', 'text': user}]
     messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': content}]
     last_error = None
+    # IN_AGENT_LLM=hosted: the in_agent reads reports on the hosted endpoint too (a few seconds each, many at
+    # once) instead of the AMD server (about 30 s each, one at a time). AMD stays the fallback.
+    servers = AGENT if AGENT and setting('IN_AGENT_LLM', '').lower() == 'hosted' else None
     for attempt in range(retries + 1):
         try:
-            r = _post({'messages': messages, 'temperature': 0, 'max_tokens': max_tokens}, timeout)
+            r = _post({'messages': messages, 'temperature': 0, 'max_tokens': max_tokens}, timeout, servers)
             r.raise_for_status()
             reply = r.json()['choices'][0]['message']['content']
         except (httpx.HTTPError, KeyError) as exc:
+            if servers:                                   # the hosted endpoint failed: this report goes to AMD
+                servers, last_error = None, f'hosted model failed ({exc})'
+                continue
             last_error = f'model not reachable at {', '.join(BASE_URLS)} ({exc}); is the SSH tunnel open?'
             time.sleep(2 * (attempt + 1))
             continue

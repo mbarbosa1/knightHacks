@@ -928,7 +928,7 @@ button {
     color: #56d1cb;
 }
 
-.map-toolbar span {
+.map-toolbar>span {
     height: 1px;
     background: #34474e;
 }

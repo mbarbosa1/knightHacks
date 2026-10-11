@@ -46,6 +46,7 @@ interface Activity {
   note?: string;
 }
 const AGENT_NAME: Record<string, string> = {
+  triage: "Triage",
   detect_agent: "Detect agent",
   medical_agent: "Medical agent",
   response_agent: "Response agent",

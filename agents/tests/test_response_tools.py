@@ -102,16 +102,23 @@ def test_what_an_incident_could_use_follows_the_rescue_rules_and_the_field():
     engine, ambulance = {'type': 'fire_engine'}, {'type': 'ambulance'}
     assert use('reported', {'trapped': 3, 'critical': 1}, [], []) == ['ambulance', 'fire_engine']
     assert use('reported', {'trapped': 3, 'critical': 1}, [engine, ambulance], []) == []
-    assert use('reported', {'injured': 9}, [], []) == []                              # walking wounded: nobody is sent
-    assert use('reported', {'trapped': 12}, [], []) == ['fire_engine', 'fire_engine']  # two engines for a big one
-    assert use('reported', {'trapped': 12}, [engine], []) == ['fire_engine']
-    assert use('reported', {'trapped': 12}, [engine, engine], []) == []
+    assert use('reported', {'injured': 9}, [], []) == ['police']                      # "injured" often hides worse: a patrol looks
+    assert use('reported', {'injured': 9}, [], [{'unit_type': 'police', 'action': 'assessed', 'trapped': 0, 'critical': 0}]) == []
+    assert use('reported', {'safe': 4, 'unhurt_evacuated': 2}, [], []) == []          # everyone accounted for: nobody is sent
+    assert use('reported', {'trapped': 12}, [], []) == ['ambulance', 'fire_engine', 'fire_engine']  # two engines for a big one
+    assert use('reported', {'trapped': 12}, [engine, ambulance], []) == ['fire_engine']
+    assert use('reported', {'trapped': 12}, [engine, engine, ambulance], []) == []
     assert use('disputed', {}, [], []) == ['police'] and use('reported', {}, [], []) == ['police']
     assert use('disputed', {}, [{'type': 'police'}], []) == []
     seen = [{'unit_type': 'police', 'action': 'assessed', 'trapped': 0, 'critical': 2}]
     assert use('reported', {'trapped': 5}, [], seen) == ['ambulance']                  # the patrol's count replaces the estimate
     assert use('reported', {'trapped': 5}, [], [{'unit_type': 'fire_engine', 'action': 'nothing_found'}]) == []
     assert use('reported', {'trapped': 5}, [], [{'unit_type': 'fire_engine', 'action': 'rescued', 'count': 5, 'still_trapped': 0}]) == []
+    # Trapped people get an ambulance too, even with nobody reported critical...
+    assert use('reported', {'trapped': 4}, [], []) == ['ambulance', 'fire_engine'] and use('reported', {'trapped': 4}, [ambulance], []) == ['fire_engine']
+    # ...once: one that came and found nobody to treat, or treated who was there, is not sent again.
+    assert use('reported', {'trapped': 4}, [], [{'unit_type': 'ambulance', 'action': 'nothing_found'}]) == ['fire_engine']
+    assert use('reported', {'trapped': 4}, [], [{'unit_type': 'ambulance', 'action': 'treated', 'count': 2, 'still_critical': 0}]) == ['fire_engine']
 
 
 def test_a_list_of_units_is_sent_in_one_call_and_a_unit_cannot_go_twice(tools):
@@ -143,6 +150,7 @@ def test_the_orchestrator_records_what_was_really_sent_and_skips_the_model_when_
     tools.log_agent_run = lambda *a, **k: logged.append(a)
     orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
     orch.tools, orch.run_id, orch.cursor, orch._responded_to = tools, RUN, 'obs-9', None
+    orch._responding, orch._stop_responding = orchestrator.threading.Lock(), orchestrator.threading.Event()
     orch.response = {'response_agent': ('instructions', ['dispatch_units'])}
 
     def fake_model(instructions, payload, specs, functions, max_steps):
@@ -159,3 +167,31 @@ def test_the_orchestrator_records_what_was_really_sent_and_skips_the_model_when_
 
     tools_module._sim('GET', '/units')[1]['status'] = 'busy'                          # now no ambulance is free
     assert orch.respond() is None and len(asked) == 1
+
+
+def test_the_response_agent_looks_on_its_own_and_never_runs_two_rounds_at_once(tools, monkeypatch):
+    import threading, time
+    orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
+    orch.run_id, orch.response = RUN, {'response_agent': ('instructions', ['dispatch_units'])}
+    orch._responding, orch._stop_responding = threading.Lock(), threading.Event()
+    looks, inside = [], threading.Event()
+
+    def slow_round():
+        looks.append(time.monotonic())
+        inside.set()
+        time.sleep(0.15)
+        return 'done'
+    orch._respond = slow_round
+    first = threading.Thread(target=orch.respond)
+    first.start()
+    inside.wait(1)
+    assert orch.respond() is None and len(looks) == 1     # a round is under way: this look is skipped, not queued
+    first.join()
+
+    orch.keep_responding(interval_s=0.05)                  # on its own thread, with nobody calling it
+    time.sleep(0.5)
+    orch.stop_responding()
+    seen = len(looks)
+    assert seen >= 3
+    time.sleep(0.3)
+    assert len(looks) <= seen + 1                          # and it stops when the run is no longer worked on

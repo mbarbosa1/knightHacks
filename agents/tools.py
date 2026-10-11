@@ -396,7 +396,8 @@ class RunTools:
             people, needs = {}, set()
             for g in i['person_groups'] or []:
                 condition = str(g.get('condition') or 'unknown').lower()
-                people[condition] = people.get(condition, 0) + int(g.get('est_count') or 0)
+                # A group with no count still means somebody is there: count it as one, not as nobody.
+                people[condition] = people.get(condition, 0) + int(g.get('est_count') or 1)
                 needs.update(g.get('needs') or [])
             on_it = [{'unit_id': u['id'], 'type': u['type'], 'status': u['status']} for u in units
                      if u['status'] != 'available' and (u['destination'] or {}).get('incident_id') == i['id']]
@@ -616,33 +617,42 @@ def _merge_groups(old, new):
 
 
 SECOND_ENGINE_FROM = 8   # trapped people from which a second engine is worth sending
+SAFE_CONDITIONS = ('safe', 'unhurt_evacuated', 'deceased', 'minor')
 
 
 def _could_use(status, people, on_it, field_reports):
     """The kinds of unit an incident could still use, from the rescue rules: an engine frees the trapped, an
     ambulance treats the critical, a patrol checks what is unclear. What a unit reported first-hand overrides
-    the estimate. Facts for the response agent to decide with; it still chooses who goes and in what order."""
+    the estimate. Facts for the response agent to decide with; it still chooses who goes and in what order.
+
+    Where people are trapped an ambulance goes too, even if nobody is reported critical: callers rarely know
+    who is critical under the rubble, there usually is someone, and the trapped turn critical as they wait.
+    One that finds nobody to treat loses a minute; one that was never sent can cost lives."""
     trapped, critical = people.get('trapped', 0), people.get('critical', 0)
-    assessed = False
+    assessed = ambulance_has_been = False
     for r in field_reports:   # oldest first, so the latest word wins
         if r.get('action') == 'assessed':
             trapped, critical, assessed = r.get('trapped', 0), r.get('critical', 0), True
         elif r.get('action') == 'rescued':
-            trapped = r.get('still_trapped', 0)
+            trapped, assessed = r.get('still_trapped', 0), True   # a crew has been there: no patrol needed to look
         elif r.get('action') == 'treated':
-            critical = r.get('still_critical', 0)
+            critical, ambulance_has_been, assessed = r.get('still_critical', 0), True, True
         elif r.get('action') == 'nothing_found':
             if r.get('unit_type') == 'fire_engine':
                 trapped = 0
             elif r.get('unit_type') == 'ambulance':
-                critical = 0
+                critical, ambulance_has_been = 0, True
             assessed = True
     there = [u['type'] for u in on_it]
     out = []
-    if critical and 'ambulance' not in there:
+    if (critical or (trapped and not ambulance_has_been)) and 'ambulance' not in there:
         out.append('ambulance')
     out += ['fire_engine'] * max(0, ((2 if trapped >= SECOND_ENGINE_FROM else 1) if trapped else 0) - there.count('fire_engine'))
-    if not trapped and not critical and not assessed and not there and (status == 'disputed' or not people):
+    # Nobody known trapped or critical, and nobody has looked: a patrol goes to see, unless everyone there is
+    # known to be safe. "Injured" from a caller often hides worse, and a patrol's count then brings the
+    # engines and ambulances.
+    unclear = status == 'disputed' or not people or any(n and c not in SAFE_CONDITIONS for c, n in people.items())
+    if not trapped and not critical and not assessed and not there and unclear:
         out.append('police')
     return out
 

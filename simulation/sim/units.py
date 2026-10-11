@@ -27,6 +27,8 @@ RESCUE_S_OTHER = 20
 TREAT_S = 30              # to treat one critical person
 ASSESS_S = 120            # for a patrol to look the scene over and report
 NOTHING_S = 60            # a unit that finds nothing it can do stays this long before it is free again
+SEARCH_RADIUS_M = 150     # a unit that finds nobody at the address looks this far around it
+SEARCH_SPEED_MPS = 2.0    # and gets there on foot at this speed
 WORSEN_AFTER_S = 600      # how long people can wait before any of them get worse
 WORSEN_EVERY_S = 300      # and how often after that
 WORSEN_SHARE = 0.2        # the share that gets worse each time (rounded up: a lone person does)
@@ -222,12 +224,37 @@ class Fleet:
         unit.task['arrived_s'] = at_s
         self.log.append({'t': at_s, 'kind': 'arrived', 'unit_id': unit.id, 'text': f'{unit.name} on scene'})
         skill = unit.skills[0] if unit.skills else None
-        building_id = unit.task['destination']['building_id']
+        building_id, walk_s = unit.task['destination']['building_id'], 0.0
+        # Reports give addresses, not exact buildings. A crew that finds nobody at the door does what a real
+        # one does: it looks around, and goes to the nearest building where it can see people it can help.
+        wanted = [skill] if skill in NEEDS else ['rescue', 'medical'] if skill == 'assess' else []
+        if wanted and not any(self._waiting(building_id, s) for s in wanted):
+            found = self._look_around(unit.task['destination'], wanted)
+            if found:
+                building_id, metres = found
+                unit.task['searched_m'] = round(metres)
+                walk_s = metres / SEARCH_SPEED_MPS
+        at_s += walk_s
+        unit.task['work_at'] = building_id   # where it works; its destination stays the address it was sent to
         secs = ASSESS_S if skill == 'assess' else self._secs_per_person(skill, building_id) if self._waiting(building_id, skill) else None
         unit.task['work'] = {'skill': skill, 'done': 0, 'working': secs is not None and skill != 'assess',
                              'next_s': at_s + (secs or NOTHING_S)}
 
     # --- work on scene -----------------------------------------------------------------------------
+    def _look_around(self, destination, skills):
+        """(building_id, metres) of the nearest building within SEARCH_RADIUS_M of the address where people
+        are waiting for one of these skills, or None."""
+        best = None
+        for building_id, groups in self._groups.items():
+            if not any(self._waiting(building_id, s) for s in skills):
+                continue
+            c = self.m.building_geoms[building_id].centroid
+            metres = math.hypot((c.x - destination['lon']) * 111_320 * math.cos(math.radians(destination['lat'])),
+                                (c.y - destination['lat']) * 110_540)
+            if metres <= SEARCH_RADIUS_M and (best is None or metres < best[1]):
+                best = (building_id, metres)
+        return best
+
     def _waiting(self, building_id, skill):
         """How many people at this building this skill can still help."""
         gid = self._groups.get(building_id, {}).get(NEEDS.get(skill))
@@ -241,7 +268,7 @@ class Fleet:
 
     def _work(self, unit):
         """The unit has reached the end of one piece of work: one person helped, or its look around done."""
-        w, building_id = unit.task['work'], unit.task['destination']['building_id']
+        w, building_id = unit.task['work'], unit.task['work_at']
         at_s = w['next_s']
         if w['working'] and self._waiting(building_id, w['skill']):
             self._help_one(building_id, w['skill'], at_s)
@@ -263,7 +290,7 @@ class Fleet:
 
     def _worsen(self, at_s):
         """People still waiting get worse, except where a unit that can help them is at work."""
-        helped = {(u.task['destination']['building_id'], u.task['work']['skill'])
+        helped = {(u.task['work_at'], u.task['work']['skill'])
                   for u in self.units.values() if u.status == 'busy' and u.task['work']['working']}
         for building_id, groups in self._groups.items():
             trapped = 0 if (building_id, 'rescue') in helped else self._waiting(building_id, 'rescue')
@@ -282,7 +309,7 @@ class Fleet:
 
     def _leave(self, unit, at_s):
         """Nothing left here for this unit: it reports what it did (or saw) and is free where it stands."""
-        w, building_id = unit.task['work'], unit.task['destination']['building_id']
+        w, building_id = unit.task['work'], unit.task['work_at']
         counts = {c: self.truth.people[g]['count'] for c, g in self._groups.get(building_id, {}).items()}
         seen = {c: counts.get(c, 0) for c in ('trapped', 'critical', 'injured', 'deceased')}
         if w['skill'] == 'assess':
@@ -298,6 +325,9 @@ class Fleet:
         else:
             facts = {'action': 'nothing_found', **seen}
             text = f"{unit.name}: {'nobody trapped' if w['skill'] == 'rescue' else 'no critical patients'} here. Unit free."
+        if unit.task.get('searched_m'):
+            facts['searched_m'] = unit.task['searched_m']
+            text += f" (found {unit.task['searched_m']} m from the reported address)"
         observation = {
             'id': str(uuid.uuid5(uuid.UUID(self.run_id), f"{unit.id}:{unit.task['decision_id']}:left")), 'run_id': self.run_id,
             'channel': 'responder_update', 'source_reliability': RESPONDER_RELIABILITY, 'format': 'structured', 'lang': 'en',
