@@ -92,7 +92,19 @@ class RunTools:
     def list_observations(self, after=None, ids=None):
         """Reports in feed order. ids: only these; after: only reports after this observation id."""
         if ids:
-            return [_get(f'/runs/{self.run_id}/observations/{i}') for i in ids]
+            found, missing = [], []
+            for i in ids:
+                try:
+                    found.append(_get(f'/runs/{self.run_id}/observations/{i}'))
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code not in (404, 422):
+                        raise
+                    missing.append(i)
+            if missing:
+                raise ToolError(f'these ids are not reports of this event: {missing}. Use only observation_ids '
+                                f'from your input or from list_observations() results'
+                                + (f'; these were found: {[o["id"] for o in found]}' if found else ''))
+            return found
         out = []
         while True:
             page = _get(f'/runs/{self.run_id}/observations', limit=500, **({'after': after} if after else {}))
@@ -300,12 +312,19 @@ class RunTools:
 
     # ---- offering the tools to the model ------------------------------------
 
-    def toolbox(self, agent, names):
+    def toolbox(self, agent, names, done=None):
         """(specs, functions) for llm.run_agent: the named tools described for the model, and callables.
-        get_last_agent_run / log_agent_run are bound to this agent, matching the .md signatures
-        (get_last_agent_run(), log_agent_run(input_ref, output))."""
-        bound = {'get_last_agent_run': lambda: self.get_last_agent_run(agent),
-                 'log_agent_run': lambda input_ref, output: self.log_agent_run(agent, input_ref, output)}
+        get_last_agent_run is bound to this agent. log_agent_run(input_ref) only records, in `done`, the last
+        report the agent processed: the agent then gives its final answer as plain text and the orchestrator
+        saves both to ops.agent_runs. (Passing the whole answer inside a tool call made the model server crash:
+        "json parser could not parse region as JSON".) An `output` argument, if the model still sends one, is kept."""
+        done = {} if done is None else done
+
+        def mark_done(input_ref, output=None, **_):
+            done.update(input_ref=input_ref, **({'output': output} if output is not None else {}))
+            return {'ok': True, 'next': 'Now reply with your final JSON answer as plain text, not in a tool call.'}
+
+        bound = {'get_last_agent_run': lambda: self.get_last_agent_run(agent), 'log_agent_run': mark_done}
         functions = {n: bound.get(n) or getattr(self, n) for n in names}
         specs = [{'type': 'function', 'function': {'name': n, 'description': TOOL_SPECS[n][0],
                                                    'parameters': {'type': 'object', 'properties': TOOL_SPECS[n][1],
@@ -350,9 +369,10 @@ TOOL_SPECS = {
                              {'road_id': {'type': 'string', 'description': 'only an id returned by find_nearest_road'},
                               'status': {'type': 'string', 'enum': list(ROAD_STATUSES)},
                               'source_observation_id': {'type': 'string'}}, ['road_id', 'status']),
-    'log_agent_run': ('Record this invocation and your final output. Always call it last, even if nothing changed.',
-                      {'input_ref': {'type': 'string', 'description': 'last observation id you processed'},
-                       'output': {'type': 'object'}}, ['input_ref', 'output']),
+    'log_agent_run': ('Call this last, every time, with only the id of the last report you processed. Then reply '
+                      'with your final JSON answer as plain text (not inside a tool call).',
+                      {'input_ref': {'type': 'string', 'description': 'last observation id you processed'}},
+                      ['input_ref']),
 }
 
 

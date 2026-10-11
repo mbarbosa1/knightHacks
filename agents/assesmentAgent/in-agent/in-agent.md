@@ -55,11 +55,13 @@ Reply with **only** a JSON object with exactly these keys:
 - **event_type:** the most serious thing reported. People trapped in a collapse → `building_collapse`
   (and set the people fields). Only injuries → `injuries`. "Road blocked / closed / impassable" →
   `road_blocked`. "Slow / one lane / partly blocked" → `road_limited`. Nothing damaged → `no_damage`.
-  Asking whether others are OK → `request_info`.
+  Shaking felt, furniture moved or small items fell, and no one hurt → `no_damage` (not `injuries`:
+  use `injuries` only when the report says someone is hurt). Asking whether others are OK → `request_info`.
 - **building_type:** "school building" → `education_welfare`; "shop-house" / 店舗付き住宅 → `house_with_shop`;
   "apartment" / "mansion" / マンション → `apartment`; null if no building is described.
 - **building_floors:** "5-storey" / "5階建て" → 5. Null if not said.
-- **people_*:** numbers only when the report gives one ("about 20" → 20 with `count_is_estimate: true`).
+- **people_*:** numbers only when the report gives one ("about 20" → 20 with `count_is_estimate: true`;
+  no number at all → `count_is_estimate: null`).
   "People are trapped" with no number → `people_trapped: null`, `trapped_mentioned: true`.
   "In critical condition" / 重体 counts as injured.
 - **hazards:** only from the list above, only if mentioned. Empty list if none.
@@ -82,7 +84,7 @@ Reply with **only** a JSON object with exactly these keys:
 
 ## For developers (not sent to the model)
 
-Code: `in_agent.py`. Everything above the line before this section is the model's system prompt.
+Code: `in_agent.py` (same folder). Everything above the line before this section is the model's system prompt.
 The allowed values above must match `EVENT_TYPES`, `BUILDING_TYPES` and the hazard list in `in_agent.py`.
 
 **Tools** (from `agents/tools.py`, called by code after the model replies, not by the model):
@@ -121,6 +123,6 @@ landmark 145–324 m): `gps` 30 m, `address` 120 m, `landmark` 350 m, `vague` no
 means the location is ambiguous and verify-agent should combine reports before trusting one building.
 Fields are hints for the next agents; the report in `ops.observations` stays the source of truth.
 
-Run it: `.venv/bin/python -m agents.assesmentAgent.in_agent <run_id> [--limit 10]` from the repo root,
+Run it: `.venv/bin/python agents/assesmentAgent/in-agent/in_agent.py <run_id> [--limit 10]` from the repo root,
 with `./dev.sh` running and the SSH tunnel to the AMD server open. Each record is saved as one Neon
 `ops.agent_runs` row (agent `in_agent`, `input_ref` = observation id) via the `log_agent_run` tool.

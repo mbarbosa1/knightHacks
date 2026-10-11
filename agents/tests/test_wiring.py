@@ -1,0 +1,150 @@
+"""The pieces fit together: every agent the orchestrator runs has its .md, every tool it may use exists and is
+described for the model, the .md files name only tools the agent gets, and write tools reject bad input
+before touching the database."""
+import re
+import pytest
+from agents import orchestrator
+from agents.tools import RunTools, TOOL_SPECS, ToolError
+
+
+@pytest.mark.parametrize('name', sorted(orchestrator.ASSESSMENT_AGENTS))
+def test_agent_instructions_exist(name):
+    path, _ = orchestrator.ASSESSMENT_AGENTS[name]
+    assert (orchestrator.AGENTS_DIR / path).exists(), f'{name}: {path} not found'
+
+
+@pytest.mark.parametrize('name', sorted(orchestrator.ASSESSMENT_AGENTS))
+def test_agent_tools_exist(name):
+    _, tools = orchestrator.ASSESSMENT_AGENTS[name]
+    for tool in tools:
+        assert tool in TOOL_SPECS, f'{name}: {tool} has no description for the model'
+        assert hasattr(RunTools, tool), f'{name}: {tool} is not implemented in tools.py'
+
+
+@pytest.mark.parametrize('name', sorted(orchestrator.ASSESSMENT_AGENTS))
+def test_md_names_only_tools_the_agent_gets(name):
+    path, tools = orchestrator.ASSESSMENT_AGENTS[name]
+    in_md = set(re.findall(r'^\| `(\w+)\(', (orchestrator.AGENTS_DIR / path).read_text(), re.M))
+    assert in_md, f'{name}: no tools table found in its .md'
+    assert in_md <= set(tools), f'{name}: .md mentions tools it is not given: {sorted(in_md - set(tools))}'
+
+
+def test_in_agent_loads_from_its_folder():
+    assert orchestrator.IN_AGENT == 'in_agent'
+    assert orchestrator.InAgent.__name__ == 'InAgent'
+
+
+def test_tool_specs_are_valid_for_the_model():
+    for name, (description, params, required) in TOOL_SPECS.items():
+        assert description and isinstance(params, dict)
+        assert set(required) <= set(params), f'{name}: required parameter not defined'
+
+
+def test_toolbox_binds_the_agent_name():
+    tools = RunTools.__new__(RunTools)
+    seen, done = {}, {}
+    tools.get_last_agent_run = lambda agent: seen.setdefault('last', agent)
+    specs, functions = tools.toolbox('medical_agent', ['get_last_agent_run', 'log_agent_run'], done)
+    assert [s['function']['name'] for s in specs] == ['get_last_agent_run', 'log_agent_run']
+    functions['get_last_agent_run']()
+    assert seen == {'last': 'medical_agent'}
+
+
+def test_log_agent_run_tool_only_marks_progress():
+    """The model must not put its whole answer in a tool call: that crashed the model server
+    ("json parser could not parse region as JSON"). The tool takes only input_ref."""
+    assert TOOL_SPECS['log_agent_run'][2] == ['input_ref'] and 'output' not in TOOL_SPECS['log_agent_run'][1]
+    done = {}
+    _, functions = RunTools.__new__(RunTools).toolbox('detect_agent', ['log_agent_run'], done)
+    reply = functions['log_agent_run'](input_ref='obs9')
+    assert done == {'input_ref': 'obs9'} and 'final JSON answer' in reply['next']
+    functions['log_agent_run'](input_ref='obs9', output={'incidents': []})   # an old-style call still works
+    assert done['output'] == {'incidents': []}
+
+
+class FakeTools:
+    def __init__(self):
+        self.logged = []
+
+    def toolbox(self, agent, names, done):
+        return RunTools.toolbox(RunTools.__new__(RunTools), agent, ['log_agent_run'], done)
+
+    def log_agent_run(self, agent, input_ref, output, duration_ms=None):
+        self.logged.append((agent, input_ref, output))
+
+
+def fake_orchestrator(agents):
+    orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
+    orch.run_id, orch.cursor, orch.tools = 'run', None, FakeTools()
+    orch.assessment = {name: ('instructions', ['log_agent_run']) for name in agents}
+    return orch
+
+
+def test_orchestrator_logs_each_agents_final_answer(monkeypatch):
+    def agent(instructions, payload, specs, functions):
+        functions['log_agent_run'](input_ref='obs2')
+        return {'output': {'incidents': [{'incident_id': 'i1'}], 'situation_summary': 'ok'}, 'tool_calls': [], 'steps': 2}
+    monkeypatch.setattr(orchestrator, 'run_agent', agent)
+    orch = fake_orchestrator(['detect_agent', 'medical_agent'])
+    results = orch.assess([{'observation_id': 'obs1'}, {'observation_id': 'obs2'}])
+    assert set(results) == {'detect_agent', 'medical_agent'} and orch.cursor == 'obs2'
+    assert sorted(orch.tools.logged) == [(n, 'obs2', {'incidents': [{'incident_id': 'i1'}], 'situation_summary': 'ok'})
+                                         for n in ('detect_agent', 'medical_agent')]
+
+
+def test_orchestrator_logs_a_failed_agent_and_keeps_the_others(monkeypatch):
+    def agent(instructions, payload, specs, functions):
+        if 'boom' in instructions:
+            raise RuntimeError('model server error 500')
+        return {'output': {'incidents': []}, 'tool_calls': [], 'steps': 1}
+    monkeypatch.setattr(orchestrator, 'run_agent', agent)
+    orch = fake_orchestrator(['detect_agent', 'medical_agent'])
+    orch.assessment['detect_agent'] = ('boom', ['log_agent_run'])
+    results = orch.assess([{'observation_id': 'obs1'}])
+    assert 'error' in results['detect_agent'] and 'error' not in results['medical_agent']
+    logged = dict((a, out) for a, _, out in orch.tools.logged)
+    assert logged['detect_agent'] == {'error': 'RuntimeError: model server error 500'}
+    assert logged['medical_agent'] == {'incidents': []}
+
+
+# ---- write tools check their input before any database call ----------------------
+
+@pytest.fixture
+def offline_tools():
+    tools = RunTools.__new__(RunTools)
+    tools.run_id = '00000000-0000-0000-0000-000000000000'
+    tools.map = type('Map', (), {'roads': {'1_2_0': {}}})()
+    return tools
+
+
+@pytest.mark.parametrize('kwargs, message', [
+    ({'status': 'maybe'}, 'status must be one of'),
+    ({'status': 'reported', 'person_groups': [{'group_id': 'g'}, {'group_id': 'g'}]}, 'own group_id'),
+    ({'status': 'reported', 'person_groups': [{'est_count': 2}]}, 'own group_id'),
+    ({'status': 'reported', 'location': {'longitude': 139.7}}, 'both longitude and latitude'),
+])
+def test_upsert_incident_rejects_bad_input(offline_tools, kwargs, message):
+    with pytest.raises(ToolError, match=message):
+        offline_tools.upsert_incident(**kwargs)
+
+
+def test_set_road_restriction_rejects_bad_input(offline_tools):
+    with pytest.raises(ToolError, match='status must be one of'):
+        offline_tools.set_road_restriction('1_2_0', 'CLOSED')
+    with pytest.raises(ToolError, match='not on this run'):
+        offline_tools.set_road_restriction('9_9_9', 'BLOCKED')
+
+
+# ---- orchestrator bookkeeping ------------------------------------------------------
+
+def test_summary_counts_writes_and_errors():
+    result = {'seconds': 2, 'steps': 4, 'output': {'incidents': [1, 2], 'situation_summary': 'two'}, 'tool_calls': [
+        {'tool': 'upsert_incident', 'args': {}, 'ok': True},
+        {'tool': 'set_road_restriction', 'args': {}, 'ok': False, 'error': 'ToolError: road'},
+        {'tool': 'log_agent_run', 'args': {'input_ref': 'o'}, 'ok': True}]}
+    s = orchestrator._summary(result)
+    assert s['incidents'] == 2 and s['summary'] == 'two' and s['writes_ok'] == 1 and s['tool_errors'] == ['ToolError: road']
+
+
+def test_summary_of_a_failed_agent():
+    assert orchestrator._summary({'error': 'LLMError: down', 'seconds': 1}) == {'error': 'LLMError: down', 'seconds': 1}

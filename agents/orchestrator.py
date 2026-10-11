@@ -3,15 +3,16 @@ Orchestrator: runs the agents in the order of the team architecture diagram. It 
 WHEN and passes each one's output to the next; it does no AI work itself.
 
     new reports ──► in_agent (each report, in parallel)
-                ──► detect_agent ‖ medical_agent ‖ verify_agent   (same batch, in parallel)
-                ──► [assessment coordinator ──► response: resource ‖ route ──► plan ──► report]   (next)
+                ──► detect_agent ‖ medical_agent                  (same batch, in parallel)
+                ──► [assessment coordination ──► response: resource ‖ route ──► plan]   (next)
 
 Run it (from the repo root; ./dev.sh running; SSH tunnel to the AMD server open):
     .venv/bin/python -m agents.orchestrator <run_id>              # process every report not done yet, then stop
     .venv/bin/python -m agents.orchestrator <run_id> --watch      # keep checking for new reports (live loop)
     .venv/bin/python -m agents.orchestrator <run_id> --batch-size 5 --limit 10
 
-An agent takes part once its instructions file exists (agents/<group>/<name>.md); until then it is skipped,
+An agent takes part once its instructions file exists (agents/<group>/<name>/<name>.md, e.g.
+assesmentAgent/detect-agent/detect-agent.md); until then it is skipped,
 so teammates can add agents one at a time. Try an instructions file before committing it with
     --instructions detect_agent=/path/to/detect-agent.md
 
@@ -19,12 +20,16 @@ Batches: assessment agents get a few normalized reports at a time (default 5), o
 sees the incidents the previous one created and the model's context stays small.
 
 Every batch is logged to Neon as an ops.agent_runs row (agent 'orchestrator') with each agent's result,
-tool calls and errors; the agents log their own runs too (log_agent_run in their .md).
+tool calls and errors. Each agent's own entry (agent = its name, output = its final answer, or its error) is
+written here too: the agent's log_agent_run(input_ref) call only tells us which report it got to.
 '''
 import argparse, concurrent.futures, pathlib, time
 from agents.llm import run_agent
 from agents.tools import RunTools
-from agents.assesmentAgent.in_agent import InAgent, AGENT as IN_AGENT
+from agents.loader import load_agent
+
+_in_agent = load_agent('assesmentAgent/in-agent/in_agent.py')
+InAgent, IN_AGENT = _in_agent.InAgent, _in_agent.AGENT
 
 AGENTS_DIR = pathlib.Path(__file__).resolve().parent
 
@@ -34,12 +39,9 @@ ASSESSMENT_AGENTS = {
                      ['get_run', 'list_observations', 'list_incidents', 'get_last_agent_run', 'find_nearby_incidents',
                       'find_nearby_buildings', 'find_nearest_road', 'upsert_incident', 'set_road_restriction',
                       'log_agent_run']),
-    'medical_agent': ('assesmentAgent/medical-agent.md',
+    'medical_agent': ('assesmentAgent/medical-agent/medical-agent.md',
                       ['get_run', 'list_observations', 'list_incidents', 'get_last_agent_run', 'find_nearby_incidents',
                        'upsert_incident', 'log_agent_run']),
-    'verify_agent': ('assesmentAgent/verify-agent.md',
-                     ['get_run', 'list_observations', 'list_incidents', 'get_last_agent_run', 'find_nearby_incidents',
-                      'find_nearby_buildings', 'upsert_incident', 'log_agent_run']),
 }
 
 
@@ -84,13 +86,20 @@ class Orchestrator:
 
         def one(name):
             instructions, tool_names = self.assessment[name]
-            specs, functions = self.tools.toolbox(name, tool_names)
+            done = {}                                   # filled by the agent's log_agent_run(input_ref) call
+            specs, functions = self.tools.toolbox(name, tool_names, done)
             started = time.monotonic()
             try:
                 result = run_agent(instructions, payload, specs, functions)
-                return name, {**result, 'seconds': round(time.monotonic() - started, 1)}
+                output = result['output'] if isinstance(result['output'], dict) and result['output'] else done.get('output')
+                result = {**result, 'output': output, 'seconds': round(time.monotonic() - started, 1)}
             except Exception as exc:   # one agent failing must not stop the others
-                return name, {'error': f'{type(exc).__name__}: {exc}', 'seconds': round(time.monotonic() - started, 1)}
+                result = {'error': f'{type(exc).__name__}: {exc}', 'seconds': round(time.monotonic() - started, 1)}
+            # The agent's audit entry, written by code (also when it failed): ops.agent_runs + outbox row.
+            self.tools.log_agent_run(name, done.get('input_ref') or batch[-1]['observation_id'],
+                                     result.get('output') or {'error': result.get('error')},
+                                     int(result['seconds'] * 1000))
+            return name, result
 
         with concurrent.futures.ThreadPoolExecutor(max(1, len(self.assessment))) as pool:
             results = dict(pool.map(one, self.assessment))
