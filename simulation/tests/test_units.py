@@ -133,7 +133,7 @@ def test_an_engine_frees_the_trapped_one_by_one_then_reports_and_is_free():
     assert f.truth.people['bldg_x:g1']['count'] == 2                      # an engine does not treat the critical
     assert [c[0] for c in f.truth.changes if c[1] == 'rescued'] == [80, 140, 200]
     said = json.loads(reports[-1]['original_text'])
-    assert said == {'unit_id': unit.id, 'building_id': 'bldg_x', 'action': 'rescued', 'count': 3, 'still_trapped': 0}
+    assert said == {'unit_id': unit.id, 'incident_id': None, 'building_id': 'bldg_x', 'action': 'rescued', 'count': 3, 'still_trapped': 0}
     assert reports[-1]['sim_time_s'] == 200 and '3 people freed' in reports[-1]['text_en'] and links[-1][2:4] == ('building', 'bldg_x')
     assert f.view()[0]['helped'] == 3 and [e['kind'] for e in f.log] == ['dispatched', 'arrived', 'left']
 
@@ -179,7 +179,7 @@ def test_a_patrol_looks_and_reports_what_is_really_there():
     assert unit.status == 'busy' and reports == []
     f.tick(141)
     assert unit.status == 'available' and f.truth.changes == []            # it helps nobody itself
-    assert json.loads(reports[0]['original_text']) == {'unit_id': unit.id, 'building_id': 'bldg_x', 'action': 'assessed',
+    assert json.loads(reports[0]['original_text']) == {'unit_id': unit.id, 'incident_id': None, 'building_id': 'bldg_x', 'action': 'assessed',
                                                        'damage_level': 'collapsed', 'trapped': 5, 'critical': 1, 'injured': 7, 'deceased': 0}
     assert 'building collapsed' in reports[0]['text_en'] and '5 trapped' in reports[0]['text_en']
 

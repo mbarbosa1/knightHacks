@@ -45,6 +45,7 @@ from sim.roads import to_metres                # noqa: E402
 from agents.llm import setting                 # noqa: E402
 
 BACKEND_URL = setting('BACKEND_URL', 'http://127.0.0.1:8000').rstrip('/')
+SIM_URL = setting('SIM_URL', 'http://127.0.0.1:8100').rstrip('/')   # the simulator service: units, routes, dispatch
 AGENTS_DATABASE_URL = setting('AGENTS_DATABASE_URL')
 INCIDENT_STATUSES = ('reported', 'corroborated', 'disputed', 'resolved')
 ROAD_STATUSES = ('OPEN', 'LIMITED', 'BLOCKED')
@@ -253,6 +254,155 @@ class RunTools:
             _event(conn, self.run_id, 'road_restrictions', road_id, 'UPSERT', row, sim_time_s)
             return _json(row)
 
+    # ---- response: units, routes, dispatch (the simulator service) ----------
+    # The simulator owns the units: it knows where each one is, plans on the roads the agents believe
+    # open (never the truth), and moves a unit once it is dispatched. These tools only ask it.
+
+    def _incident_place(self, incident_id):
+        """Where an incident is, as the simulator wants it: its building, else its point."""
+        try:
+            with _db() as conn:
+                row = conn.execute(f'SELECT {INCIDENT_COLUMNS} FROM ops.incidents WHERE run_id = %s AND id = %s',
+                                   (self.run_id, incident_id)).fetchone()
+        except psycopg.errors.InvalidTextRepresentation as exc:
+            raise ToolError('incident_id must be an id from incidents_to_cover or list_incidents') from exc
+        if row is None:
+            raise ToolError(f'incident {incident_id} is not in this event: use an id from incidents_to_cover')
+        if row['building_id'] in self.map.building_geoms:
+            return {'building_id': row['building_id']}
+        if row['location']:
+            return {'lon': row['location']['longitude'], 'lat': row['location']['latitude']}
+        raise ToolError(f'incident {incident_id} has no location yet, so nobody can be sent to it')
+
+    def _units(self):
+        if _sim('GET', '/clock').get('run_id') != self.run_id:
+            raise ToolError('this event is not the one being played in the simulator, so it has no units')
+        return _sim('GET', '/units')
+
+    def list_resources(self, status=None, type=None):
+        """The responder units right now: type, status (available / en_route / busy), where each is, the
+        incident it was last sent to, and how many people it has helped on that job."""
+        return [{'unit_id': u['id'], 'name': u['name'], 'type': u['type'], 'status': u['status'],
+                 'longitude': u['lon'], 'latitude': u['lat'],
+                 'incident_id': (u['destination'] or {}).get('incident_id'), 'helped': u['helped']}
+                for u in self._units() if status in (None, u['status']) and type in (None, u['type'])]
+
+    def nearest_units(self, incident_id, type=None, k=3):
+        """The k available units (of a type, if given) that can reach an incident soonest, with travel_time_s.
+        Units with no way there on the roads believed open are left out."""
+        body = {**self._incident_place(incident_id), 'run_id': self.run_id, 'k': k, **({'type': type} if type else {})}
+        return _sim('POST', '/tools/nearest-units', body)
+
+    def plan_route(self, unit_id, incident_id):
+        """Whether a unit can reach an incident and how long it would take. Sends nobody."""
+        r = _sim('POST', '/tools/route', {**self._incident_place(incident_id), 'run_id': self.run_id, 'unit_id': unit_id})
+        if not r.get('reachable'):
+            return {'reachable': False}
+        fallback = r.get('fallback')
+        return {'reachable': True, 'travel_time_s': r['travel_time_s'], 'length_m': r['length_m'],
+                'has_fallback': bool(fallback), 'fallback_travel_time_s': fallback['travel_time_s'] if fallback else None}
+
+    def dispatch_unit(self, unit_id, incident_id):
+        """Send an available unit to an incident. It sets off at once; the decision is recorded in ops.decisions."""
+        d = _sim('POST', '/dispatch', {**self._incident_place(incident_id), 'run_id': self.run_id,
+                                       'unit_id': unit_id, 'incident_id': incident_id})
+        return {'dispatched': True, 'decision_id': d['id'], 'version': d['version'], 'unit_id': unit_id,
+                'incident_id': incident_id, 'eta_s': d['eta_s']}
+
+    def list_decisions(self, status=None):
+        """Dispatch decisions of this event: who was sent where, and which were invalidated and why."""
+        return [{'decision_id': d['id'], 'incident_id': d['incident_id'], 'version': d['version'], 'status': d['status'],
+                 'unit_ids': [a.get('resource_id') for a in d['assignments'] or []], 'eta_s': d['eta_s'],
+                 'invalidated_reason': d['invalidated_reason']}
+                for d in _get(f'/runs/{self.run_id}/decisions', limit=1000) if status in (None, d['status'])]
+
+    def list_field_reports(self):
+        """What units reported first-hand, oldest first: a road found BLOCKED, or what they did or saw on
+        scene (action: assessed / rescued / treated / nothing_found, with counts)."""
+        out = []
+        for o in self.list_observations():
+            if o['channel'] != 'responder_update':
+                continue
+            try:
+                facts = json.loads(o['original_text'])
+            except (TypeError, ValueError):
+                continue
+            out.append({'observation_id': o['id'], 'sim_time_s': o['sim_time_s'], **facts, 'text': o['text_en']})
+        return sorted(out, key=lambda r: r['sim_time_s'])
+
+    def dispatch_units(self, assignments):
+        """Send several units at once: [{unit_id, incident_id}, ...]. Each is tried on its own, so one that
+        cannot go (not available, no way there, used twice in the list) does not stop the others."""
+        sent, refused, used = [], [], set()
+        for a in assignments or []:
+            unit_id, incident_id = (a or {}).get('unit_id') or (a or {}).get('unit'), (a or {}).get('incident_id') or (a or {}).get('incident')
+            try:
+                if not unit_id or not incident_id:
+                    raise ToolError('each assignment needs a unit and an incident')
+                if unit_id in used:
+                    raise ToolError('this unit is already used earlier in this list: a unit goes to one incident')
+                d = self.dispatch_unit(unit_id, incident_id)
+                used.add(unit_id)
+                sent.append({'unit_id': unit_id, 'incident_id': incident_id, 'eta_s': d['eta_s'], 'decision_id': d['decision_id']})
+            except ToolError as exc:
+                refused.append({'unit_id': unit_id, 'incident_id': incident_id, 'reason': str(exc)})
+        return {'sent': sent, 'refused': refused}
+
+    def incidents_to_cover(self, limit=10):
+        """The response picture in one call: every incident that is not resolved, with the people believed
+        there by condition, the units already on it, what units reported from the scene, the kinds of unit it
+        could still use, and the nearest free units of those kinds; plus how many units of each type are free.
+        Most urgent first; only the first `limit` that could use a unit are listed."""
+        units = self._units()
+        unit_type = {u['id']: u['type'] for u in units}
+        reports = {}
+        for r in self.list_field_reports():
+            if r.get('incident_id') and r.get('action'):
+                reports.setdefault(r['incident_id'], []).append(
+                    {'unit_type': unit_type.get(r.get('unit_id')),
+                     **{k: v for k, v in r.items() if k not in ('observation_id', 'unit_id', 'incident_id', 'building_id', 'text')}})
+        incidents = []
+        for i in self.list_incidents():
+            if i['status'] == 'resolved':
+                continue
+            people, needs = {}, set()
+            for g in i['person_groups'] or []:
+                condition = str(g.get('condition') or 'unknown').lower()
+                people[condition] = people.get(condition, 0) + int(g.get('est_count') or 0)
+                needs.update(g.get('needs') or [])
+            on_it = [{'unit_id': u['id'], 'type': u['type'], 'status': u['status']} for u in units
+                     if u['status'] != 'available' and (u['destination'] or {}).get('incident_id') == i['id']]
+            field = reports.get(i['id'], [])
+            located = bool(i['building_id'] or i['location'])
+            incidents.append({'incident_id': i['id'], 'status': i['status'], 'people': people, 'needs': sorted(needs),
+                              'has_location': located, 'units_on_it': on_it, 'field_reports': field[-3:],
+                              'could_use': _could_use(i['status'], people, on_it, field) if located else []})
+        free = {t: sum(1 for u in units if u['type'] == t and u['status'] == 'available') for t in ('fire_engine', 'ambulance', 'police')}
+        urgency = lambda i: (-i['people'].get('critical', 0), -i['people'].get('trapped', 0))
+        open_, rest = [i for i in incidents if i['could_use']], [i for i in incidents if not i['could_use']]
+        open_.sort(key=urgency)
+        for i in open_[:limit]:   # who could go: asked of the simulator here, so the model does not have to
+            i['nearest_free'] = {}
+            for t in dict.fromkeys(i['could_use']):
+                if free[t]:
+                    try:
+                        i['nearest_free'][t] = [{'unit_id': n['unit_id'], 'name': n['name'], 'travel_time_s': round(n['travel_time_s'])}
+                                                for n in self.nearest_units(i['incident_id'], type=t, k=3)]
+                    except ToolError:
+                        i['nearest_free'][t] = []
+                else:
+                    i['nearest_free'][t] = []
+        # A first plan by the plain rule: most urgent incident first, the nearest unit nobody else has taken.
+        suggested, taken = [], set()
+        for i in open_[:limit]:
+            for t in i['could_use']:
+                unit = next((u for u in i['nearest_free'][t] if u['unit_id'] not in taken), None)
+                if unit:
+                    taken.add(unit['unit_id'])
+                    suggested.append({'unit_id': unit['unit_id'], 'incident_id': i['incident_id'], 'type': t})
+        return {'incidents': open_[:limit], 'free_units': free, 'suggested': suggested,
+                'not_listed': {'more_that_could_use_a_unit': max(0, len(open_) - limit), 'nothing_needed_now': len(rest)}}
+
     # ---- agent audit log (ops.agent_runs) ----------------------------------
 
     def log_agent_run(self, agent, input_ref, output, duration_ms=None, run_key=None):
@@ -369,11 +519,85 @@ TOOL_SPECS = {
                              {'road_id': {'type': 'string', 'description': 'only an id returned by find_nearest_road'},
                               'status': {'type': 'string', 'enum': list(ROAD_STATUSES)},
                               'source_observation_id': {'type': 'string'}}, ['road_id', 'status']),
+    'incidents_to_cover': ('The response picture in one call: unresolved incidents that could use a unit, most urgent '
+                           'first, with the people believed there, units already on it, field reports, could_use '
+                           '(unit types still useful) and nearest_free (nearest available units of those types); '
+                           'plus free_units per type.', {}, []),
+    'dispatch_units': ('Send several units at once. Each sets off immediately. Returns which were sent (with eta_s) and '
+                       'which were refused and why. A unit may appear only once in the list.',
+                       {'assignments': {'type': 'array', 'items': {'type': 'object', 'properties': {
+                           'unit': {'type': 'string', 'description': 'a unit from your input, e.g. "A1"'},
+                           'incident': {'type': 'string', 'description': 'an incident from your input, e.g. "I2"'}},
+                           'required': ['unit', 'incident']}}}, ['assignments']),
+    'list_resources': ('Responder units right now: type (fire_engine / ambulance / police), status (available / '
+                       'en_route / busy), position, the incident each was last sent to.',
+                       {'status': {'type': 'string', 'enum': ['available', 'en_route', 'busy']},
+                        'type': {'type': 'string', 'enum': ['fire_engine', 'ambulance', 'police']}}, []),
+    'nearest_units': ('The k available units of a type that can reach an incident soonest, with travel_time_s. '
+                      'Units that cannot get there are left out.',
+                      {'incident_id': {'type': 'string'}, 'type': {'type': 'string', 'enum': ['fire_engine', 'ambulance', 'police']},
+                       'k': {'type': 'integer'}}, ['incident_id']),
+    'plan_route': ('Whether a unit can reach an incident, the travel time, and whether a fallback route exists. Sends nobody.',
+                   {'unit_id': {'type': 'string'}, 'incident_id': {'type': 'string'}}, ['unit_id', 'incident_id']),
+    'dispatch_unit': ('Send one available unit to one incident. It sets off at once. Returns the decision, or an '
+                      'error saying why it cannot go (not available, or no way there).',
+                      {'unit_id': {'type': 'string', 'description': 'only a unit_id returned by nearest_units'},
+                       'incident_id': {'type': 'string', 'description': 'only an incident_id from incidents_to_cover'}},
+                      ['unit_id', 'incident_id']),
+    'list_decisions': ('Dispatch decisions so far: unit, incident, status (sent / invalidated) and why one was invalidated.',
+                       {'status': {'type': 'string', 'enum': ['sent', 'invalidated']}}, []),
+    'list_field_reports': ('What units reported first-hand, oldest first: roads found BLOCKED, and what they did or '
+                           'saw on scene (assessed / rescued / treated / nothing_found, with counts).', {}, []),
     'log_agent_run': ('Call this last, every time, with only the id of the last report you processed. Then reply '
                       'with your final JSON answer as plain text (not inside a tool call).',
                       {'input_ref': {'type': 'string', 'description': 'last observation id you processed'}},
                       ['input_ref']),
 }
+
+
+SECOND_ENGINE_FROM = 8   # trapped people from which a second engine is worth sending
+
+
+def _could_use(status, people, on_it, field_reports):
+    """The kinds of unit an incident could still use, from the rescue rules: an engine frees the trapped, an
+    ambulance treats the critical, a patrol checks what is unclear. What a unit reported first-hand overrides
+    the estimate. Facts for the response agent to decide with; it still chooses who goes and in what order."""
+    trapped, critical = people.get('trapped', 0), people.get('critical', 0)
+    assessed = False
+    for r in field_reports:   # oldest first, so the latest word wins
+        if r.get('action') == 'assessed':
+            trapped, critical, assessed = r.get('trapped', 0), r.get('critical', 0), True
+        elif r.get('action') == 'rescued':
+            trapped = r.get('still_trapped', 0)
+        elif r.get('action') == 'treated':
+            critical = r.get('still_critical', 0)
+        elif r.get('action') == 'nothing_found':
+            if r.get('unit_type') == 'fire_engine':
+                trapped = 0
+            elif r.get('unit_type') == 'ambulance':
+                critical = 0
+            assessed = True
+    there = [u['type'] for u in on_it]
+    out = []
+    if critical and 'ambulance' not in there:
+        out.append('ambulance')
+    out += ['fire_engine'] * max(0, ((2 if trapped >= SECOND_ENGINE_FROM else 1) if trapped else 0) - there.count('fire_engine'))
+    if not trapped and not critical and not assessed and not there and (status == 'disputed' or not people):
+        out.append('police')
+    return out
+
+
+def _sim(method, path, body=None):
+    """One request to the simulator service. A refusal (unit not free, no way there, wrong run) becomes a
+    ToolError carrying the simulator's reason, so the model can read it and choose differently."""
+    try:
+        r = httpx.request(method, SIM_URL + path, json=body, timeout=60)
+    except httpx.HTTPError as exc:
+        raise ToolError(f'the simulator is not reachable at {SIM_URL} ({type(exc).__name__}); is ./dev.sh running?') from None
+    if r.status_code in (409, 422):
+        detail = r.json().get('detail')
+        raise ToolError(detail if isinstance(detail, str) else json.dumps(detail))
+    return r.raise_for_status().json()
 
 
 def _get(path, **params):

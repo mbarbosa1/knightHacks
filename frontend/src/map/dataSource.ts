@@ -80,7 +80,15 @@ export interface RunTruth {
 
 /** What agents and operators believe, from the backend's run endpoints. Empty until a run is connected. */
 export interface OperationalState {
-  incidents: { id: string; status: string; building_id: string | null; location: Point | null }[];
+  incidents: {
+    id: string;
+    status: string;
+    building_id: string | null;
+    location: Point | null;
+    person_groups: { group_id: string; est_count: number; condition: string | null; needs: string[] }[] | null;
+    /** Ids of the reports the agents based this incident on, and of those that speak against it. */
+    evidence: { supports: string[]; contradicts: string[] } | null;
+  }[];
   roadRestrictions: { road_id: string; status: RoadStatus }[];
   resources: { id: string; type: string; name: string | null; status: string; location: Point | null }[];
 }
@@ -179,6 +187,8 @@ export interface RunClock {
   rescued?: number;
   treated?: number;
   died_waiting?: number;
+  /** How many units are in each state. */
+  units?: { available: number; en_route: number; busy: number } | null;
 }
 
 /** One responder unit as the simulator has it right now. */
@@ -193,6 +203,8 @@ export interface LiveUnit {
   route: [number, number][] | null;
   /** null until the unit has been sent somewhere. */
   destination: { lon: number; lat: number; building_id: string | null; incident_id: string | null } | null;
+  /** The plan it follows. reason is set when the plan replaced one that a blocked road ended. */
+  decision: { id: string; version: number; reason: string | null } | null;
   helped: number;
 }
 

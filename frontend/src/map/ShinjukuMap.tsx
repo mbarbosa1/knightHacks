@@ -38,6 +38,8 @@ export interface ShinjukuMapHandle {
   recenter(): void;
   /** Fly to a place, e.g. where a report says it is. */
   focus(lon: number, lat: number): void;
+  /** What to call a building in the side panels: its name, else its address, else what it is used for. */
+  buildingName(id: string): string | null;
 }
 
 /** What the map knows, handed to the dashboard so its side panels can show it. The map itself stays clean. */
@@ -47,6 +49,7 @@ export interface MapState {
   clock: RunClock | null;
   operational: OperationalState;
   reports: Report[];
+  units: LiveUnit[];
 }
 
 const CENTER: [number, number] = [139.7034, 35.6938]; // Shinjuku Station
@@ -78,14 +81,14 @@ export const CHANNELS: Record<string, [label: string, color: string]> = {
 };
 const REPORT_FRESH_MS = 5000;   // how long a new report stays highlighted on the map
 const REPORTS_REFRESH_MS = 2000;
-const UNIT_COLOR = { fire_engine: "#e8590c", ambulance: "#0c8599", police: "#5f3dc4" } as const;
-const UNIT_LABEL = { fire_engine: "fire engine", ambulance: "ambulance", police: "police patrol" } as const;
+export const UNIT_COLOR = { fire_engine: "#e8590c", ambulance: "#0c8599", police: "#5f3dc4" } as const;
+export const UNIT_LABEL = { fire_engine: "fire engine", ambulance: "ambulance", police: "police patrol" } as const;
 const UNIT_COLORS = ["match", ["get", "type"], "ambulance", UNIT_COLOR.ambulance, "fire_engine", UNIT_COLOR.fire_engine, UNIT_COLOR.police];
 const UNIT_LETTER = { fire_engine: "E", ambulance: "A", police: "P" } as const;
 const UNIT_STATUS = { en_route: "on the way", busy: "working on scene", available: "free" } as const;
 const UNITS_REFRESH_MS = 500;
 
-const formatClock = (s: number) =>
+export const formatClock = (s: number) =>
   `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 const empty = (): GeoJSON.FeatureCollection => ({ type: "FeatureCollection", features: [] });
 const escapeHtml = (value: unknown) =>
@@ -188,6 +191,10 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
     zoomOut: () => mapRef.current?.zoomOut(),
     recenter: () => mapRef.current?.easeTo(HOME),
     focus: (lon, lat) => mapRef.current?.easeTo({ center: [lon, lat], zoom: 16.5, duration: 700 }),
+    buildingName: (id) => {
+      const p = staticRef.current?.buildings.features.find((f) => f.properties.id === id)?.properties;
+      return p ? p.name_en || p.address_en?.split(",")[0] || (p.usage ? p.usage.replace(/_/g, " ") : null) : null;
+    },
   }));
 
   // Build the map once: basemap, static layers, and empty layers for everything that arrives later.
@@ -518,8 +525,8 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
   }, [view, units, ready]);
 
   useEffect(() => {
-    onUpdate?.({ view, truth, clock, operational, reports });
-  }, [view, truth, clock, operational, reports, onUpdate]);
+    onUpdate?.({ view, truth, clock, operational, reports, units });
+  }, [view, truth, clock, operational, reports, units, onUpdate]);
 
 
   // The bar carries no figures: counts and summaries live in the dashboard's side panels.

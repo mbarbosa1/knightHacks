@@ -7,23 +7,26 @@ from agents import orchestrator
 from agents.tools import RunTools, TOOL_SPECS, ToolError
 
 
-@pytest.mark.parametrize('name', sorted(orchestrator.ASSESSMENT_AGENTS))
+ALL_AGENTS = {**orchestrator.ASSESSMENT_AGENTS, **orchestrator.RESPONSE_AGENTS}
+
+
+@pytest.mark.parametrize('name', sorted(ALL_AGENTS))
 def test_agent_instructions_exist(name):
-    path, _ = orchestrator.ASSESSMENT_AGENTS[name]
+    path, _ = ALL_AGENTS[name]
     assert (orchestrator.AGENTS_DIR / path).exists(), f'{name}: {path} not found'
 
 
-@pytest.mark.parametrize('name', sorted(orchestrator.ASSESSMENT_AGENTS))
+@pytest.mark.parametrize('name', sorted(ALL_AGENTS))
 def test_agent_tools_exist(name):
-    _, tools = orchestrator.ASSESSMENT_AGENTS[name]
+    _, tools = ALL_AGENTS[name]
     for tool in tools:
         assert tool in TOOL_SPECS, f'{name}: {tool} has no description for the model'
         assert hasattr(RunTools, tool), f'{name}: {tool} is not implemented in tools.py'
 
 
-@pytest.mark.parametrize('name', sorted(orchestrator.ASSESSMENT_AGENTS))
+@pytest.mark.parametrize('name', sorted(ALL_AGENTS))
 def test_md_names_only_tools_the_agent_gets(name):
-    path, tools = orchestrator.ASSESSMENT_AGENTS[name]
+    path, tools = ALL_AGENTS[name]
     in_md = set(re.findall(r'^\| `(\w+)\(', (orchestrator.AGENTS_DIR / path).read_text(), re.M))
     assert in_md, f'{name}: no tools table found in its .md'
     assert in_md <= set(tools), f'{name}: .md mentions tools it is not given: {sorted(in_md - set(tools))}'

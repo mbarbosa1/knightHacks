@@ -139,6 +139,12 @@ Agreed order of work (11 Oct): finish the live loop first, talk about the agents
 - Every decision is saved to `ops.decisions` through `PUT /runs/{id}/decisions/{decision_id}` (added to the backend with `GET /runs/{id}/decisions`). A reroute marks the old row `invalidated` with the reason and writes a new row (new id, next version). Versions count up per incident because the table allows one row per incident and version. A decision the backend refuses (an `incident_id` not in the run) is dropped, not retried, so it cannot hold up unit positions.
 - Not done: the map does not draw moving units yet; step 2 is adding these tools to `agents/tools.py`, step 3 the resource and plan agents.
 
+## 9g. Response agent (11 Oct)
+- One agent, `agents/responseAgent/response-agent/`, replaces resource + plan (Gerard: no drafts, no human approval, merge them for speed). Details in `agents/PIPELINE.md` under "Response stage".
+- First version let the model look everything up: 13 model turns, 8.5 minutes. Now code drafts the plan and the model reviews and sends it with short ids: 2 turns, about 15 s, and all five expected units sent in the live test.
+- Field reports from units now carry `incident_id`, so the agents can tell which incident a report is about.
+- The assessment agents (detect, medical) are still slow: one batch took over 6 minutes in a live run, longer than a run lasts. Same remedy would apply; it is Arwa and Camila's area.
+
 ## 10. Open TODOs
 - Note (10 Oct): this folder was renamed from `sim-data-package/` to `simulation/` when it was merged with `main`. `scripts/plateau/` was removed (see `docs/PROVENANCE.md`); the loader and validator now live at the repo root in `../scripts/`; the duplicate schema and design doc were removed in favour of `../database/`. `map_id` is NOT unique, never key on it.
 - [x] J-SHIS surface-soil mesh loaded (10 Oct): `data/jshis/` CSV -> `soil_amp` on all 5,335 buildings, ARV 1.29-1.64. Loaded into Neon by Camila.
