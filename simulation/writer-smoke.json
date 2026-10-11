@@ -1,0 +1,19 @@
+{
+    "reports": [{
+        "recipe": {
+            "kind": "road_blocked",
+            "channel": "eyewitness_text",
+            "lang": "en",
+            "is_repost": false,
+            "place_said_en": "near Shinjuku Station",
+            "place_said_ja": "新宿駅の近くで",
+            "street_en": "Yasukuni Street",
+            "street_ja": "靖国通り"
+        },
+        "observation": {
+            "id": "smoke-001",
+            "original_text": "Road blocked near Shinjuku Station on Yasukuni Street.",
+            "text_en": "Road blocked near Shinjuku Station on Yasukuni Street."
+        }
+    }]
+}

@@ -176,4 +176,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     args = parser.parse_args()
-    asyncio.run(main(args.env_file))
+    asyncio.run(main(args.env_file), loop_factory=asyncio.SelectorEventLoop if sys.platform == "win32" else None)
+

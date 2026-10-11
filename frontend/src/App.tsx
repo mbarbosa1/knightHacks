@@ -38,6 +38,8 @@ import {
 } from "lucide-react";
 import { mockReports, type MockReport, type ReportKind } from "./data/mockReports";
 import { ShinjukuMap, type ShinjukuMapHandle } from "./map/ShinjukuMap";
+import type { MapState } from "./map/ShinjukuMap";
+import type { Report } from "./map/dataSource";
 
 interface Incident {
   id: string;
@@ -83,7 +85,27 @@ const incidents: Incident[] = [
   },
 ];
 
-const reports = mockReports;
+/**
+ * A real report from the backend (what agents see) in the dashboard's report shape. Radio = 119 calls,
+ * eyewitness texts and fire/police radio; Social = social media (CHANNEL_GROUP in simulation/sim/reports.py).
+ * Time is simulation time since the earthquake, not a clock time.
+ */
+function toReport(o: Report): MockReport {
+  const t = Math.max(0, Math.round(o.sim_time_s ?? 0));
+  const text = o.text_en ?? o.original_text ?? "";
+  return {
+    id: `R-${o.id.slice(0, 6).toUpperCase()}`,
+    kind: o.channel === "social_media" ? "Social" : "Radio",
+    time: `T+${String(Math.floor(t / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`,
+    status: text.startsWith("RT ") ? "Replay" : "Processed",
+    text,
+    location: o.claimed_location ?? (o.location_precision === "gps" ? "GPS location" : "Location unclear"),
+    verified: false,
+    incidentId: "",
+    lang: o.lang ?? undefined,
+    originalText: o.lang && o.lang !== "en" ? o.original_text ?? undefined : undefined,
+  };
+}
 const dispatches: Dispatch[] = [
   {
     id: "D-01",
@@ -126,6 +148,17 @@ function App() {
   const [dispatched, setDispatched] = useState(false);
   const [utc, setUtc] = useState(new Date());
   const mapRef = useRef<ShinjukuMapHandle>(null);
+  // The map follows the saved run and collects its reports as the live clock releases them into Neon
+  // (Gemini-worded when the simulator runs with SIM_GEMINI=1). The feed shows the same list, so it fills in one
+  // by one. With no saved run on the map yet, the sample reports.
+  const [mapState, setMapState] = useState<MapState | null>(null);
+  const observations: Report[] | null = mapState?.truth?.ingestion?.ready ? mapState.reports : null;
+  const reports: MockReport[] = useMemo(
+    () => observations
+      ? [...observations].sort((a, b) => (b.sim_time_s ?? 0) - (a.sim_time_s ?? 0)).map(toReport)   // newest first
+      : mockReports,
+    [observations],
+  );
   const incident =
     incidents.find((item) => item.id === selected) ?? incidents[0];
   const selectedReport: MockReport =
@@ -135,11 +168,11 @@ function App() {
       reports.filter(
         (report) =>
           (filter === "All" || report.kind === filter) &&
-          `${report.text} ${report.location} ${report.kind}`
+          `${report.text} ${report.originalText ?? ""} ${report.location} ${report.kind}`
             .toLowerCase()
             .includes(search.toLowerCase()),
       ),
-    [filter, search],
+    [reports, filter, search],
   );
   useEffect(() => {
     const timer = window.setInterval(() => setUtc(new Date()), 1000);
@@ -262,9 +295,9 @@ function App() {
             {visibleReports.map((report) => (
               <button
                 key={report.id}
-                className={`report-card ${selected === report.incidentId ? "selected" : ""} ${report.kind.toLowerCase()}`}
+                className={`report-card ${(report.incidentId ? selected === report.incidentId : selectedReportId === report.id) ? "selected" : ""} ${report.kind.toLowerCase()}`}
                 onClick={() => {
-                  setSelected(report.incidentId);
+                  if (report.incidentId) setSelected(report.incidentId);   // real reports have no incident yet
                   setSelectedReportId(report.id);
                 }}
               >
@@ -297,7 +330,11 @@ function App() {
               </button>
             ))}
             {visibleReports.length === 0 && (
-              <div className="empty-state">No reports match this search.</div>
+              <div className="empty-state">
+                {reports.length === 0
+                  ? "No reports yet. They arrive as the simulation clock runs."
+                  : "No reports match this search."}
+              </div>
             )}
           </div>
           <button className="sources-button">
@@ -311,19 +348,19 @@ function App() {
             <Metric
               icon={<Antenna size={14} />}
               label="INCOMING REPORTS"
-              value="04"
+              value={observations ? String(observations.length).padStart(2, "0") : "04"}
               detail="Radio + external"
             />
             <Metric
               icon={<MapPin size={14} />}
               label="MAPPED LOCATIONS"
-              value="02"
+              value={observations ? String(observations.filter((o) => o.longitude != null).length).padStart(2, "0") : "02"}
               detail="Located reports"
             />
             <Metric
               icon={<AlertTriangle size={14} />}
               label="NEEDS LOCATION"
-              value="00"
+              value={observations ? String(observations.filter((o) => o.longitude == null).length).padStart(2, "0") : "00"}
               detail="Review reports"
               warning
             />
@@ -332,7 +369,7 @@ function App() {
             className="map-panel"
             aria-label="3D simulation map"
           >
-            <ShinjukuMap ref={mapRef} />
+            <ShinjukuMap ref={mapRef} onUpdate={setMapState} />
             <div className="map-toolbar">
               <button aria-label="Zoom in" onClick={() => mapRef.current?.zoomIn()}>
                 <PlusIcon />
@@ -509,13 +546,18 @@ function App() {
               </button>
             </div>
             <div className="report-modal-meta">
-              <span><Clock3 size={13} /> {selectedReport.time} UTC</span>
+              <span><Clock3 size={13} /> {selectedReport.time}{selectedReport.time.startsWith("T+") ? " after the quake" : " UTC"}</span>
               <span><MapPin size={13} /> {selectedReport.location}</span>
               <span className={`tiny-state ${selectedReport.status.toLowerCase()}`}>
                 {selectedReport.status}
               </span>
             </div>
             <blockquote className="report-full-text">“{selectedReport.text}”</blockquote>
+            {selectedReport.originalText && (
+              <blockquote className="report-full-text" lang={selectedReport.lang}>
+                <small>Original ({selectedReport.lang?.toUpperCase()}):</small> {selectedReport.originalText}
+              </blockquote>
+            )}
             <div className="report-modal-incident">
               <span>Linked incident</span>
               <strong>{incident.id} · {incident.title}</strong>
