@@ -1,14 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
-  Antenna,
   ArrowDownRight,
   ArrowUpRight,
   Check,
-  CheckCircle2,
-  ChevronDown,
   ChevronRight,
-  CircleHelp,
   Clock3,
   Crosshair,
   Filter,
@@ -19,71 +15,36 @@ import {
   Menu,
   Minus,
   Navigation,
-  Play,
   Radio,
-  RotateCcw,
   Search,
-  Send,
   Settings2,
   ShieldCheck,
   Signal,
-  SlidersHorizontal,
   Square,
-  Users,
   Volume2,
   Waves,
   X,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { mockReports, type MockReport, type ReportKind } from "./data/mockReports";
-import { ShinjukuMap, type ShinjukuMapHandle } from "./map/ShinjukuMap";
+import { type MockReport, type ReportKind } from "./data/mockReports";
+import { CHANNELS, UNIT_COLOR, UNIT_LABEL, ShinjukuMap, formatClock, type ShinjukuMapHandle } from "./map/ShinjukuMap";
 import type { MapState } from "./map/ShinjukuMap";
-import type { Report } from "./map/dataSource";
+import type { LiveUnit, OperationalState, Report } from "./map/dataSource";
 
-interface Incident {
-  id: string;
-  title: string;
-  address: string;
-  severity: "Critical" | "High" | "Moderate";
-  tags: string[];
-  verified: boolean;
-}
-interface Dispatch {
-  id: string;
-  team: string;
-  state: "En route" | "Available";
-  destination: string;
-  eta: string;
-  color: string;
-}
+type BelievedIncident = OperationalState["incidents"][number];
 
-const incidents: Incident[] = [
-  {
-    id: "INC-042",
-    title: "Structural damage · trapped victims · access blocked",
-    address: "Shinjuku Mayor's Office, Av. José María España",
-    severity: "Critical",
-    tags: ["Structural damage", "Trapped victims", "Access blocked"],
-    verified: true,
-  },
-  {
-    id: "INC-038",
-    title: "Partial collapse · residents need assistance",
-    address: "Residencias Caribe, Avenida Principal",
-    severity: "High",
-    tags: ["Partial collapse", "Medical support"],
-    verified: true,
-  },
-  {
-    id: "INC-031",
-    title: "Road obstruction reported near hillside",
-    address: "Calle Sucre, Caraballeda",
-    severity: "Moderate",
-    tags: ["Road blocked", "Debris"],
-    verified: false,
-  },
-];
+/** Units that are doing something come first: driving, then working, then free again, then never sent. */
+const unitOrder = (unit: LiveUnit) =>
+  unit.status === "en_route" ? 0 : unit.status === "busy" ? 1 : unit.destination ? 2 : 3;
+const unitState = (unit: LiveUnit) =>
+  unit.status === "en_route" ? "On the way" : unit.status === "busy" ? "On scene" : unit.destination ? "Free" : "At station";
+
+/** The people the agents believe are at an incident, e.g. "4 trapped, 1 critical". */
+function believedPeople(incident: BelievedIncident): string {
+  const groups = (incident.person_groups ?? []).filter((g) => g.est_count > 0);
+  return groups.map((g) => `${g.est_count} ${g.condition ?? "people"}`).join(", ") || "nobody counted yet";
+}
 
 /**
  * A real report from the backend (what agents see) in the dashboard's report shape. Radio = 119 calls,
@@ -104,65 +65,61 @@ function toReport(o: Report): MockReport {
     incidentId: "",
     lang: o.lang ?? undefined,
     originalText: o.lang && o.lang !== "en" ? o.original_text ?? undefined : undefined,
+    observationId: o.id,
+    channel: o.channel,
+    precision: o.location_precision ?? undefined,
+    reliability: o.source_reliability ?? undefined,
+    longitude: o.longitude ?? undefined,
+    latitude: o.latitude ?? undefined,
   };
 }
-const dispatches: Dispatch[] = [
-  {
-    id: "D-01",
-    team: "Rescue Fire Department",
-    state: "En route",
-    destination: "Residencias Caribe",
-    eta: "0:16",
-    color: "cyan",
-  },
-  {
-    id: "D-02",
-    team: "Rescue Medical Team",
-    state: "Available",
-    destination: "Colegio Tanagueranas",
-    eta: "—",
-    color: "violet",
-  },
-  {
-    id: "D-03",
-    team: "Rescue Police Department",
-    state: "Available",
-    destination: "Standby · Sector 4",
-    eta: "—",
-    color: "green",
-  },
-];
-const routeUpdates = [
-  { label: "Current route", title: "Rescue Fire Department → Residencias Caribe", meta: "En route · ETA 16 min", status: "ACTIVE" },
-  { label: "Expected next", title: "Recalculate after road status update", meta: "Uses live unit position and road conditions", status: "NEXT" },
-  { label: "Fallback route", title: "Alternate path retained", meta: "Ready if the primary route is blocked", status: "READY" },
-];
 
 function App() {
   const [filter, setFilter] = useState<"All" | ReportKind>("All");
   const [search, setSearch] = useState("");
-  const [selected, setSelected] = useState("INC-042");
-  const [selectedReportId, setSelectedReportId] = useState("R-1042");
+  const [selectedReportId, setSelectedReportId] = useState<string | null>(null);
   const [reportOpen, setReportOpen] = useState(false);
-  const [playing, setPlaying] = useState(false);
-  const [dispatched, setDispatched] = useState(false);
   const [utc, setUtc] = useState(new Date());
   const mapRef = useRef<ShinjukuMapHandle>(null);
   // The map follows the saved run and collects its reports as the live clock releases them into Neon
   // (Gemini-worded when the simulator runs with SIM_GEMINI=1). The feed shows the same list, so it fills in one
-  // by one. With no saved run on the map yet, the sample reports.
+  // by one. With no saved run on the map, the feed is empty.
   const [mapState, setMapState] = useState<MapState | null>(null);
   const observations: Report[] | null = mapState?.truth?.ingestion?.ready ? mapState.reports : null;
   const reports: MockReport[] = useMemo(
     () => observations
       ? [...observations].sort((a, b) => (b.sim_time_s ?? 0) - (a.sim_time_s ?? 0)).map(toReport)   // newest first
-      : mockReports,
+      : [],
     [observations],
   );
-  const incident =
-    incidents.find((item) => item.id === selected) ?? incidents[0];
-  const selectedReport: MockReport =
-    reports.find((report) => report.id === selectedReportId) ?? reports[0];
+  const selectedReport: MockReport | null =
+    reports.find((report) => report.id === selectedReportId) ?? null;
+  // The incident the agents built from this report (or that it speaks against), if they have got to it.
+  const obsId = selectedReport?.observationId;
+  const linked: BelievedIncident | null =
+    (obsId && mapState?.operational.incidents.find(
+      (i) => i.evidence?.supports.includes(obsId) || i.evidence?.contradicts.includes(obsId))) || null;
+  const against = Boolean(obsId && linked?.evidence?.contradicts.includes(obsId));
+  const reportState = linked ? linked.status.toUpperCase() : "NOT ASSESSED YET";
+
+  const clock = mapState?.clock ?? null;
+  const truth = mapState?.truth ?? null;
+  const runState = !truth
+    ? "NO RUN"
+    : !clock
+      ? "RUN NOT PLAYING"
+      : clock.finished ? "RUN FINISHED" : clock.playing ? `RUNNING ${clock.speed}x` : "PAUSED";
+  const units = useMemo(
+    () => [...(mapState?.units ?? [])].sort((a, b) => unitOrder(a) - unitOrder(b) || a.name.localeCompare(b.name)),
+    [mapState?.units],
+  );
+  const driving = units.filter((unit) => unit.status === "en_route");
+  const roadsRestricted = mapState?.operational.roadRestrictions.filter((road) => road.status !== "OPEN").length ?? 0;
+  const destinationName = (unit: LiveUnit) =>
+    unit.destination
+      ? (unit.destination.building_id && mapRef.current?.buildingName(unit.destination.building_id)) ||
+        `${unit.destination.lat.toFixed(4)}° N, ${unit.destination.lon.toFixed(4)}° E`
+      : "";
   const visibleReports = useMemo(
     () =>
       reports.filter(
@@ -200,11 +157,10 @@ function App() {
             <i /> SIMULATION
           </span>
           <span className="clock">
-            {utc.toISOString().slice(11, 19)} <small>UTC</small>
+            {clock?.sim_time_s !== undefined
+              ? <>T+{formatClock(clock.sim_time_s)} <small>SIM</small></>
+              : <>{utc.toISOString().slice(11, 19)} <small>UTC</small></>}
           </span>
-          <button className="session-button">
-            <Users size={14} /> Session <ChevronDown size={13} />
-          </button>
           <button className="icon-button top-icon" aria-label="Audio">
             <Volume2 size={16} />
           </button>
@@ -215,33 +171,24 @@ function App() {
       </header>
       <div className="status-strip">
         <div>
-          <span className="status-dot" /> DEMO PAUSED{" "}
-          <span className="strip-divider">/</span> TOKYO command
+          <span className="status-dot" /> {runState}{" "}
+          <span className="strip-divider">/</span>{" "}
+          {truth
+            ? `M ${truth.scenario.mw.toFixed(1)} earthquake · Intensity ${truth.intensity.label} (Japan scale)`
+            : "Generate an earthquake on the map to start"}
         </div>
-        <div className="demo-controls">
-          <button
-            onClick={() => {
-              setSelected("INC-042");
-              setFilter("All");
-              setSearch("");
-              setDispatched(false);
-              setPlaying(false);
-            }}
-          >
-            <RotateCcw size={13} /> Reset demo
-          </button>
-          <button onClick={() => setPlaying(!playing)}>
-            {playing ? <Square size={12} /> : <Play size={12} />}{" "}
-            {playing ? "Pause" : "Resume"}
-          </button>
-          <button>
-            <Play size={12} /> Start Caraballeda demo <ChevronRight size={12} />
-          </button>
-          <button>
-            <SlidersHorizontal size={13} /> Sources & replay{" "}
-            <ChevronRight size={12} />
-          </button>
-        </div>
+        {clock?.run_id && (
+          <div className="strip-stats">
+            {clock.units && (
+              <span>
+                <b>{clock.units.en_route}</b> on the way · <b>{clock.units.busy}</b> on scene · <b>{clock.units.available}</b> free
+              </span>
+            )}
+            <span><b>{clock.rescued ?? 0}</b> rescued</span>
+            <span><b>{clock.treated ?? 0}</b> treated</span>
+            <span className={clock.died_waiting ? "strip-loss" : ""}><b>{clock.died_waiting ?? 0}</b> died waiting</span>
+          </div>
+        )}
       </div>
       <main className="dashboard">
         <aside className="panel incoming-panel">
@@ -283,22 +230,16 @@ function App() {
               </button>
             )}
           </label>
-          <div className="feed-options">
-            <label>
-              <input type="checkbox" /> Show filtered
-            </label>
-            <span>
-              NEWEST FIRST <ChevronDown size={11} />
-            </span>
-          </div>
           <div className="report-list">
             {visibleReports.map((report) => (
               <button
                 key={report.id}
-                className={`report-card ${(report.incidentId ? selected === report.incidentId : selectedReportId === report.id) ? "selected" : ""} ${report.kind.toLowerCase()}`}
+                className={`report-card ${selectedReportId === report.id ? "selected" : ""} ${report.kind.toLowerCase()}`}
                 onClick={() => {
-                  if (report.incidentId) setSelected(report.incidentId);   // real reports have no incident yet
                   setSelectedReportId(report.id);
+                  if (report.longitude !== undefined && report.latitude !== undefined) {
+                    mapRef.current?.focus(report.longitude, report.latitude);
+                  }
                 }}
               >
                 <div className="report-top">
@@ -320,7 +261,6 @@ function App() {
                   <span className={`tiny-state ${report.status.toLowerCase()}`}>
                     {report.status}
                   </span>
-                  <span className="replay">REPLAY</span>
                 </div>
                 <p>{report.text}</p>
                 <div className="report-location">
@@ -331,30 +271,22 @@ function App() {
             ))}
             {visibleReports.length === 0 && (
               <div className="empty-state">
-                {reports.length === 0
+                {!observations
+                  ? "No run is playing. Generate an earthquake on the map and its reports arrive here."
+                  : reports.length === 0
                   ? "No reports yet. They arrive as the simulation clock runs."
                   : "No reports match this search."}
               </div>
             )}
           </div>
-          <button className="sources-button">
-            <SlidersHorizontal size={13} /> Sources & replay tools{" "}
-            <ChevronRight size={13} />
-          </button>
         </aside>
 
         <section className="center-column">
           <div className="metrics-row">
             <Metric
-              icon={<Antenna size={14} />}
-              label="INCOMING REPORTS"
-              value={observations ? String(observations.length).padStart(2, "0") : "04"}
-              detail="Radio + external"
-            />
-            <Metric
               icon={<MapPin size={14} />}
               label="MAPPED LOCATIONS"
-              value={observations ? String(observations.filter((o) => o.longitude != null).length).padStart(2, "0") : "02"}
+              value={observations ? String(observations.filter((o) => o.longitude != null).length).padStart(2, "0") : "00"}
               detail="Located reports"
             />
             <Metric
@@ -396,22 +328,32 @@ function App() {
                 <Navigation size={14} />
                 <span>ROUTE STATUS</span>
               </div>
-              <span className="observed">LIVE</span>
+              <span className="observed">{driving.length} ON THE WAY</span>
             </div>
             <div className="route-status-list">
-              {routeUpdates.map((route) => (
-                <div className="route-status-item" key={route.label}>
+              {driving.map((unit) => (
+                <div className="route-status-item" key={unit.id}>
                   <div className="route-status-top">
-                    <span>{route.label}</span>
-                    <b>{route.status}</b>
+                    <span>{UNIT_LABEL[unit.type] ?? unit.type}</span>
+                    <b>{unit.decision?.reason ? "REROUTED" : "ACTIVE"}</b>
                   </div>
-                  <strong>{route.title}</strong>
-                  <small>{route.meta}</small>
+                  <strong>{unit.name} → {destinationName(unit)}</strong>
+                  <small>
+                    {unit.decision?.reason
+                      ? `${unit.decision.reason}. Now on plan v${unit.decision.version}.`
+                      : `On the way · plan v${unit.decision?.version ?? 1}`}
+                  </small>
                 </div>
               ))}
+              {driving.length === 0 && (
+                <div className="panel-empty">
+                  {units.length ? "No unit is on the road right now." : "No run is playing."}
+                </div>
+              )}
             </div>
             <p className="canonical-note">
-              Route plans use the current road state and may change when conditions update.
+              {roadsRestricted} road segment{roadsRestricted === 1 ? "" : "s"} believed blocked or limited.
+              Routes use the roads believed open; a unit that meets a blocked road reports it and takes another way.
             </p>
           </section>
           <section className="panel details-panel">
@@ -420,41 +362,48 @@ function App() {
                 <Layers size={14} />
                 <span>REPORT DETAILS</span>
               </div>
-              <CircleHelp size={14} className="muted-icon" />
             </div>
-            <div className="detail-source">
-              <span>
-                <Radio size={12} /> {reports.find((report) => report.incidentId === incident.id)?.kind.toUpperCase() ?? "INCIDENT REPORT"}
-              </span>
-              <span className="unverified">
-                {incident.verified ? "VERIFIED" : "UNVERIFIED"}
-              </span>
-            </div>
-            <h2>{incident.title}</h2>
-            <p className="detail-address">
-              <MapPin size={12} /> {incident.address}
-            </p>
-            <div className="detail-tags">
-              {incident.tags.map((tag) => (
-                <span key={tag}>{tag}</span>
-              ))}
-            </div>
-            <div className="verification">
-              <ShieldCheck size={14} />
-              <span>
-                {incident.verified
-                  ? "Cross-verified by 2 sources"
-                  : "Awaiting source confirmation"}
-              </span>
-              <ChevronRight size={13} />
-            </div>
-            <button
-              className="open-report-button"
-              onClick={() => setReportOpen(true)}
-            >
-              <ExternalLink size={13} /> Open full report
-              <ChevronRight size={13} />
-            </button>
+            {selectedReport ? (
+              <>
+                <div className="detail-source">
+                  <span>
+                    <Radio size={12} />{" "}
+                    {(CHANNELS[selectedReport.channel ?? ""]?.[0] ?? `${selectedReport.kind} report`).toUpperCase()}
+                  </span>
+                  <span className="unverified">{reportState}</span>
+                </div>
+                <h2>{selectedReport.id} · {selectedReport.time}</h2>
+                <p className="detail-text">{selectedReport.text}</p>
+                <p className="detail-address">
+                  <MapPin size={12} /> {selectedReport.location}
+                </p>
+                <div className="detail-tags">
+                  {selectedReport.precision && <span>Location: {selectedReport.precision}</span>}
+                  {selectedReport.reliability !== undefined && (
+                    <span>Source reliability {selectedReport.reliability.toFixed(2)}</span>
+                  )}
+                  {selectedReport.originalText && <span>Sent in {selectedReport.lang?.toUpperCase()}</span>}
+                  {selectedReport.longitude === undefined && obsId && <span>Not on the map</span>}
+                </div>
+                <div className="verification">
+                  <ShieldCheck size={14} />
+                  <span>
+                    {linked
+                      ? `${against ? "Speaks against an incident" : "Part of an incident"}: ${believedPeople(linked)}`
+                      : "No incident cites this report yet"}
+                  </span>
+                </div>
+                <button
+                  className="open-report-button"
+                  onClick={() => setReportOpen(true)}
+                >
+                  <ExternalLink size={13} /> Open full report
+                  <ChevronRight size={13} />
+                </button>
+              </>
+            ) : (
+              <div className="panel-empty">Select a report in the feed to see it here and find it on the map.</div>
+            )}
           </section>
           <section className="panel dispatch-panel">
             <div className="dispatch-heading">
@@ -464,62 +413,42 @@ function App() {
                   <span>RESCUE DISPATCH</span>
                 </div>
                 <span className="mini-live">
-                  <i /> LIVE
+                  <i /> {units.length} UNITS
                 </span>
               </div>
             </div>
             <p className="dispatch-instruction">
-              Click a road to mark it BLOCKED. Save replans from the live unit
-              position against canonical road state. Some objectives may no
-              longer be reachable.
+              Every responder unit as the simulator has it now. Click one to find it on the map.
             </p>
-            <div className="team-list">
-              {dispatches.map((team) => (
-                <div className="team-row" key={team.id}>
-                  <span className={`team-dot ${team.color}`} />
-                  <strong>{team.team}</strong>
-                  <span
-                    className={
-                      team.state === "En route" ? "team-enroute" : "team-ready"
-                    }
-                  >
-                    {team.state}
-                  </span>
-                  <span className="team-eta">{team.eta}</span>
-                  <div className="team-route">
-                    <span>
-                      {team.id === "D-01"
-                        ? "W1"
-                        : team.id === "D-02"
-                          ? "W7"
-                          : "STANDBY"}
-                    </span>
-                    {team.destination}
-                    <b>
-                      {team.id === "D-01"
-                        ? "0.74"
-                        : team.id === "D-02"
-                          ? "0.62"
-                          : "—"}
-                    </b>
-                  </div>
-                </div>
+            <div className="team-list unit-list">
+              {units.map((unit) => (
+                <button
+                  className="team-row unit-row"
+                  key={unit.id}
+                  title={unit.name}
+                  onClick={() => mapRef.current?.focus(unit.lon, unit.lat)}
+                >
+                  <span className="team-dot" style={{ background: UNIT_COLOR[unit.type] ?? UNIT_COLOR.police }} />
+                  <strong>{unit.name}</strong>
+                  <span className={unit.status === "available" ? "team-ready" : "team-enroute"}>{unitState(unit)}</span>
+                  <span className="team-eta">{unit.decision ? `v${unit.decision.version}` : "—"}</span>
+                  {unit.destination && (
+                    <div className="team-route">
+                      <span>{unit.status === "available" ? "WAS AT" : unit.status === "busy" ? "AT" : "TO"}</span>
+                      {destinationName(unit)}
+                      <b>{unit.helped ? `${unit.helped} helped` : ""}</b>
+                    </div>
+                  )}
+                </button>
               ))}
+              {units.length === 0 && (
+                <div className="panel-empty">No units yet. They appear when an earthquake is generated.</div>
+              )}
             </div>
-            <button
-              className={`dispatch-button ${dispatched ? "saved" : ""}`}
-              onClick={() => setDispatched(!dispatched)}
-            >
-              {dispatched ? <CheckCircle2 size={14} /> : <Send size={13} />}
-              {dispatched
-                ? "Dispatch saved · Route updated"
-                : "Save dispatch & replan"}
-              <ChevronRight size={13} />
-            </button>
           </section>
         </aside>
       </main>
-      {reportOpen && (
+      {reportOpen && selectedReport && (
         <div
           className="report-modal-backdrop"
           onMouseDown={(event) => {
@@ -560,11 +489,23 @@ function App() {
             )}
             <div className="report-modal-incident">
               <span>Linked incident</span>
-              <strong>{incident.id} · {incident.title}</strong>
-              <small>{incident.address}</small>
+              <strong>
+                {linked
+                  ? `${against ? "Speaks against an incident" : "Part of an incident"} (${linked.status})`
+                  : "No incident cites this report yet"}
+              </strong>
+              <small>
+                {linked
+                  ? `Believed there: ${believedPeople(linked)}. Based on ${linked.evidence?.supports.length ?? 0} report${linked.evidence?.supports.length === 1 ? "" : "s"}.`
+                  : "The assessment agents link reports to incidents as they work through them."}
+              </small>
             </div>
             <div className="report-modal-footer">
-              <span>{selectedReport.verified ? "Source marked verified" : "Awaiting source confirmation"}</span>
+              <span>
+                {selectedReport.reliability !== undefined
+                  ? `Source reliability ${selectedReport.reliability.toFixed(2)}`
+                  : selectedReport.verified ? "Source marked verified" : "Awaiting source confirmation"}
+              </span>
               <button onClick={() => setReportOpen(false)}>Done</button>
             </div>
           </section>
@@ -577,9 +518,6 @@ function App() {
           <span>SIMULATION ENVIRONMENT</span>
         </div>
         <span>DEMO SCENARIO · NOT FOR OPERATIONAL USE</span>
-        <button>
-          <CircleHelp size={13} /> Help & documentation
-        </button>
       </footer>
     </div>
   );
@@ -635,7 +573,6 @@ function Metric({
         {value}
         <span>{detail}</span>
       </div>
-      <ChevronRight size={13} className="metric-arrow" />
     </div>
   );
 }
