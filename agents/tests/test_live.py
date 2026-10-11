@@ -33,4 +33,7 @@ def test_assessment_agents_run_on_one_report(agent):
     batch = [agent.normalize(report)]
     for name, result in orch.assess(batch).items():
         assert 'error' not in result, f'{name}: {result.get("error")}'
-        assert any(c['tool'] == 'log_agent_run' and c['ok'] for c in result['tool_calls']), f'{name} did not log its run'
+        saved = orch.tools.get_last_agent_run(name)
+        assert saved and saved['id'] == result['audit_id'], f'{name} was not saved by the orchestrator'
+        assert saved['output'] == result['output']
+        assert saved['input_ref'] == report['id']

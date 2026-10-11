@@ -27,6 +27,7 @@ import argparse, concurrent.futures, math, pathlib, time
 from agents.llm import run_agent
 from agents.tools import RunTools
 from agents.loader import load_agent
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 _in_agent = load_agent('assesmentAgent/in-agent/in_agent.py')
 InAgent, IN_AGENT = _in_agent.InAgent, _in_agent.AGENT
@@ -41,6 +42,71 @@ ASSESSMENT_AGENTS = {
                       'log_agent_run']),
     'medical_agent': ('assesmentAgent/medical-agent/medical-agent.md', ['list_observations']),   # writes nothing
 }
+
+
+class MedicalLocation(BaseModel):
+    model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
+    longitude: float = Field(ge=-180, le=180)
+    latitude: float = Field(ge=-90, le=90)
+
+    @field_validator('longitude', 'latitude', mode='before')
+    @classmethod
+    def reject_boolean(cls, value):
+        if isinstance(value, bool):
+            raise ValueError('coordinates must be numbers, not booleans')
+        return value
+
+
+class MedicalPlace(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    name: str | None = None
+    building_id: str | None = None
+    location: MedicalLocation | None = None
+    trapped: StrictInt | None = Field(default=None, ge=0, le=2**31 - 1)
+    critical: StrictInt | None = Field(default=None, ge=0, le=2**31 - 1)
+    injured: StrictInt | None = Field(default=None, ge=0, le=2**31 - 1)
+    priority: StrictInt = Field(ge=1, le=3)
+    why: str = ''
+    observation_ids: list[str] = Field(min_length=1)
+
+    @field_validator('location', mode='before')
+    @classmethod
+    def no_point_is_no_location(cls, value):
+        """A vague report has no point; the model writes that as {longitude: null, latitude: null}."""
+        if isinstance(value, dict) and value.get('longitude') is None and value.get('latitude') is None:
+            return None
+        return value
+
+    @field_validator('trapped', 'critical', 'injured', 'priority', mode='before')
+    @classmethod
+    def parse_integer_string(cls, value):
+        if isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
+            return int(value.strip())
+        return value
+
+
+class MedicalOutput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    situation_summary: str = ''
+    places: list[MedicalPlace]
+
+
+def validate_medical_output(output, batch):
+    """Validate the entire result before logging success or changing the queue."""
+    result = MedicalOutput.model_validate(output).model_dump()
+    by_id = {record['observation_id']: record for record in batch}
+    for place in result['places']:
+        if any(source not in by_id for source in place['observation_ids']):
+            raise ValueError('medical observation_ids must come from the current batch')
+        candidates = {
+            candidate['building_id']
+            for source in place['observation_ids']
+            for candidate in (by_id[source].get('location') or {}).get('building_candidates', [])
+            if (by_id[source].get('location') or {}).get('precision') in ('gps', 'address')
+        }
+        if place['building_id'] not in candidates:
+            place['building_id'] = None
+    return result
 
 
 class Orchestrator:
@@ -91,26 +157,23 @@ class Orchestrator:
             try:
                 result = run_agent(instructions, payload, specs, functions)
                 output = result['output'] if isinstance(result['output'], dict) and result['output'] else done.get('output')
+                if name == 'medical_agent':
+                    output = validate_medical_output(output, batch)
                 result = {**result, 'output': output, 'seconds': round(time.monotonic() - started, 1)}
             except Exception as exc:   # one agent failing must not stop the others
                 result = {'error': f'{type(exc).__name__}: {exc}', 'seconds': round(time.monotonic() - started, 1)}
             # The agent's audit entry, written by code (also when it failed): ops.agent_runs + outbox row.
-            self.tools.log_agent_run(name, done.get('input_ref') or batch[-1]['observation_id'],
+            audit = self.tools.log_agent_run(name, done.get('input_ref') or batch[-1]['observation_id'],
                                      result.get('output') or {'error': result.get('error')},
                                      int(result['seconds'] * 1000))
+            result['audit_id'] = audit['id']
             return name, result
 
         with concurrent.futures.ThreadPoolExecutor(max(1, len(self.assessment))) as pool:
             results = dict(pool.map(one, self.assessment))
         self.cursor = batch[-1]['observation_id']
         medical = (results.get('medical_agent') or {}).get('output')
-        by_id = {r['observation_id']: r for r in batch}
-        for place in (medical.get('places') or []) if isinstance(medical, dict) else []:
-            # A building only when a report pinpoints it (gps / address); "near <landmark>" fits many buildings,
-            # and a wrong building_id would merge unrelated places in the queue.
-            reports = [by_id[o] for o in place.get('observation_ids') or [] if o in by_id]
-            if not any((r.get('location') or {}).get('precision') in ('gps', 'address') for r in reports):
-                place = {**place, 'building_id': None}
+        for place in (medical or {}).get('places', []):
             self.add_to_medical_queue(place)
         return results
 
@@ -120,9 +183,7 @@ class Orchestrator:
         """Add one place from medical_agent, or merge it into the same place already queued (same building, or
         within 100 m when there is no building). Two reports of "3 trapped" are the same 3 people, so counts
         keep the highest reported, not the sum; priority keeps the most urgent."""
-        place = {**place, 'observation_ids': list(place.get('observation_ids') or [])}
-        if place.get('priority') not in (1, 2, 3, 4):
-            place['priority'] = 1 if (place.get('trapped') or place.get('critical')) else 2 if place.get('injured') else 3
+        place = MedicalPlace.model_validate(place).model_dump()
         same = next((q for q in self.medical_queue if _same_place(q, place)), None)
         if same is None:
             self.medical_queue.append(place)
