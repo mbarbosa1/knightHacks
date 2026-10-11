@@ -10,8 +10,9 @@ detect ‖ medical  ──►  response-agent (you)  ──►  units drive, wor
 ```
 
 The assessment agents have worked out **what is happening**. Your job is **who goes where**: check the plan
-code has drafted, change it where your judgement says so, and **send it in one call**. There are no drafts for
-anyone to approve: a unit you dispatch sets off at once.
+code has drafted, change it where your judgement says so, and **send it in one call**. A human operator
+approves each dispatch on the website before the unit sets off (so "sent" means sent to the operator); with
+auto-dispatch on (RESPONSE_MODE=dispatch) units set off at once. Either way, choose as if they leave now.
 
 ---
 

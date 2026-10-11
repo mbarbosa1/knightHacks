@@ -12,7 +12,7 @@ import argparse, time
 from agents.llm import run_agent
 
 
-def run_md_agent(tools, name, instructions, tool_names, batch, cursor=None):
+def run_md_agent(tools, name, instructions, tool_names, batch, cursor=None, validate=None):
     payload = {'run_id': tools.run_id, 'observation_ids': [r['observation_id'] for r in batch],
                'cursor': cursor, 'normalized': batch}
     done = {}                                   # filled by the agent's log_agent_run(input_ref) call
@@ -21,11 +21,14 @@ def run_md_agent(tools, name, instructions, tool_names, batch, cursor=None):
     try:
         result = run_agent(instructions, payload, specs, functions)
         output = result['output'] if isinstance(result['output'], dict) and result['output'] else done.get('output')
+        if validate is not None:          # e.g. the medical agent's answer is checked before anything is saved
+            output = validate(output, batch)
         result = {**result, 'output': output, 'seconds': round(time.monotonic() - started, 1)}
     except Exception as exc:   # reported, not raised: one agent failing must not stop the others
         result = {'error': f'{type(exc).__name__}: {exc}', 'seconds': round(time.monotonic() - started, 1)}
-    tools.log_agent_run(name, done.get('input_ref') or (batch[-1]['observation_id'] if batch else None),
-                        result.get('output') or {'error': result.get('error')}, int(result['seconds'] * 1000))
+    audit = tools.log_agent_run(name, done.get('input_ref') or (batch[-1]['observation_id'] if batch else None),
+                                result.get('output') or {'error': result.get('error')}, int(result['seconds'] * 1000))
+    result['audit_id'] = (audit or {}).get('id')
     return result
 
 

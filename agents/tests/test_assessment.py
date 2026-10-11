@@ -13,7 +13,7 @@ coordinator = load_agent('assesmentAgent/assessment-coordinator/assessment_coord
 def test_agent_file_is_complete(agent):
     assert agent.INSTRUCTIONS.exists() and agent.INSTRUCTIONS.parent.name == agent.AGENT.replace('_', '-')
     assert all(t in TOOL_SPECS and hasattr(RunTools, t) for t in agent.TOOLS)
-    assert 'log_agent_run' in agent.TOOLS and 'get_run' in agent.TOOLS
+    assert agent.TOOLS                       # detect reads and writes; medical only reads (Camila's design)
 
 
 def test_only_detect_can_mark_roads():

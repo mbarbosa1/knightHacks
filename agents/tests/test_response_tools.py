@@ -143,6 +143,7 @@ def test_a_unit_arriving_does_not_wake_the_response_agent_but_a_freed_unit_does(
 
 
 def test_the_orchestrator_records_what_was_really_sent_and_skips_the_model_when_nobody_can_go(tools, monkeypatch):
+    monkeypatch.setattr(orchestrator, "RESPONSE_MODE", "dispatch")   # automatic dispatch (RESPONSE_MODE=dispatch)
     monkeypatch.setattr(RunTools, 'list_incidents', lambda self: [
         {'id': INC, 'status': 'reported', 'building_id': 'bldg_1', 'location': None, 'person_groups': [{'condition': 'critical', 'est_count': 2}]}])
     monkeypatch.setattr(RunTools, 'list_observations', lambda self: [])

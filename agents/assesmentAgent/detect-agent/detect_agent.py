@@ -19,9 +19,9 @@ TOOLS = ['get_run', 'list_observations', 'list_incidents', 'get_last_agent_run',
          'find_nearby_buildings', 'find_nearest_road', 'upsert_incident', 'set_road_restriction', 'log_agent_run']
 
 
-def run(tools, batch, cursor=None, instructions=None):
+def run(tools, batch, cursor=None, instructions=None, validate=None):
     """One invocation on a batch of in_agent records -> run_md_agent's result (also logged to ops.agent_runs)."""
-    return run_md_agent(tools, AGENT, instructions or INSTRUCTIONS.read_text(), TOOLS, batch, cursor)
+    return run_md_agent(tools, AGENT, instructions or INSTRUCTIONS.read_text(), TOOLS, batch, cursor, validate)
 
 
 if __name__ == '__main__':

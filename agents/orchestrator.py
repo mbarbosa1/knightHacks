@@ -28,10 +28,11 @@ Every batch is logged to Neon as an ops.agent_runs row (agent 'orchestrator') wi
 tool calls and errors. Each agent's own entry (agent = its name, output = its final answer, or its error) is
 written here too: the agent's log_agent_run(input_ref) call only tells us which report it got to.
 '''
-import argparse, concurrent.futures, pathlib, threading, time
+import argparse, concurrent.futures, math, pathlib, threading, time
 from agents.llm import run_agent
 from agents.tools import RunTools
 from agents.loader import load_agent
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 _in_agent = load_agent('assesmentAgent/in-agent/in_agent.py')
 InAgent, IN_AGENT = _in_agent.InAgent, _in_agent.AGENT
@@ -46,6 +47,10 @@ ASSESSMENT_MODULES = {m.AGENT: m for m in (load_agent('assesmentAgent/detect-age
 ASSESSMENT_AGENTS = {name: (str(m.INSTRUCTIONS.relative_to(AGENTS_DIR)), m.TOOLS) for name, m in ASSESSMENT_MODULES.items()}
 
 
+# Human in the loop (default): the response agent PROPOSES dispatches; an operator approves each one on the website,
+# which is what sends the unit. RESPONSE_MODE=dispatch sends units at once, with no approval.
+RESPONSE_MODE = 'dispatch' if __import__('os').environ.get('RESPONSE_MODE', '').lower() == 'dispatch' else 'propose'
+
 # The response agent runs after each assessment batch (and when units come free): it reads the incidents and
 # the units, and dispatches. Resource and plan are one agent, with no drafts or approval; routing is code.
 RESPONSE_AGENTS = {
@@ -54,17 +59,85 @@ RESPONSE_AGENTS = {
 }
 
 
+class MedicalLocation(BaseModel):
+    model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
+    longitude: float = Field(ge=-180, le=180)
+    latitude: float = Field(ge=-90, le=90)
+
+    @field_validator('longitude', 'latitude', mode='before')
+    @classmethod
+    def reject_boolean(cls, value):
+        if isinstance(value, bool):
+            raise ValueError('coordinates must be numbers, not booleans')
+        return value
+
+
+class MedicalPlace(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    name: str | None = None
+    building_id: str | None = None
+    location: MedicalLocation | None = None
+    trapped: StrictInt | None = Field(default=None, ge=0, le=2**31 - 1)
+    critical: StrictInt | None = Field(default=None, ge=0, le=2**31 - 1)
+    injured: StrictInt | None = Field(default=None, ge=0, le=2**31 - 1)
+    priority: StrictInt = Field(ge=1, le=3)
+    why: str = ''
+    observation_ids: list[str] = Field(min_length=1)
+
+    @field_validator('location', mode='before')
+    @classmethod
+    def no_point_is_no_location(cls, value):
+        """A vague report has no point; the model writes that as {longitude: null, latitude: null}."""
+        if isinstance(value, dict) and value.get('longitude') is None and value.get('latitude') is None:
+            return None
+        return value
+
+    @field_validator('trapped', 'critical', 'injured', 'priority', mode='before')
+    @classmethod
+    def parse_integer_string(cls, value):
+        if isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
+            return int(value.strip())
+        return value
+
+
+class MedicalOutput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    situation_summary: str = ''
+    places: list[MedicalPlace]
+
+
+def validate_medical_output(output, batch):
+    """Validate the entire result before logging success or changing the queue."""
+    result = MedicalOutput.model_validate(output).model_dump()
+    by_id = {record['observation_id']: record for record in batch}
+    for place in result['places']:
+        if any(source not in by_id for source in place['observation_ids']):
+            raise ValueError('medical observation_ids must come from the current batch')
+        candidates = {
+            candidate['building_id']
+            for source in place['observation_ids']
+            for candidate in (by_id[source].get('location') or {}).get('building_candidates', [])
+            if (by_id[source].get('location') or {}).get('precision') in ('gps', 'address')
+        }
+        if place['building_id'] not in candidates:
+            place['building_id'] = None
+    return result
+
+
 class Orchestrator:
     _reading = False   # True while reports are read on their own thread (keep_reading)
 
-    def __init__(self, run_id, instructions_override=None, batch_size=5, in_workers=12, parallel_batches=3):
+    def __init__(self, run_id, instructions_override=None, batch_size=3, in_workers=12, parallel_batches=4):
         self.in_agent = InAgent.for_run(run_id)
         self.tools = self.in_agent.tools          # one RunTools (map loaded once) shared by every agent
         self.run_id = run_id
         self.batch_size = batch_size
         self.in_workers = in_workers
-        self.parallel_batches = parallel_batches   # assessment batches in flight at once (the model server batches requests)
+        self.parallel_batches = parallel_batches  # assessment batches in flight at once
+        self._respond_lock = __import__('threading').Lock()   # one response agent run at a time
+        self._queue_lock = __import__('threading').Lock()     # the medical queue, updated by parallel batches
         self.cursor = None                        # last observation id handed to the assessment agents
+        self.medical_queue = []                   # places with hurt people, from medical_agent; local only, never saved
         self.assessment = {}                      # name -> (instructions, tool names) for agents that exist
         for name, (path, tools) in ASSESSMENT_AGENTS.items():
             md = pathlib.Path((instructions_override or {}).get(name) or AGENTS_DIR / path)
@@ -175,11 +248,16 @@ class Orchestrator:
         Each agent's run() also writes its ops.agent_runs entry (its answer, or its error)."""
         def one(name):
             instructions, _ = self.assessment[name]
-            return name, ASSESSMENT_MODULES[name].run(self.tools, batch, cursor, instructions)
+            validate = validate_medical_output if name == 'medical_agent' else None   # Camila: check before saving
+            return name, ASSESSMENT_MODULES[name].run(self.tools, batch, cursor, instructions, validate=validate)
 
         with concurrent.futures.ThreadPoolExecutor(max(1, len(self.assessment))) as pool:
             results = dict(pool.map(one, self.assessment))
         self.cursor = batch[-1]['observation_id']
+        medical = (results.get('medical_agent') or {}).get('output')
+        with self._queue_lock:                      # batches run in parallel
+            for place in (medical or {}).get('places', []):
+                self.add_to_medical_queue(place)
         return results
 
     def assess_and_log(self, batch, number):
@@ -202,6 +280,11 @@ class Orchestrator:
         self.tools.log_agent_run('assessment_coordinator', last, handoff, run_key=f'coordinator:{last}')
         print(f'  batch {number}: coordinator    {len(handoff["incidents"])} incidents, '
               f'{len(handoff["needs_response"])} need a response', flush=True)
+        if handoff['needs_response'] and self._respond_lock.acquire(blocking=False):
+            try:              # propose right away, not after every batch of the cycle (one response at a time)
+                self.respond()
+            finally:
+                self._respond_lock.release()
         return True
 
     # ---- stage 3: the response agent ---------------------------------------
@@ -209,12 +292,15 @@ class Orchestrator:
     def respond(self):
         """Run the response agent if there is something it could do: an unresolved incident, a free unit,
         and a situation that has changed since it last looked. Returns its result, or None when skipped."""
-        if not self.response or not self._responding.acquire(blocking=False):
+        if not self.response:
+            return None
+        lock = self.__dict__.setdefault('_responding', threading.Lock())
+        if not lock.acquire(blocking=False):
             return None                            # a round is already under way; the next look catches up
         try:
             return self._respond()
         finally:
-            self._responding.release()
+            lock.release()
 
     def keep_responding(self, interval_s=5):
         """Look for someone to send every few seconds, on its own thread, for as long as this run is worked on.
@@ -235,6 +321,8 @@ class Orchestrator:
     def _respond(self):
         try:
             situation = self.tools.incidents_to_cover()
+            if RESPONSE_MODE == 'propose':
+                situation = self._without_pending(situation)
         except Exception as exc:   # no live run in the simulator, or it is not running: nothing to dispatch
             print(f'  response skipped: {exc}', flush=True)
             return None
@@ -251,11 +339,30 @@ class Orchestrator:
         dispatch = functions['dispatch_units']
         refs = {full: short for short, full in ids.items()}
 
+        eta = {(i['incident_id'], u['unit_id']): (t, u['travel_time_s'])
+               for i in situation['incidents'] for t, us in i['nearest_free'].items() for u in us}
+
+        def propose(real):
+            """Human in the loop: each choice becomes a draft for the operator (Approve dispatches it)."""
+            outcome, used = {'sent': [], 'refused': []}, set()
+            for a in real:
+                key = (a['incident_id'], a['unit_id'])
+                if key not in eta or a['unit_id'] in used:
+                    reason = 'already proposed in this list' if a['unit_id'] in used else \
+                             'not one of the free units listed for this incident'
+                    outcome['refused'].append({**a, 'reason': reason})
+                    continue
+                unit_type, eta_s = eta[key]
+                d = self.tools.propose_dispatch(a['unit_id'], a['incident_id'], unit_type, eta_s)
+                used.add(a['unit_id'])
+                outcome['sent'].append({**a, 'eta_s': eta_s, 'decision_id': d['id']})
+            return outcome
+
         def dispatch_units(assignments):
             real = [{'unit_id': ids.get(str((a or {}).get('unit')).upper(), (a or {}).get('unit')),
                      'incident_id': ids.get(str((a or {}).get('incident')).upper(), (a or {}).get('incident'))}
                     for a in assignments or []]
-            outcome = dispatch(real)
+            outcome = propose(real) if RESPONSE_MODE == 'propose' else dispatch(real)
             sent.extend(outcome['sent'])
             refused.extend(outcome['refused'])
             short = lambda r: {'unit': refs.get(r['unit_id'], r['unit_id']), 'incident': refs.get(r['incident_id'], r['incident_id'])}
@@ -269,7 +376,8 @@ class Orchestrator:
         except Exception as exc:
             result = {'error': f'{type(exc).__name__}: {exc}', 'output': {}, 'tool_calls': [], 'steps': None}
         result['seconds'] = round(time.monotonic() - started, 1)
-        result['output'] = {**result['output'], 'dispatched': sent, 'refused': refused,
+        result['output'] = {**result['output'], 'mode': RESPONSE_MODE,
+                            ('proposed' if RESPONSE_MODE == 'propose' else 'dispatched'): sent, 'refused': refused,
                             **({'error': result['error']} if 'error' in result else {})}
         self.tools.log_agent_run(name, self.cursor or 'no-reports-yet', result['output'], int(result['seconds'] * 1000))
         try:   # what it left behind, so an unchanged situation is not handed to it again
@@ -278,6 +386,53 @@ class Orchestrator:
             self._responded_to = None
         print(f'  response: {_response_summary(result)}', flush=True)
         return result
+
+    def _without_pending(self, situation):
+        """Propose mode: leave out what is already waiting for the operator, and drop drafts that went stale
+        (their unit is no longer free, or the incident was resolved), so nothing is proposed twice."""
+        free = {u['id'] for u in self.tools._units() if u['status'] == 'available'}
+        open_ids = {i['incident_id'] for i in situation['incidents']}
+        pending = []
+        for d in self.tools.proposals('draft'):
+            unit = (d['assignments'] or [{}])[0].get('resource_id')
+            if unit not in free or d['incident_id'] not in open_ids:
+                self.tools.close_proposal(d, 'invalidated', 'unit no longer free' if unit not in free
+                                          else 'incident no longer needs a unit')
+            else:
+                pending.append(d)
+        busy = {(d['assignments'] or [{}])[0].get('resource_id') for d in pending}
+        for i in situation['incidents']:
+            waiting = [(d['assignments'] or [{}])[0].get('type') for d in pending if d['incident_id'] == i['incident_id']]
+            for t in waiting:
+                if t in i['could_use']:
+                    i['could_use'].remove(t)
+            i['nearest_free'] = {t: [u for u in us if u['unit_id'] not in busy]
+                                 for t, us in i['nearest_free'].items() if t in i['could_use']}
+        situation['incidents'] = [i for i in situation['incidents'] if i['could_use']]
+        situation['suggested'] = [x for x in situation['suggested'] if x['unit_id'] not in busy
+                                  and any(x['incident_id'] == i['incident_id'] for i in situation['incidents'])]
+        return situation
+
+    # ---- medical queue: where people need help, most urgent first (in memory) ----
+
+    def add_to_medical_queue(self, place):
+        """Add one place from medical_agent, or merge it into the same place already queued (same building, or
+        within 100 m when there is no building). Two reports of "3 trapped" are the same 3 people, so counts
+        keep the highest reported, not the sum; priority keeps the most urgent."""
+        place = MedicalPlace.model_validate(place).model_dump()
+        same = next((q for q in self.medical_queue if _same_place(q, place)), None)
+        if same is None:
+            self.medical_queue.append(place)
+        else:
+            for k in ('trapped', 'critical', 'injured'):
+                counts = [v for v in (same.get(k), place.get(k)) if v is not None]
+                same[k] = max(counts) if counts else None
+            if place['priority'] < same['priority']:   # the more urgent report describes the place
+                same.update(priority=place['priority'], why=place.get('why') or same.get('why'),
+                            name=place.get('name') or same.get('name'))
+            same['observation_ids'] += [o for o in place['observation_ids'] if o not in same['observation_ids']]
+            same['building_id'] = same.get('building_id') or place.get('building_id')
+        self.medical_queue.sort(key=_queue_order)
 
     # ---- one pass over everything new ---------------------------------------
 
@@ -313,8 +468,20 @@ class Orchestrator:
             done = list(pool.map(self.assess_and_log, batches, range(1, len(batches) + 1)))
         assessed = sum(len(b) for b, ok in zip(batches, done) if ok)
         if assessed:
-            self.respond()   # new incidents: who goes where
+            self.print_medical_queue()
+            with self._respond_lock:
+                self.respond()   # anything the batches left (e.g. units that came free meanwhile)
         return len(reports) + assessed
+
+    def print_medical_queue(self, top=10):
+        if 'medical_agent' not in self.assessment:
+            return
+        print(f'Medical queue ({len(self.medical_queue)} places, most urgent first):', flush=True)
+        for n, q in enumerate(self.medical_queue[:top], 1):
+            counts = ', '.join(f'{q[k]} {k}' for k in ('critical', 'trapped', 'injured') if q.get(k)) or 'number unknown'
+            where = q.get('name') or q.get('building_id') or q.get('location')
+            print(f'  {n}. [P{q["priority"]}] {where}: {counts}. {q.get("why") or ""}', flush=True)
+
 
     def watch(self, interval_s=10, chunk=10):
         """Keep going while reports arrive. Each cycle takes at most `chunk` new reports, so the first incidents
@@ -333,6 +500,25 @@ TRIAGE_SAME_INCIDENT_M = 60   # a report this close to a known incident is about
 def _trapped_group(trapped, record):
     return {'group_id': 'grp_trapped', 'est_count': trapped or None, 'condition': 'trapped',
             'needs': ['extrication', 'medical'], 'confidence': record.get('source_reliability')}
+
+
+def _queue_order(q):
+    """Priority first, then most people trapped or critical, then most injured. A place where people were
+    reported with no number counts as at least one, so "people trapped" isn't ranked below "1 injured"."""
+    counts = [q.get(k) for k in ('critical', 'trapped', 'injured')]
+    serious = (q.get('critical') or 0) + (q.get('trapped') or 0) or (1 if all(c is None for c in counts) else 0)
+    return q['priority'], -serious, -(q.get('injured') or 0)
+
+
+def _same_place(a, b, within_m=100):
+    if a.get('building_id') and b.get('building_id'):
+        return a['building_id'] == b['building_id']
+    la, lb = a.get('location') or {}, b.get('location') or {}
+    if None in (la.get('longitude'), la.get('latitude'), lb.get('longitude'), lb.get('latitude')):
+        return False
+    dx = (la['longitude'] - lb['longitude']) * 111_320 * math.cos(math.radians(la['latitude']))
+    dy = (la['latitude'] - lb['latitude']) * 110_540
+    return math.hypot(dx, dy) <= within_m
 
 
 def _summary(result):
@@ -357,7 +543,7 @@ def current_run():
         return None
 
 
-def follow(override=None, batch_size=5, parallel=3, chunk=10, interval_s=10):
+def follow(override=None, batch_size=3, parallel=4, chunk=12, interval_s=5):
     """Work on whichever earthquake the website is showing, and switch by itself when someone clicks Generate."""
     orch = None
     print('Following the simulator: agents work on the earthquake the website shows (Ctrl+C to stop)...', flush=True)
@@ -416,7 +602,8 @@ def _brief(situation):
 
 def _response_summary(result):
     out = result['output']
-    return {'seconds': result['seconds'], 'steps': result['steps'], 'dispatched': len(out['dispatched']),
+    return {'seconds': result['seconds'], 'steps': result['steps'], 'mode': out.get('mode'),
+            'proposed' if out.get('mode') == 'propose' else 'dispatched': len(out.get('proposed', out.get('dispatched', []))),
             'refused': [r['reason'] for r in out['refused']][:5],
             'tool_errors': [c['error'] for c in result['tool_calls'] if not c['ok']][:5],
             'not_covered': len(out.get('not_covered') or []), 'summary': (out.get('summary') or '')[:300],
@@ -429,15 +616,15 @@ def main():
     ap.add_argument('--follow', action='store_true',
                     help='work on the run the website shows, switching when a new earthquake is generated')
     ap.add_argument('--watch', action='store_true', help='keep checking for new reports')
-    ap.add_argument('--batch-size', type=int, default=5)
-    ap.add_argument('--parallel', type=int, default=3, help='assessment batches at the same time (default 3)')
+    ap.add_argument('--batch-size', type=int, default=3)
+    ap.add_argument('--parallel', type=int, default=4, help='assessment batches at the same time (default 4)')
     ap.add_argument('--limit', type=int, help='only take this many new reports (with --watch: per cycle, default 10)')
     ap.add_argument('--instructions', action='append', default=[], metavar='AGENT=PATH',
                     help='use this .md for an agent instead of agents/<group>/<name>.md')
     a = ap.parse_args()
     override = dict(x.split('=', 1) for x in a.instructions)
     if a.follow:
-        return follow(override, a.batch_size, a.parallel, a.limit or 10)
+        return follow(override, a.batch_size, a.parallel, a.limit or 12)
     if not a.run_id:
         ap.error('give a run_id, or use --follow')
     print('Loading the run and its map...', flush=True)
