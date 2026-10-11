@@ -29,7 +29,7 @@ Configuration (environment variables, else backend/.env; backend/.env is never c
     DATABRICKS_TOKEN      dapi...
 With any of them missing (or DATABRICKS_UPLOAD=off) the upload is off and the simulator works exactly as before.
 '''
-import concurrent.futures, datetime, json, logging, os, pathlib, ssl, sys, time, urllib.error, urllib.request
+import concurrent.futures, datetime, json, logging, os, pathlib, random, ssl, sys, time, urllib.error, urllib.request, uuid
 from .storage import LocalStorage
 
 log = logging.getLogger('uvicorn.error')
@@ -154,13 +154,17 @@ def merge_sql(table, key, cols, schema='truth'):
 
 
 def read_rows(path, key, cols):
-    """Rows of one .jsonl file, only the table's columns, one per key (the last one wins)."""
+    """Rows of one .jsonl file, only the table's columns, one per key (the last one wins).
+    Runs written before truth_links had event_id get one derived from the row, so re-uploads still dedupe."""
     rows = {}
     with path.open() as f:
         for line in f:
             if line.strip():
                 r = json.loads(line)
-                rows[r[key]] = {c: r.get(c) for c in cols}
+                row = {c: r.get(c) for c in cols}
+                if row.get(key) is None and key == 'event_id':
+                    row[key] = str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(row, sort_keys=True)))
+                rows[row[key]] = row
     return list(rows.values())
 
 
@@ -183,11 +187,23 @@ def upload_run(run_dir, db=None):
     return new_rows
 
 
+def _merge_with_retry(db, sql, parameters, attempts=6):
+    """A MERGE reads the whole table, so another writer appending at the same time (a second simulator,
+    --pending, a teammate) aborts it with a Delta concurrency conflict. MERGE on the key is idempotent: retry."""
+    for attempt in range(attempts):
+        try:
+            return db.sql(sql, parameters)
+        except DatabricksError as exc:
+            if 'CONCURRENT' not in str(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(min(30, 2 ** attempt) + random.random())
+
+
 def _merge_chunks(db, sql, rows):
     """Send rows in CHUNK-sized MERGEs; returns how many were new."""
     inserted = 0
     for i in range(0, len(rows), CHUNK):
-        r = db.sql(sql, [{'name': 'rows', 'type': 'STRING', 'value': json.dumps(rows[i:i + CHUNK], ensure_ascii=False)}])
+        r = _merge_with_retry(db, sql, [{'name': 'rows', 'type': 'STRING', 'value': json.dumps(rows[i:i + CHUNK], ensure_ascii=False)}])
         data = (r.get('result') or {}).get('data_array') or [[0]]
         inserted += int(data[0][-1] or 0)   # MERGE returns (affected, updated, deleted, inserted)
     return inserted

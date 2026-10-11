@@ -423,6 +423,12 @@ class RunTools:
                 refused.append({'unit_id': unit_id, 'incident_id': incident_id, 'reason': str(exc)})
         return {'sent': sent, 'refused': refused}
 
+    def _in_district(self, lon, lat):
+        """True when there is at least one building of this map within OUTSIDE_DISTRICT_M of the point."""
+        within_m = OUTSIDE_DISTRICT_M
+        p = to_metres(Point(lon, lat))
+        return any(self._bldg_m[i].distance(p) <= within_m for i in self._bldgs.query(p.buffer(within_m)))
+
     def incidents_to_cover(self, limit=10):
         """The response picture in one call: every incident that is not resolved, with the people believed
         there by condition, the units already on it, what units reported from the scene, the kinds of unit it
@@ -443,12 +449,16 @@ class RunTools:
             people, needs = {}, set()
             for g in i['person_groups'] or []:
                 condition = str(g.get('condition') or 'unknown').lower()
-                people[condition] = people.get(condition, 0) + int(g.get('est_count') or 0)
+                # A group with no count still means somebody is there: count it as one, not as nobody.
+                people[condition] = people.get(condition, 0) + int(g.get('est_count') or 1)
                 needs.update(g.get('needs') or [])
             on_it = [{'unit_id': u['id'], 'type': u['type'], 'status': u['status']} for u in units
                      if u['status'] != 'available' and (u['destination'] or {}).get('incident_id') == i['id']]
             field = reports.get(i['id'], [])
-            located = bool(i['building_id'] or i['location'])
+            # Somewhere a unit could find something: a building on this map, or a point with buildings around
+            # it. A vague or false report can put an incident outside the district, where nothing exists.
+            located = i['building_id'] in self.map.building_geoms or bool(
+                i['location'] and self._in_district(i['location']['longitude'], i['location']['latitude']))
             incidents.append({'incident_id': i['id'], 'status': i['status'], 'people': people, 'needs': sorted(needs),
                               'has_location': located, 'units_on_it': on_it, 'field_reports': field[-3:],
                               'could_use': _could_use(i['status'], people, on_it, field) if located else []})
@@ -666,33 +676,43 @@ def _merge_groups(old, new):
 
 
 SECOND_ENGINE_FROM = 8   # trapped people from which a second engine is worth sending
+OUTSIDE_DISTRICT_M = 80  # an incident with no building of the map this close is outside the district: nobody is sent
+SAFE_CONDITIONS = ('safe', 'unhurt_evacuated', 'deceased', 'minor')
 
 
 def _could_use(status, people, on_it, field_reports):
     """The kinds of unit an incident could still use, from the rescue rules: an engine frees the trapped, an
     ambulance treats the critical, a patrol checks what is unclear. What a unit reported first-hand overrides
-    the estimate. Facts for the response agent to decide with; it still chooses who goes and in what order."""
+    the estimate. Facts for the response agent to decide with; it still chooses who goes and in what order.
+
+    Where people are trapped an ambulance goes too, even if nobody is reported critical: callers rarely know
+    who is critical under the rubble, there usually is someone, and the trapped turn critical as they wait.
+    One that finds nobody to treat loses a minute; one that was never sent can cost lives."""
     trapped, critical = people.get('trapped', 0), people.get('critical', 0)
-    assessed = False
+    assessed = ambulance_has_been = False
     for r in field_reports:   # oldest first, so the latest word wins
         if r.get('action') == 'assessed':
             trapped, critical, assessed = r.get('trapped', 0), r.get('critical', 0), True
         elif r.get('action') == 'rescued':
-            trapped = r.get('still_trapped', 0)
+            trapped, assessed = r.get('still_trapped', 0), True   # a crew has been there: no patrol needed to look
         elif r.get('action') == 'treated':
-            critical = r.get('still_critical', 0)
+            critical, ambulance_has_been, assessed = r.get('still_critical', 0), True, True
         elif r.get('action') == 'nothing_found':
             if r.get('unit_type') == 'fire_engine':
                 trapped = 0
             elif r.get('unit_type') == 'ambulance':
-                critical = 0
+                critical, ambulance_has_been = 0, True
             assessed = True
     there = [u['type'] for u in on_it]
     out = []
-    if critical and 'ambulance' not in there:
+    if (critical or (trapped and not ambulance_has_been)) and 'ambulance' not in there:
         out.append('ambulance')
     out += ['fire_engine'] * max(0, ((2 if trapped >= SECOND_ENGINE_FROM else 1) if trapped else 0) - there.count('fire_engine'))
-    if not trapped and not critical and not assessed and not there and (status == 'disputed' or not people):
+    # Nobody known trapped or critical, and nobody has looked: a patrol goes to see, unless everyone there is
+    # known to be safe. "Injured" from a caller often hides worse, and a patrol's count then brings the
+    # engines and ambulances.
+    unclear = status == 'disputed' or not people or any(n and c not in SAFE_CONDITIONS for c, n in people.items())
+    if not trapped and not critical and not assessed and not there and unclear:
         out.append('police')
     return out
 

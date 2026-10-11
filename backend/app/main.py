@@ -14,6 +14,7 @@ from . import repository
 from .config import Settings
 from .db import get_connection, make_pool
 from .models import DecisionPut, IncidentPut, ObservationCreate, ResourcePut, RoadRestrictionPut, RunCreate, RunEnd, SimulationIngest
+from .analytics import make_router
 
 
 def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
@@ -31,6 +32,7 @@ def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
     # Environment configuration is also used when constructing the app, so CORS
     # works consistently for the browser and keeps its list explicit.
     config = settings or Settings()
+    app.include_router(make_router(config))
     app.add_middleware(CORSMiddleware, allow_origins=config.cors_origins,
                        allow_methods=["GET", "POST", "PUT"], allow_headers=["Content-Type"])
     app.add_middleware(GZipMiddleware, minimum_size=1000)
@@ -119,6 +121,18 @@ def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
         return await (await connection.execute(
             f"SELECT {repository.DECISION_COLUMNS} FROM ops.decisions WHERE run_id=%s ORDER BY incident_id, version, id LIMIT %s OFFSET %s",
             (run_id, limit, offset),
+        )).fetchall()
+
+    @app.get("/runs/{run_id}/agent-runs")
+    async def agent_runs(run_id: UUID, connection: Connection, limit: int = Query(50, ge=1, le=500),
+                         include_in_agent: bool = False):
+        """What the agents concluded, newest first: one entry per invocation with its final output.
+        in_agent writes one entry per report, so it is left out unless asked for."""
+        await repository.require_run(connection, run_id)
+        return await (await connection.execute(
+            """SELECT id, agent, input_ref, output, duration_ms, created_at FROM ops.agent_runs
+               WHERE run_id=%s AND (%s OR agent <> 'in_agent') ORDER BY created_at DESC, id LIMIT %s""",
+            (run_id, include_in_agent, limit),
         )).fetchall()
 
     @app.put("/runs/{run_id}/road-restrictions/{road_id}")

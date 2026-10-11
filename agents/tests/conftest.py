@@ -7,6 +7,7 @@ import os, pathlib, sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))   # repo root, so `agents.*` imports
 os.environ.setdefault('AGENT_LLM', 'off')   # fast tests never call the hosted endpoint (the live tests can: AGENT_LLM=on)
+os.environ.setdefault('IN_AGENT_LLM', 'amd')   # and the in_agent's server does not depend on this laptop's backend/.env
 
 
 def pytest_configure(config):

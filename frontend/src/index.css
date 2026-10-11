@@ -516,7 +516,7 @@ button {
 
 .metrics-row {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 8px;
 }
 
@@ -928,7 +928,7 @@ button {
     color: #56d1cb;
 }
 
-.map-toolbar span {
+.map-toolbar>span {
     height: 1px;
     background: #34474e;
 }
@@ -2883,3 +2883,209 @@ detail-tags span {
 .dismiss:hover { color: var(--text-primary); border-color: var(--text-muted); }
 
 .team-done > span:first-child { color: #1f6b35; }
+
+/* Agent activity: what each agent concluded and what units report back, newest first. */
+.activity-list {
+    max-height: 290px;
+    overflow-y: auto;
+    padding-right: 2px;
+}
+
+.activity-item {
+    border-left: 3px solid var(--border);
+}
+
+.activity-item.activity-respond {
+    border-left-color: #e8590c;
+}
+
+.activity-item.activity-assess {
+    border-left-color: #1c7ed6;
+}
+
+.activity-item.activity-field {
+    border-left-color: #2b8a3e;
+    background: #fff;
+}
+
+.activity-item.activity-field>strong {
+    font-weight: 500;
+}
+
+.activity-item.activity-error {
+    border-left-color: #adb5bd;
+    opacity: 0.75;
+}
+
+.activity-panel .mini-live {
+    color: #2b8a3e;
+    background: #ebfbee;
+    border-color: #b2f2bb;
+}
+
+.activity-panel .mini-live i {
+    background: #2b8a3e;
+    box-shadow: 0 0 6px #2b8a3e88;
+}
+
+/* The map on the whole screen, for the demo. */
+.map-panel:fullscreen {
+    width: 100vw;
+    height: 100vh;
+    border: 0;
+    border-radius: 0;
+}
+
+.map-dots-toggle {
+    white-space: nowrap;
+    opacity: 0.75;
+}
+
+.map-dots-toggle.active {
+    opacity: 1;
+}
+
+/* The unit the camera is riding along with. */
+.map-unit {
+    cursor: pointer;
+}
+
+.map-unit-followed {
+    transform-origin: center;
+    outline: 3px solid #18212b;
+    outline-offset: 3px;
+    z-index: 5;
+}
+
+.map-following {
+    white-space: nowrap;
+    color: #ffffff;
+    background: #18212b;
+    border-color: #18212b;
+}
+
+/* Agent activity keeps a useful height in the fitted right column. */
+.right-column > .activity-panel {
+    max-height: 210px;
+}
+
+/* Start: the run is ready and waiting for the operator to pick a speed and begin. */
+.map-clock-button.map-start {
+    color: #ffffff;
+    background: #2b8a3e;
+    border-color: #1f7a3d;
+    font-weight: 600;
+}
+
+.metric-card small,
+.metric-card .metric-detail {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Time since the earthquake: minutes and seconds, with a caption saying what it is. */
+.map-clock-elapsed {
+    display: inline-flex;
+    flex-direction: column;
+    line-height: 1.05;
+}
+
+.map-clock-elapsed small {
+    font-size: 9px;
+    letter-spacing: 0.02em;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+/* The right column scrolls as a whole, so every panel can be reached on any screen height. */
+.right-column {
+    overflow-x: hidden;
+    overflow-y: auto;
+    padding-right: 2px;
+}
+
+/* Full screen: the response figures as a see-through card on the left of the map. */
+.map-stats-overlay {
+    position: absolute;
+    left: 14px;
+    top: 150px;
+    z-index: 4;
+    width: 190px;
+    padding: 12px 14px 10px;
+    border: 1px solid #ffffff99;
+    border-radius: 8px;
+    background: #ffffffb8;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    box-shadow: 0 6px 20px #18212b22;
+    color: #18212b;
+    pointer-events: none;      /* never in the way of dragging the map */
+}
+
+.map-stats-overlay h3 {
+    margin: 0 0 4px;
+    font: 600 9px "DM Mono", monospace;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #5c6b73;
+}
+
+.map-stats-overlay dl {
+    margin: 0 0 10px;
+}
+
+.map-stats-overlay dl:last-child {
+    margin-bottom: 0;
+}
+
+.map-stats-overlay dl > div {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 2px 0;
+}
+
+.map-stats-overlay dt {
+    font-size: 12px;
+}
+
+.map-stats-overlay dd {
+    margin: 0;
+    font: 600 18px "Space Grotesk", sans-serif;
+    font-variant-numeric: tabular-nums;
+}
+
+.map-stats-overlay .loss dd {
+    color: #c1121f;
+}
+
+/* Right column, uncramped: each panel takes the room its content needs (up to a limit, then it scrolls
+   inside), an empty panel stays small, and the column itself scrolls. */
+.right-column > .incidents-panel {
+    flex: 0 0 auto;
+    min-height: 0;
+    max-height: 46vh;
+}
+
+.right-column > .incidents-panel .incident-list {
+    flex: 0 1 auto;
+}
+
+.right-column > .activity-panel {
+    max-height: 320px;
+}
+
+.right-column > .activity-panel .activity-list {
+    max-height: 250px;
+}
+
+.right-column > .progress-panel:not(.activity-panel) {
+    max-height: 230px;
+}
+
+.right-column > .dispatch-panel {
+    flex: 0 0 auto;
+    max-height: none;
+    overflow: visible;
+}

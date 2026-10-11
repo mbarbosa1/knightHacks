@@ -10,6 +10,7 @@
     POST /clock             {"speed": 10|20, "playing": true|false}
     POST /stop              stop the live run and close it
     GET  /units             every responder unit: where it is, where it has been, where it is going
+    GET  /agents            whether the agents are running for the live run, and the end of their log
 
 Tools for the response agents. They answer from what is *believed* about the roads (ops.road_restrictions
 plus anything units have found), never from the truth:
@@ -17,6 +18,10 @@ plus anything units have found), never from the truth:
     POST /tools/route           {unit_id | from_lon+from_lat, building_id | lon+lat}   how to get there
     POST /dispatch              {unit_id, building_id | lon+lat, incident_id?}         send the unit
 Each takes an optional run_id and refuses if that is not the run being played.
+
+SIM_AGENTS=1 (set by ./dev.sh) starts the agents for every new run: Generate also launches
+`python -m agents.orchestrator <run_id> --watch`, and stops it when the run is stopped or replaced. Their
+output goes to simulation/runs/<run_id>/agents.log. They need the SSH tunnel to the model to be open.
 
 This serves hidden ground truth and has no login: keep it on localhost. Agents must never call it.
 
@@ -30,7 +35,7 @@ The default is Neon mode; SIM_LOCAL_ONLY=1 explicitly selects a local-only devel
 SIM_GEMINI=1 has Gemini write the report wording (needs GEMINI_API_KEY; see sim/report_writer.py). It adds up to
 a few minutes to POST /runs on the free tier; reports Gemini cannot word keep their template text. Off by default.
 """
-import asyncio, collections, json, logging, os, random, time, uuid
+import asyncio, collections, json, logging, os, pathlib, random, subprocess, sys, time, uuid
 from types import SimpleNamespace
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
@@ -53,6 +58,8 @@ BACKEND_URL = None if os.environ.get('SIM_LOCAL_ONLY') == '1' else os.environ.ge
 log = logging.getLogger('uvicorn.error')
 AUTO_DISPATCH = os.environ.get('SIM_AUTO_DISPATCH') == '1'   # stand-in dispatcher for testing without agents
 BELIEFS_TTL_S = 3.0
+AGENTS = os.environ.get('SIM_AGENTS') == '1'   # start the agent pipeline for each new run
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 GEMINI = os.environ.get('SIM_GEMINI') == '1'   # opt-in Gemini wording for every new run
 
 @asynccontextmanager
@@ -61,6 +68,7 @@ async def lifespan(app):
     task = asyncio.create_task(asyncio.to_thread(ApiStorage(BACKEND_URL).recover_prepared)) if BACKEND_URL else None
     databricks_sink.upload_pending_in_background()   # truth of runs that never reached Databricks
     yield
+    stop_agents()
     if task:
         await task
 
@@ -69,7 +77,7 @@ app = FastAPI(title='Shinjuku simulator', version='0.2.0', lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origin_regex=r'http://(localhost|127\.0\.0\.1):\d+',
                    allow_methods=['GET', 'POST'], allow_headers=['Content-Type'])
 _state = {'storage': None, 'map': None, 'router': None, 'runs': collections.OrderedDict(), 'reports': {}, 'dispatch': {},
-          'live': None, 'live_storage': None, 'fleet': None, 'beliefs': (0.0, {})}
+          'live': None, 'live_storage': None, 'fleet': None, 'beliefs': (0.0, {}), 'agents': None}
 
 
 def _map():
@@ -111,10 +119,40 @@ def saved_view(run_id, name):
         raise HTTPException(404,'Run view not found')
 
 
+def stop_agents():
+    """Stop the agent pipeline of the previous run, if it is still going."""
+    agents, _state['agents'] = _state['agents'], None
+    if agents and agents['process'].poll() is None:
+        agents['process'].terminate()
+        try:
+            agents['process'].wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            agents['process'].kill()
+
+
+def start_agents(run_id):
+    """Start the agents on a run that is saved and playing: the orchestrator, watching for new reports.
+    Only in Neon mode (agents read and write Neon), and not next to the stand-in dispatcher."""
+    stop_agents()
+    if not (AGENTS and BACKEND_URL) or AUTO_DISPATCH:
+        return
+    log_path = LocalStorage().runs_dir / run_id / 'agents.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        process = subprocess.Popen([sys.executable, '-m', 'agents.orchestrator', run_id, '--watch'], cwd=REPO_ROOT,
+                                   env={**os.environ, 'BACKEND_URL': BACKEND_URL, 'PYTHONUNBUFFERED': '1'},
+                                   stdout=open(log_path, 'w', encoding='utf-8'), stderr=subprocess.STDOUT)
+    except OSError as exc:   # the run plays on without agents
+        log.warning('run %s: agents could not be started (%s)', run_id, exc)
+        return
+    _state['agents'] = {'run_id': run_id, 'process': process, 'log': log_path}
+
+
 def stop_live():
     """Stop the clock of the run that is live, if any, and close it. One run plays at a time."""
     live, storage = _state['live'], _state['live_storage']
     _state['live'] = _state['live_storage'] = None
+    stop_agents()
     if live is None:
         return None
     live.stop()
@@ -156,6 +194,7 @@ def start_live(run_id, reports, speed, static_map=None, truth=None, auto_dispatc
             schedule, on_due = [(u['depart_s'], u['building_id']) for u in auto_dispatch], _standin_send
     _state['live_storage'], _state['fleet'], _state['beliefs'] = storage, fleet, (0.0, {})
     _state['live'] = LiveRun(run_id, reports, storage, speed=speed, fleet=fleet, schedule=schedule, on_due=on_due).start()
+    start_agents(run_id)
     return _state['live'].state()
 
 
@@ -212,13 +251,15 @@ class NewRun(BaseModel):
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1, description='omit for a random earthquake')
     mw: float | None = Field(default=None, ge=MW_RANGE[0], le=MW_RANGE[1], description='omit to let the seed pick the magnitude')
     speed: int = Field(default=DEFAULT_SPEED, description=f'simulated seconds per real second: one of {SPEEDS}')
+    paused: bool = Field(default=False, description='create the run with its clock held at T+0 until POST /clock {playing: true}')
 
 
 @app.get('/health')
 def health():
     return {'status':'ok','magnitude_range':list(MW_RANGE),'storage_mode':'neon' if BACKEND_URL else 'local-demo',
             'speeds':list(SPEEDS),'truth_upload':'databricks' if databricks_sink.enabled() else 'off',
-            'report_wording':'gemini' if GEMINI else 'templates'}
+            'report_wording':'gemini' if GEMINI else 'templates',
+            'agents':'auto-start' if AGENTS and BACKEND_URL and not AUTO_DISPATCH else 'off'}
 
 
 
@@ -261,6 +302,8 @@ def new_run(body: NewRun):
         # Only now, with the run confirmed saved, does its clock start and the previous run's stop.
         data['clock'] = start_live(truth.run_id, truth.reports, body.speed, static_map, truth,
                                    auto_dispatch=dispatch_view if AUTO_DISPATCH else None)
+        if body.paused:   # held at the start: nothing is released and nobody moves until Start is pressed
+            data['clock'] = _state['live'].set(playing=False)
     except Exception as exc:
         log.error('Simulation submission failed: %s',exc)
         raise submission_error(storage,exc) from exc
@@ -325,6 +368,19 @@ def change_clock(body: ClockChange):
     if body.speed is not None and body.speed not in SPEEDS:
         raise HTTPException(422, f'speed must be one of {list(SPEEDS)}')
     return live.set(speed=body.speed, playing=body.playing)
+
+
+@app.get('/agents')
+def agents():
+    """Whether the agents are running for the live run, and the last lines they printed."""
+    a = _state['agents']
+    if a is None:
+        return {'run_id': None, 'running': False, 'enabled': AGENTS and bool(BACKEND_URL) and not AUTO_DISPATCH, 'log': []}
+    try:
+        lines = a['log'].read_text(encoding='utf-8', errors='replace').splitlines()[-40:]
+    except OSError:
+        lines = []
+    return {'run_id': a['run_id'], 'running': a['process'].poll() is None, 'enabled': True, 'log': lines}
 
 
 @app.get('/units')

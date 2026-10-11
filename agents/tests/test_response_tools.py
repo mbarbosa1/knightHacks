@@ -12,6 +12,8 @@ RUN, INC, UNIT = 'run-1', 'inc-1', 'unit-1'
 def tools(monkeypatch):
     t = RunTools.__new__(RunTools)
     t.run_id = RUN
+    t.map = type('M', (), {'building_geoms': {'bldg_1': None, 'bldg_2': None}})()
+    t._in_district = lambda lon, lat: lon < 139.9   # the test district ends there
     calls = []
     units = [{'id': UNIT, 'name': 'Engine 1', 'type': 'fire_engine', 'status': 'en_route', 'lon': 139.7, 'lat': 35.69,
               'destination': {'incident_id': INC}, 'helped': 0},
@@ -102,16 +104,23 @@ def test_what_an_incident_could_use_follows_the_rescue_rules_and_the_field():
     engine, ambulance = {'type': 'fire_engine'}, {'type': 'ambulance'}
     assert use('reported', {'trapped': 3, 'critical': 1}, [], []) == ['ambulance', 'fire_engine']
     assert use('reported', {'trapped': 3, 'critical': 1}, [engine, ambulance], []) == []
-    assert use('reported', {'injured': 9}, [], []) == []                              # walking wounded: nobody is sent
-    assert use('reported', {'trapped': 12}, [], []) == ['fire_engine', 'fire_engine']  # two engines for a big one
-    assert use('reported', {'trapped': 12}, [engine], []) == ['fire_engine']
-    assert use('reported', {'trapped': 12}, [engine, engine], []) == []
+    assert use('reported', {'injured': 9}, [], []) == ['police']                      # "injured" often hides worse: a patrol looks
+    assert use('reported', {'injured': 9}, [], [{'unit_type': 'police', 'action': 'assessed', 'trapped': 0, 'critical': 0}]) == []
+    assert use('reported', {'safe': 4, 'unhurt_evacuated': 2}, [], []) == []          # everyone accounted for: nobody is sent
+    assert use('reported', {'trapped': 12}, [], []) == ['ambulance', 'fire_engine', 'fire_engine']  # two engines for a big one
+    assert use('reported', {'trapped': 12}, [engine, ambulance], []) == ['fire_engine']
+    assert use('reported', {'trapped': 12}, [engine, engine, ambulance], []) == []
     assert use('disputed', {}, [], []) == ['police'] and use('reported', {}, [], []) == ['police']
     assert use('disputed', {}, [{'type': 'police'}], []) == []
     seen = [{'unit_type': 'police', 'action': 'assessed', 'trapped': 0, 'critical': 2}]
     assert use('reported', {'trapped': 5}, [], seen) == ['ambulance']                  # the patrol's count replaces the estimate
     assert use('reported', {'trapped': 5}, [], [{'unit_type': 'fire_engine', 'action': 'nothing_found'}]) == []
     assert use('reported', {'trapped': 5}, [], [{'unit_type': 'fire_engine', 'action': 'rescued', 'count': 5, 'still_trapped': 0}]) == []
+    # Trapped people get an ambulance too, even with nobody reported critical...
+    assert use('reported', {'trapped': 4}, [], []) == ['ambulance', 'fire_engine'] and use('reported', {'trapped': 4}, [ambulance], []) == ['fire_engine']
+    # ...once: one that came and found nobody to treat, or treated who was there, is not sent again.
+    assert use('reported', {'trapped': 4}, [], [{'unit_type': 'ambulance', 'action': 'nothing_found'}]) == ['fire_engine']
+    assert use('reported', {'trapped': 4}, [], [{'unit_type': 'ambulance', 'action': 'treated', 'count': 2, 'still_critical': 0}]) == ['fire_engine']
 
 
 def test_a_list_of_units_is_sent_in_one_call_and_a_unit_cannot_go_twice(tools):
@@ -144,6 +153,7 @@ def test_the_orchestrator_records_what_was_really_sent_and_skips_the_model_when_
     tools.log_agent_run = lambda *a, **k: logged.append(a)
     orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
     orch.tools, orch.run_id, orch.cursor, orch._responded_to = tools, RUN, 'obs-9', None
+    orch._responding, orch._stop_responding = orchestrator.threading.Lock(), orchestrator.threading.Event()
     orch.response = {'response_agent': ('instructions', ['dispatch_units'])}
 
     def fake_model(instructions, payload, specs, functions, max_steps):
@@ -160,3 +170,45 @@ def test_the_orchestrator_records_what_was_really_sent_and_skips_the_model_when_
 
     tools_module._sim('GET', '/units')[1]['status'] = 'busy'                          # now no ambulance is free
     assert orch.respond() is None and len(asked) == 1
+
+
+def test_the_response_agent_looks_on_its_own_and_never_runs_two_rounds_at_once(tools, monkeypatch):
+    import threading, time
+    orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
+    orch.run_id, orch.response = RUN, {'response_agent': ('instructions', ['dispatch_units'])}
+    orch._responding, orch._stop_responding = threading.Lock(), threading.Event()
+    looks, inside = [], threading.Event()
+
+    def slow_round():
+        looks.append(time.monotonic())
+        inside.set()
+        time.sleep(0.15)
+        return 'done'
+    orch._respond = slow_round
+    first = threading.Thread(target=orch.respond)
+    first.start()
+    inside.wait(1)
+    assert orch.respond() is None and len(looks) == 1     # a round is under way: this look is skipped, not queued
+    first.join()
+
+    orch.keep_responding(interval_s=0.05)                  # on its own thread, with nobody calling it
+    time.sleep(0.5)
+    orch.stop_responding()
+    seen = len(looks)
+    assert seen >= 3
+    time.sleep(0.3)
+    assert len(looks) <= seen + 1                          # and it stops when the run is no longer worked on
+
+
+def test_an_incident_outside_the_district_gets_no_unit(tools, monkeypatch):
+    """A vague or false report can put an incident where the map has no buildings: nothing can be found there."""
+    monkeypatch.setattr(RunTools, 'list_incidents', lambda self: [
+        {'id': 'far', 'status': 'reported', 'building_id': None, 'location': {'longitude': 139.95, 'latitude': 35.6},
+         'person_groups': [{'condition': 'trapped', 'est_count': 5}]},
+        {'id': 'near', 'status': 'reported', 'building_id': None, 'location': {'longitude': 139.70, 'latitude': 35.69},
+         'person_groups': [{'condition': 'critical', 'est_count': 1}]},
+        {'id': 'ghost', 'status': 'reported', 'building_id': 'not-on-this-map', 'location': None, 'person_groups': None}])
+    monkeypatch.setattr(RunTools, 'list_observations', lambda self: [])
+    picture = tools.incidents_to_cover()
+    assert [i['incident_id'] for i in picture['incidents']] == ['near']
+    assert picture['not_listed']['nothing_needed_now'] == 2 and all(s['incident_id'] == 'near' for s in picture['suggested'])

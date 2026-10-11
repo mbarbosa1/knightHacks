@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  BarChart3,
   ArrowDownRight,
   ArrowUpRight,
   Check,
@@ -30,10 +31,35 @@ import {
 import { type MockReport, type ReportKind } from "./data/mockReports";
 import { CHANNELS, UNIT_COLOR, UNIT_LABEL, ShinjukuMap, formatClock, type ShinjukuMapHandle } from "./map/ShinjukuMap";
 import type { MapState } from "./map/ShinjukuMap";
-import type { Decision, LiveUnit, OperationalState, Report } from "./map/dataSource";
-import { approveProposal, incidentPriority, rejectProposal } from "./map/dataSource";
+import { approveProposal, incidentPriority, loadAgentRuns, loadAgentsStatus, rejectProposal } from "./map/dataSource";
+import type { AgentRun, AgentsStatus, Decision, LiveUnit, OperationalState, Report } from "./map/dataSource";
+import "./analytics/analytics.css";
+
+const AnalyticsPage = lazy(() => import("./analytics/AnalyticsPage"));
+const currentPage = () => window.location.pathname.replace(/\/$/, "") === "/analytics" ? "analytics" : "operations";
 
 type BelievedIncident = OperationalState["incidents"][number];
+
+/** One line of the agent activity feed: an agent's conclusion, or word from a unit in the field. */
+interface Activity {
+  key: string;
+  at: number;                      // simulated seconds since the earthquake
+  kind: "assess" | "respond" | "field" | "error";
+  who: string;
+  title: string;
+  lines: string[];
+  note?: string;
+}
+const AGENT_NAME: Record<string, string> = {
+  triage: "Triage",
+  detect_agent: "Detect agent",
+  medical_agent: "Medical agent",
+  response_agent: "Response agent",
+};
+const AGENTS_REFRESH_MS = 3000;
+
+/** A count for a dashboard card: two digits, or a dash while no run is playing. */
+const pad = (n: number | undefined | null) => (n === undefined || n === null ? "–" : String(n).padStart(2, "0"));
 
 /** Units that are doing something come first: driving, then working, then free again, then never sent. */
 const unitOrder = (unit: LiveUnit) =>
@@ -76,12 +102,39 @@ function toReport(o: Report): MockReport {
 }
 
 function App() {
+  const [page, setPage] = useState(currentPage);
+  const [operationsVisited, setOperationsVisited] = useState(() => currentPage() === "operations");
+  const navigate = (next: "analytics" | "operations") => {
+    window.history.pushState({}, "", next === "analytics" ? "/analytics" : "/");
+    setPage(next);
+    if (next === "operations") setOperationsVisited(true);
+  };
+  useEffect(() => {
+    const follow = () => { const next = currentPage(); setPage(next); if (next === "operations") setOperationsVisited(true); };
+    window.addEventListener("popstate", follow);
+    return () => window.removeEventListener("popstate", follow);
+  }, []);
+  useEffect(() => {
+    document.title = page === "analytics" ? "Analytics & Replay · KYU-BOT" : "KYU-BOT · Disaster Intelligence";
+    if (page === "operations") window.dispatchEvent(new Event("resize"));
+  }, [page]);
   const [filter, setFilter] = useState<"All" | ReportKind>("All");
   const [search, setSearch] = useState("");
   const [selectedReportId, setSelectedReportId] = useState<string | null>(null);
   const [reportOpen, setReportOpen] = useState(false);
   const [utc, setUtc] = useState(new Date());
   const mapRef = useRef<ShinjukuMapHandle>(null);
+  const mapPanel = useRef<HTMLElement>(null);
+  const [fullscreen, setFullscreen] = useState(false);
+  useEffect(() => {
+    const changed = () => setFullscreen(document.fullscreenElement === mapPanel.current);
+    document.addEventListener("fullscreenchange", changed);
+    return () => document.removeEventListener("fullscreenchange", changed);
+  }, []);
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else mapPanel.current?.requestFullscreen();
+  };
   // The map follows the saved run and collects its reports as the live clock releases them into Neon
   // (Gemini-worded when the simulator runs with SIM_GEMINI=1). The feed shows the same list, so it fills in one
   // by one. With no saved run on the map, the feed is empty.
@@ -155,6 +208,88 @@ function App() {
       ? (unit.destination.building_id && mapRef.current?.buildingName(unit.destination.building_id)) ||
         `${unit.destination.lat.toFixed(4)}° N, ${unit.destination.lon.toFixed(4)}° E`
       : "";
+  // What the agents concluded, asked of the backend every few seconds. An entry is stamped with the simulated
+  // time at which the dashboard first saw it, so it can sit in one timeline with the units' own reports.
+  const [agentRuns, setAgentRuns] = useState<(AgentRun & { seenAt: number })[]>([]);
+  const [agentsStatus, setAgentsStatus] = useState<AgentsStatus | null>(null);
+  const simNow = useRef(0);
+  simNow.current = clock?.sim_time_s ?? 0;
+  useEffect(() => {
+    setAgentRuns([]);
+    setAgentsStatus(null);
+    if (!runId) return;
+    let stop = false;
+    const tick = async () => {
+      const [runs, status] = await Promise.all([loadAgentRuns(runId), loadAgentsStatus()]);
+      if (stop) return;
+      setAgentsStatus(status);
+      setAgentRuns((previous) => {
+        const seen = new Map(previous.map((run) => [run.id, run.seenAt]));
+        return runs.map((run) => ({ ...run, seenAt: seen.get(run.id) ?? simNow.current }));
+      });
+    };
+    tick();
+    const timer = window.setInterval(tick, AGENTS_REFRESH_MS);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
+  }, [runId]);
+  const agentsLive = Boolean(runId && agentsStatus?.running && agentsStatus.run_id === runId);
+  useEffect(() => {
+    setSelectedReportId(null);
+    setReportOpen(false);
+    setSearch("");
+  }, [runId]);
+
+  const activity: Activity[] = useMemo(() => {
+    const incidents = mapState?.operational.incidents ?? [];
+    const place = (incidentId: string) => {
+      const incident = incidents.find((i) => i.id === incidentId);
+      if (!incident) return "an incident";
+      const name = incident.building_id ? mapRef.current?.buildingName(incident.building_id) : null;
+      return `${believedPeople(incident)}${name ? ` at ${name}` : ""}`;
+    };
+    const unitName = (unitId: string) => units.find((unit) => unit.id === unitId)?.name ?? "a unit";
+    const out: Activity[] = [];
+    for (const run of agentRuns) {
+      const who = AGENT_NAME[run.agent];
+      const output = run.output;
+      if (!who || !output) continue;                       // the orchestrator's own bookkeeping is not shown
+      const took = run.duration_ms ? `${Math.round(run.duration_ms / 1000)} s` : undefined;
+      if (output.error) {
+        out.push({ key: run.id, at: run.seenAt, kind: "error", who, title: "Could not finish this round", lines: [output.error.slice(0, 160)], note: took });
+      } else if (run.agent === "response_agent") {
+        const proposing = output.proposed !== undefined;   // approval mode: the operator sends them
+        const sent = output.proposed ?? output.dispatched ?? [];
+        const units_ = `${sent.length} unit${sent.length === 1 ? "" : "s"}`;
+        out.push({
+          key: run.id, at: run.seenAt, kind: "respond", who, note: took,
+          title: !sent.length ? (proposing ? "Nothing new to propose" : "Sent nobody")
+            : proposing ? `Proposed ${units_} · waiting for approval` : `Sent ${units_}`,
+          lines: [
+            ...sent.map((d) => `${unitName(d.unit_id)} → ${place(d.incident_id)}`),
+            ...(output.refused ?? []).map((r) => `Could not send ${unitName(r.unit_id)}: ${r.reason}`),
+            ...((output.not_covered?.length ?? 0) > 0 ? [`${output.not_covered!.length} need${output.not_covered!.length === 1 ? "" : "s"} left uncovered`] : []),
+          ],
+        });
+      } else {
+        const said = output.situation_summary ?? output.summary;
+        const found = output.incidents?.length;
+        out.push({
+          key: run.id, at: run.seenAt, kind: "assess", who, note: took,
+          title: found !== undefined ? `Assessed reports · ${found} incident${found === 1 ? "" : "s"}` : "Assessed reports",
+          lines: said ? [said] : [],
+        });
+      }
+    }
+    for (const report of observations ?? []) {
+      if (report.channel !== "responder_update") continue;
+      out.push({ key: report.id, at: report.sim_time_s ?? 0, kind: "field", who: "From the field", title: report.text_en ?? "", lines: [] });
+    }
+    return out.sort((a, b) => b.at - a.at).slice(0, 40);
+  }, [agentRuns, observations, units, mapState?.operational.incidents]);
+
   const visibleReports = useMemo(
     () =>
       reports.filter(
@@ -188,12 +323,16 @@ function App() {
           <span className="scenario-name">Tokyo earthquake scenario</span>
         </div>
         <div className="top-actions">
+          <nav className="app-page-nav" aria-label="Main pages">
+            <a href="/" aria-current={page === "operations" ? "page" : undefined} onClick={event => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey) { event.preventDefault(); navigate("operations"); } }}>Operations</a>
+            <a href="/analytics" aria-current={page === "analytics" ? "page" : undefined} onClick={event => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey) { event.preventDefault(); navigate("analytics"); } }}><BarChart3 size={15} /> Analytics &amp; Replay</a>
+          </nav>
           <span className="live-badge">
             <i /> SIMULATION
           </span>
           <span className="clock">
             {clock?.sim_time_s !== undefined
-              ? <>T+{formatClock(clock.sim_time_s)} <small>SIM</small></>
+              ? <>{formatClock(clock.sim_time_s)} <small>SINCE THE EARTHQUAKE</small></>
               : <>{utc.toISOString().slice(11, 19)} <small>UTC</small></>}
           </span>
           <button className="icon-button top-icon" aria-label="Audio">
@@ -204,6 +343,7 @@ function App() {
           </button>
         </div>
       </header>
+      {operationsVisited ? <div className="operations-view" hidden={page !== "operations"}>
       <div className="status-strip">
         <div>
           <span className="status-dot" /> {runState}{" "}
@@ -212,18 +352,6 @@ function App() {
             ? `M ${truth.scenario.mw.toFixed(1)} earthquake · Intensity ${truth.intensity.label} (Japan scale)`
             : "Generate an earthquake on the map to start"}
         </div>
-        {clock?.run_id && (
-          <div className="strip-stats">
-            {clock.units && (
-              <span>
-                <b>{clock.units.en_route}</b> on the way · <b>{clock.units.busy}</b> on scene · <b>{clock.units.available}</b> free
-              </span>
-            )}
-            <span><b>{clock.rescued ?? 0}</b> rescued</span>
-            <span><b>{clock.treated ?? 0}</b> treated</span>
-            <span className={clock.died_waiting ? "strip-loss" : ""}><b>{clock.died_waiting ?? 0}</b> died waiting</span>
-          </div>
-        )}
       </div>
       <main className="dashboard">
         <aside className="panel incoming-panel">
@@ -271,6 +399,7 @@ function App() {
                 key={report.id}
                 className={`report-card ${selectedReportId === report.id ? "selected" : ""} ${report.kind.toLowerCase()}`}
                 onClick={() => {
+                  if (selectedReportId === report.id) setReportOpen(true);   // a second click opens the full report
                   setSelectedReportId(report.id);
                   if (report.longitude !== undefined && report.latitude !== undefined) {
                     mapRef.current?.focus(report.longitude, report.latitude);
@@ -318,25 +447,44 @@ function App() {
 
         <section className="center-column">
           <div className="metrics-row">
+            {/* The response at a glance: where the 13 units are, and what has happened to the people. */}
+            <Metric icon={<Navigation size={14} />} label="ON THE WAY" value={pad(clock?.units?.en_route)} detail="units driving" />
+            <Metric icon={<MapPin size={14} />} label="ON SCENE" value={pad(clock?.units?.busy)} detail="units working" />
             <Metric
-              icon={<MapPin size={14} />}
-              label="MAPPED LOCATIONS"
-              value={observations ? String(observations.filter((o) => o.longitude != null).length).padStart(2, "0") : "00"}
-              detail="Located reports"
+              icon={<Check size={14} />}
+              label="AVAILABLE"
+              value={pad(clock?.units?.available)}
+              detail={units.length
+                ? `${units.filter((u) => u.status === "available" && !u.destination).length} at station · ${units.filter((u) => u.status === "available" && u.destination).length} in the field`
+                : "units free to send"}
             />
-            <Metric
-              icon={<AlertTriangle size={14} />}
-              label="NEEDS LOCATION"
-              value={observations ? String(observations.filter((o) => o.longitude == null).length).padStart(2, "0") : "00"}
-              detail="Review reports"
-              warning
-            />
+            <Metric icon={<ArrowUpRight size={14} />} label="RESCUED" value={pad(clock?.rescued)} detail="people freed" />
+            <Metric icon={<ShieldCheck size={14} />} label="TREATED" value={pad(clock?.treated)} detail="critical treated" />
+            <Metric icon={<AlertTriangle size={14} />} label="DIED WAITING" value={pad(clock?.died_waiting)} detail="not reached in time" warning />
           </div>
           <section
             className="map-panel"
             aria-label="3D simulation map"
+            ref={mapPanel}
           >
             <ShinjukuMap ref={mapRef} onUpdate={setMapState} />
+            {/* Full screen hides the dashboard, so the same figures ride on the map as a see-through card. */}
+            {fullscreen && clock?.run_id && (
+              <div className="map-stats-overlay" aria-label="Response figures">
+                <h3>Response</h3>
+                <dl>
+                  <div><dt>On the way</dt><dd>{clock.units?.en_route ?? 0}</dd></div>
+                  <div><dt>On scene</dt><dd>{clock.units?.busy ?? 0}</dd></div>
+                  <div><dt>Available</dt><dd>{clock.units?.available ?? 0}</dd></div>
+                </dl>
+                <h3>People</h3>
+                <dl>
+                  <div><dt>Rescued</dt><dd>{clock.rescued ?? 0}</dd></div>
+                  <div><dt>Treated</dt><dd>{clock.treated ?? 0}</dd></div>
+                  <div className="loss"><dt>Died waiting</dt><dd>{clock.died_waiting ?? 0}</dd></div>
+                </dl>
+              </div>
+            )}
             <div className="map-toolbar">
               <button aria-label="Zoom in" onClick={() => mapRef.current?.zoomIn()}>
                 <PlusIcon />
@@ -347,6 +495,13 @@ function App() {
               <span />
               <button aria-label="Recentre on Shinjuku Station" onClick={() => mapRef.current?.recenter()}>
                 <Crosshair size={15} />
+              </button>
+              <button
+                aria-label={fullscreen ? "Leave full screen" : "Show the map full screen"}
+                title={fullscreen ? "Leave full screen (Esc)" : "Full screen"}
+                onClick={toggleFullscreen}
+              >
+                {fullscreen ? <X size={15} /> : <Maximize2 size={14} />}
               </button>
             </div>
             <div className="map-attribution">
@@ -440,6 +595,39 @@ function App() {
               )}
             </div>
           </section>
+          <section className="panel progress-panel activity-panel">
+            <div className="panel-heading">
+              <div>
+                <Signal size={14} />
+                <span>AGENT ACTIVITY</span>
+              </div>
+              {agentsLive
+                ? <span className="mini-live"><i /> AGENTS LIVE</span>
+                : <span className="observed">{runId ? (agentsStatus?.enabled ? "AGENTS STOPPED" : "AGENTS OFF") : "NO RUN"}</span>}
+            </div>
+            <div className="route-status-list activity-list">
+              {activity.map((entry) => (
+                <div className={`route-status-item activity-item activity-${entry.kind}`} key={entry.key}>
+                  <div className="route-status-top">
+                    <span>{entry.who}{entry.note ? ` · ${entry.note}` : ""}</span>
+                    <b>T+{formatClock(entry.at)}</b>
+                  </div>
+                  <strong>{entry.title}</strong>
+                  {entry.lines.map((line, index) => <small key={index}>{line}</small>)}
+                </div>
+              ))}
+              {activity.length === 0 && (
+                <div className="panel-empty">
+                  {!runId
+                    ? "No run is playing."
+                    : agentsLive
+                      ? "The agents are reading the first reports…"
+                      : "Nothing from the agents yet. They start with each new earthquake when ./dev.sh is running."}
+                </div>
+              )}
+            </div>
+          </section>
+          {driving.length > 0 && (
           <section className="panel progress-panel">
             <div className="panel-heading">
               <div>
@@ -471,58 +659,9 @@ function App() {
             </div>
             <p className="canonical-note">
               {roadsRestricted} road segment{roadsRestricted === 1 ? "" : "s"} believed blocked or limited.
-              Routes use the roads believed open; a unit that meets a blocked road reports it and takes another way.
             </p>
           </section>
-          <section className="panel details-panel">
-            <div className="panel-heading">
-              <div>
-                <Layers size={14} />
-                <span>REPORT DETAILS</span>
-              </div>
-            </div>
-            {selectedReport ? (
-              <>
-                <div className="detail-source">
-                  <span>
-                    <Radio size={12} />{" "}
-                    {(CHANNELS[selectedReport.channel ?? ""]?.[0] ?? `${selectedReport.kind} report`).toUpperCase()}
-                  </span>
-                  <span className="unverified">{reportState}</span>
-                </div>
-                <h2>{selectedReport.id} · {selectedReport.time}</h2>
-                <p className="detail-text">{selectedReport.text}</p>
-                <p className="detail-address">
-                  <MapPin size={12} /> {selectedReport.location}
-                </p>
-                <div className="detail-tags">
-                  {selectedReport.precision && <span>Location: {selectedReport.precision}</span>}
-                  {selectedReport.reliability !== undefined && (
-                    <span>Source reliability {selectedReport.reliability.toFixed(2)}</span>
-                  )}
-                  {selectedReport.originalText && <span>Sent in {selectedReport.lang?.toUpperCase()}</span>}
-                  {selectedReport.longitude === undefined && obsId && <span>Not on the map</span>}
-                </div>
-                <div className="verification">
-                  <ShieldCheck size={14} />
-                  <span>
-                    {linked
-                      ? `${against ? "Speaks against an incident" : "Part of an incident"}: ${believedPeople(linked)}`
-                      : "No incident cites this report yet"}
-                  </span>
-                </div>
-                <button
-                  className="open-report-button"
-                  onClick={() => setReportOpen(true)}
-                >
-                  <ExternalLink size={13} /> Open full report
-                  <ChevronRight size={13} />
-                </button>
-              </>
-            ) : (
-              <div className="panel-empty">Select a report in the feed to see it here and find it on the map.</div>
-            )}
-          </section>
+          )}
           <section className="panel dispatch-panel">
             <div className="dispatch-heading">
               <div className="panel-heading">
@@ -536,7 +675,7 @@ function App() {
               </div>
             </div>
             <p className="dispatch-instruction">
-              Every responder unit as the simulator has it now. Click one to find it on the map.
+              Every responder unit as the simulator has it now. Click one to follow it on the map.
             </p>
             <div className="team-list unit-list">
               {units.map((unit) => (
@@ -544,7 +683,10 @@ function App() {
                   className="team-row unit-row"
                   key={unit.id}
                   title={unit.name}
-                  onClick={() => mapRef.current?.focus(unit.lon, unit.lat)}
+                  onClick={() => {
+                    mapRef.current?.focus(unit.lon, unit.lat);
+                    mapRef.current?.follow(unit.destination ? unit.id : null);   // ride along with a unit that has been sent
+                  }}
                 >
                   <span className="team-dot" style={{ background: UNIT_COLOR[unit.type] ?? UNIT_COLOR.police }} />
                   <strong>{unit.name}</strong>
@@ -640,6 +782,8 @@ function App() {
           </section>
         </div>
       )}
+      </div> : null}
+      {page === "analytics" ? <Suspense fallback={<div className="analytics-loading" role="status">Opening analytics…</div>}><AnalyticsPage /></Suspense> : null}
       <footer className="app-footer">
         <div>
           <Waves size={13} />

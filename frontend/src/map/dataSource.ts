@@ -21,6 +21,8 @@ function rememberedRun(): string | undefined {
   try { return window.sessionStorage.getItem(RUN_KEY) ?? undefined; } catch { return undefined; }
 }
 export const RUN_ID: string | undefined = env.VITE_RUN_ID ?? rememberedRun();
+/** True when the run to show is only what this tab remembered, not one asked for by id. */
+export const RUN_IS_REMEMBERED = !env.VITE_RUN_ID && RUN_ID !== undefined;
 
 /** Stop following the remembered run (Reset), so a reload does not bring its units back either. */
 export function forgetRun(): void {
@@ -225,7 +227,8 @@ async function submitEarthquake(url: string, body: unknown): Promise<RunTruth> {
 }
 
 export async function createEarthquake(magnitude: number | null, speed: number = DEFAULT_SPEED): Promise<RunTruth> {
-  return submitEarthquake(`${SIM_BASE}/runs`, magnitude === null ? { speed } : { mw: magnitude, speed });
+  // The run is created with its clock held: the operator picks 5x or 10x and presses Start.
+  return submitEarthquake(`${SIM_BASE}/runs`, { ...(magnitude === null ? {} : { mw: magnitude }), speed, paused: true });
 }
 
 /** How many simulated seconds pass per real second. */
@@ -333,6 +336,51 @@ export interface Report {
   sim_time_s: number | null;
   longitude: number | null;
   latitude: number | null;
+}
+
+/** One invocation of an agent and what it concluded (ops.agent_runs). */
+export interface AgentRun {
+  id: string;
+  agent: string;
+  created_at: string;
+  duration_ms: number | null;
+  output: {
+    summary?: string;
+    situation_summary?: string;
+    error?: string;
+    incidents?: unknown[];
+    /** response_agent: what was really sent, recorded by code. */
+    dispatched?: { unit_id: string; incident_id: string; eta_s: number }[];
+    /** response_agent in approval mode: dispatches waiting for the operator. */
+    proposed?: { unit_id: string; incident_id: string; eta_s: number }[];
+    refused?: { unit_id: string; incident_id: string; reason: string }[];
+    not_covered?: { incident?: string; type?: string; reason?: string }[];
+  } | null;
+}
+
+/** What the agents concluded in this run, newest first. Empty when the backend is not connected. */
+export async function loadAgentRuns(runId: string): Promise<AgentRun[]> {
+  if (!API_BASE) return [];
+  try {
+    return await getJson<AgentRun[]>(`${API_BASE}/runs/${runId}/agent-runs?limit=40`);
+  } catch {
+    return [];
+  }
+}
+
+/** Whether the simulator has the agents running for the live run. */
+export interface AgentsStatus {
+  run_id: string | null;
+  running: boolean;
+  enabled: boolean;
+}
+
+export async function loadAgentsStatus(): Promise<AgentsStatus | null> {
+  try {
+    return await getJson<AgentsStatus>(`${SIM_BASE}/agents`);
+  } catch {
+    return null;
+  }
 }
 
 /** Reports that arrived after `after` (a report id), oldest first. The feed is a cursor, so each poll only brings the new ones. */
