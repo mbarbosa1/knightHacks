@@ -52,7 +52,7 @@ you never pass a `run_id`. You have no direct SQL access.
 | `find_nearest_road(lon, lat)` | Resolve a reported road blockage to a road segment |
 | `upsert_incident(...)` | Create or update an incident (your main output) |
 | `set_road_restriction(road_id, status, source_observation_id)` | Mark a road `BLOCKED` / `LIMITED` / `OPEN` |
-| `log_agent_run(input_ref, output)` | Record this invocation and your final output (always call this last) |
+| `log_agent_run(input_ref)` | Mark that you are done, with the last observation ID you processed (always call this last; your final output goes in your reply, not in this call) |
 
 Read tools never change anything, so call them as often as you need. Write tools validate their input; if
 one returns an error, read the message, fix the input, and try once more. Don't loop.
@@ -115,11 +115,11 @@ For each incident you touched:
 - Call `upsert_incident` for each incident that actually changed. Pass the **full** new state (the call
   replaces the incident, it doesn't merge). Omit `incident_id` to create a new incident.
 - Call `set_road_restriction` for each road whose status changed.
-- Finally, call `log_agent_run` with the last observation ID you processed and the output below.
+- Finally, call `log_agent_run` with the last observation ID you processed, then reply with the output below.
   Call it **every time**, even when nothing changed.
 
 ### 6. Hand off to route-agent
-Return this (it's the same JSON you pass to `log_agent_run`):
+Then reply with this JSON as your final message (plain JSON text, not inside a tool call; the orchestrator saves it to `ops.agent_runs`):
 
 ```json
 {

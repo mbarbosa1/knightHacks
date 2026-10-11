@@ -1,26 +1,28 @@
 '''
 In agent: turns one raw report (119 call, text, social post, radio; any language; maybe a photo) into
-one clean, structured record that detect, medical and verify agents receive in parallel.
+one clean, structured record that the detect and medical agents receive in parallel.
 
     in-agent.md        what the agent does: its instructions (= the model's system prompt), reply format,
                        rules, and the record it hands on (see "For developers" there)
     agents/tools.py    the tools it uses: find_nearby_buildings, find_nearest_road, log_agent_run
     this file          runs it: model reads the words, code finds the place, the record is saved
 
-    from agents.assesmentAgent.in_agent import InAgent
+    from agents.loader import load_agent     # the folder name has a dash, so it is loaded by path
+    InAgent = load_agent('assesmentAgent/in-agent/in_agent.py').InAgent
     agent = InAgent.for_run(run_id)          # loads the run's map once
     record = agent.normalize(observation)    # observation = one row of GET /runs/{id}/observations
 
 Run it over a whole simulation run (from the repo root; ./dev.sh running; tunnel to the AMD server open):
-    .venv/bin/python -m agents.assesmentAgent.in_agent <run_id> [--limit 10] [--workers 6]
+    .venv/bin/python agents/assesmentAgent/in-agent/in_agent.py <run_id> [--limit 10] [--workers 6]
 
 Each record is saved in Neon as one ops.agent_runs row (agent 'in_agent', input_ref = observation id) plus
 its ops.operational_events row (needs AGENTS_DATABASE_URL in backend/.env). Re-running is safe: reports
 with a successful record are skipped, failed ones are retried and their entry replaced.
 '''
-import argparse, collections, concurrent.futures, pathlib, time
-from agents.llm import ask_json
-from agents.tools import RunTools
+import argparse, collections, concurrent.futures, pathlib, sys, time
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))   # repo root, when run as a script
+from agents.llm import ask_json  # noqa: E402
+from agents.tools import RunTools  # noqa: E402
 
 AGENT = 'in_agent'
 VERSION = '0.2'
@@ -55,6 +57,19 @@ def _int_or_none(v):
         return None
 
 
+def _consistent_event_type(event_type, people, building, hazards):
+    """The model's event_type, unless its own fields contradict it: 'injuries' / 'people_trapped' with
+    nobody hurt or trapped (e.g. "my desk slid" read as injuries) falls back to building_damage when a
+    building is described, 'other' when a hazard is, else no_damage."""
+    if event_type not in EVENT_TYPES:
+        return 'other'
+    if event_type in ('injuries', 'people_trapped') and not (people['injured_mentioned'] or people['trapped_mentioned']):
+        if building['type'] or building['floors']:
+            return 'building_damage'
+        return 'other' if hazards else 'no_damage'
+    return event_type
+
+
 def read_report(obs, instructions):
     """The model's reading of one report, checked and cleaned: values outside the allowed lists become
     null / 'other', so a model slip never reaches the next agents as a made-up category."""
@@ -64,20 +79,25 @@ def read_report(obs, instructions):
     raw = ask_json(instructions, '\n'.join(lines), image_url=obs.get('media_url'))
 
     trapped, injured = _int_or_none(raw.get('people_trapped')), _int_or_none(raw.get('people_injured'))
+    evacuated = _int_or_none(raw.get('people_evacuated'))
     estimate, confidence, hazards = raw.get('count_is_estimate'), raw.get('model_confidence'), raw.get('hazards')
+    hazards = [h for h in hazards if h in HAZARDS] if isinstance(hazards, list) else []
+    building = {'type': raw.get('building_type') if raw.get('building_type') in BUILDING_TYPES else None,
+                'floors': _int_or_none(raw.get('building_floors')),
+                'name': raw.get('building_name') or None}
+    people = {'trapped': trapped, 'injured': injured, 'unhurt_evacuated': evacuated,
+              # "about / exact" only means something when the report gives a number
+              'count_is_estimate': estimate if isinstance(estimate, bool) and
+                                   any(n is not None for n in (trapped, injured, evacuated)) else None,
+              'trapped_mentioned': bool(raw.get('trapped_mentioned') or trapped),
+              'injured_mentioned': bool(raw.get('injured_mentioned') or injured)}
     return {
-        'event_type': raw.get('event_type') if raw.get('event_type') in EVENT_TYPES else 'other',
+        'event_type': _consistent_event_type(raw.get('event_type'), people, building, hazards),
         'summary_en': str(raw.get('summary_en') or '').strip() or None,
-        'building': {'type': raw.get('building_type') if raw.get('building_type') in BUILDING_TYPES else None,
-                     'floors': _int_or_none(raw.get('building_floors')),
-                     'name': raw.get('building_name') or None},
-        'people': {'trapped': trapped, 'injured': injured,
-                   'unhurt_evacuated': _int_or_none(raw.get('people_evacuated')),
-                   'count_is_estimate': estimate if isinstance(estimate, bool) else None,
-                   'trapped_mentioned': bool(raw.get('trapped_mentioned') or trapped),
-                   'injured_mentioned': bool(raw.get('injured_mentioned') or injured)},
+        'building': building,
+        'people': people,
         'street_name': raw.get('street_name') or None,
-        'hazards': [h for h in hazards if h in HAZARDS] if isinstance(hazards, list) else [],
+        'hazards': hazards,
         'secondhand': bool(raw.get('secondhand')),
         'urgency': min(5, max(1, _int_or_none(raw.get('urgency')) or 1)),
         'model_confidence': round(min(1.0, max(0.0, float(confidence))), 2) if isinstance(confidence, (int, float)) else None,

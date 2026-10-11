@@ -51,7 +51,7 @@ you never pass a `run_id`. You have no direct SQL access.
 | `get_last_agent_run()` | Find when you last ran and what you concluded then |
 | `find_nearby_incidents(lon, lat, radius_m)` | Find the incident a casualty report belongs to |
 | `upsert_incident(...)` | Update an incident's `person_groups` (your main output), or create one for an urgent casualty report with no incident yet |
-| `log_agent_run(input_ref, output)` | Record this invocation and your final output (always call this last) |
+| `log_agent_run(input_ref)` | Mark that you are done, with the last observation ID you processed (always call this last; your final output goes in your reply, not in this call) |
 
 Read tools never change anything, so call them as often as you need. Write tools validate their input; if
 one returns an error, read the message, fix the input, and try once more. Don't loop.
@@ -112,11 +112,11 @@ condition (e.g. "3 trapped on floor 2", "about 10 walking wounded outside").
   `uncertainty_m` and `building_id` exactly as you just read them, change only `person_groups`, and add the
   report IDs you used to `evidence.supports` (keep every ID already there). The call replaces, it doesn't merge.
 - Skip incidents whose `person_groups` didn't actually change.
-- Finally, call `log_agent_run` with the last observation ID you processed and the output below.
+- Finally, call `log_agent_run` with the last observation ID you processed, then reply with the output below.
   Call it **every time**, even when nothing changed.
 
 ### 6. Hand off to the response agents
-Return this (it's the same JSON you pass to `log_agent_run`):
+Then reply with this JSON as your final message (plain JSON text, not inside a tool call; the orchestrator saves it to `ops.agent_runs`):
 
 ```json
 {

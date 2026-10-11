@@ -57,7 +57,7 @@ picture: they avoid `BLOCKED` roads and treat `LIMITED` roads as three times slo
 | `plan_route(origin, destination)` | Fastest route with `travel_time_s`, road ids, GeoJSON and a fallback route; `null` if unreachable |
 | `upsert_decision(incident_id, assignments, route, fallback_route, eta_s)` | Write a **draft** plan for an incident; it becomes the next version for that incident and returns its `decision_id` and `version` |
 | `get_last_agent_run()` | Find when you last ran and what you drafted then |
-| `log_agent_run(input_ref, output)` | Record this invocation and your final output (always call this last) |
+| `log_agent_run(input_ref)` | Mark that you are done, with the last observation ID you processed (always call this last; your final output goes in your reply, not in this call) |
 
 `plan_route` takes each place as one of `{"incident_id": ...}`, `{"unit_id": ...}`, `{"facility_id": ...}` or
 `{"longitude": ..., "latitude": ...}`. Pass its result **unchanged** as `route` / `fallback_route` to
@@ -119,11 +119,11 @@ For each incident:
   `approved` or `sent`.
 - Write the most urgent incidents first (replacements and `critical` incidents), so if you run out of steps the
   important ones are done.
-- Finally, call `log_agent_run` with the cursor and the output below. Call it **every time**, even when nothing
+- Finally, call `log_agent_run` with the cursor, then reply with the output below. Call it **every time**, even when nothing
   changed.
 
 ### 6. Hand off to the report-agent
-Return this (it's the same JSON you pass to `log_agent_run`):
+Then reply with this JSON as your final message (plain JSON text, not inside a tool call; the orchestrator saves it to `ops.agent_runs`):
 
 ```json
 {

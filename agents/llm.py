@@ -94,6 +94,27 @@ def ask_json(system, user, image_url=None, max_tokens=500, retries=2, timeout=12
 # =============================================================================
 
 TOOL_RESULT_LIMIT = 8000   # characters of one tool result sent back to the model (keeps the context small)
+SERVER_ERROR_RETRIES = 2   # a 5xx from the model server is usually momentary (seen with two agents at once)
+
+
+def _chat(messages, tool_specs, max_tokens, timeout, step, tool_calls_so_far):
+    """One model turn of run_agent. A 5xx is retried after a short pause, so a momentary server error does
+    not throw away the tool calls the agent already made; anything else fails at once with a clear message."""
+    for attempt in range(SERVER_ERROR_RETRIES + 1):
+        try:
+            r = httpx.post(f'{BASE_URL}/chat/completions', timeout=timeout, headers={'Authorization': f'Bearer {API_KEY}'},
+                           json={'model': MODEL, 'messages': messages, 'tools': tool_specs,
+                                 'temperature': 0, 'max_tokens': max_tokens})
+            r.raise_for_status()
+            return r.json()['choices'][0]['message']
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code >= 500 and attempt < SERVER_ERROR_RETRIES:
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise LLMError(f'model server error {exc.response.status_code} at step {step} '
+                           f'(after {tool_calls_so_far} tool calls, {attempt + 1} tries): {exc.response.text[:300]}') from None
+        except (httpx.HTTPError, KeyError) as exc:
+            raise LLMError(f'model not reachable at {BASE_URL} ({exc}); is the SSH tunnel open?') from None
 
 
 def run_agent(instructions, user_input, tool_specs, tool_functions, max_steps=30, max_tokens=1500, timeout=180):
@@ -111,17 +132,7 @@ def run_agent(instructions, user_input, tool_specs, tool_functions, max_steps=30
     messages = [{'role': 'system', 'content': instructions}, {'role': 'user', 'content': user}]
     trace, nudged = [], False
     for step in range(1, max_steps + 1):
-        try:
-            r = httpx.post(f'{BASE_URL}/chat/completions', timeout=timeout, headers={'Authorization': f'Bearer {API_KEY}'},
-                           json={'model': MODEL, 'messages': messages, 'tools': tool_specs,
-                                 'temperature': 0, 'max_tokens': max_tokens})
-            r.raise_for_status()
-            message = r.json()['choices'][0]['message']
-        except httpx.HTTPStatusError as exc:
-            raise LLMError(f'model server error {exc.response.status_code} at step {step} '
-                           f'(after {len(trace)} tool calls): {exc.response.text[:300]}') from None
-        except (httpx.HTTPError, KeyError) as exc:
-            raise LLMError(f'model not reachable at {BASE_URL} ({exc}); is the SSH tunnel open?') from None
+        message = _chat(messages, tool_specs, max_tokens, timeout, step, len(trace))
 
         calls = message.get('tool_calls') or []
         if not calls:   # no tool call: this is the final answer

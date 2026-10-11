@@ -16,7 +16,8 @@ orchestrator.py   Orchestrator(run_id).cycle()  /  --watch
 
 The orchestrator does no AI work. It decides which agent runs when and passes each one's
 output to the next. An agent is **an instructions `.md` file + a list of tool names**; the
-only Python agent is `in_agent.py`, because its tools are called by code, not by the model.
+only Python agent is `in-agent/in_agent.py`, because its tools are called by code, not by the model.
+Agent folders have dashes, so Python agents are loaded by path with `agents/loader.py` (`load_agent`).
 
 ## Ports
 
@@ -39,7 +40,7 @@ The two 8000s don't clash: one is on the GPU box, the other on your laptop. Poin
 
 | Agent | Instructions | Tools | How it runs |
 |---|---|---|---|
-| in_agent | `assesmentAgent/in-agent.md` | `find_nearby_buildings`, `find_nearest_road` (called by `in_agent.py`) | `InAgent.process(obs)` → `ask_json` |
+| in_agent | `assesmentAgent/in-agent/in-agent.md` | `find_nearby_buildings`, `find_nearest_road` (called by `in_agent.py`) | `InAgent.process(obs)` → `ask_json` |
 | detect_agent | `assesmentAgent/detect-agent/detect-agent.md` | read + `upsert_incident`, `set_road_restriction`, `log_agent_run` | `run_agent` |
 | medical_agent | `assesmentAgent/medical-agent.md` | read + `upsert_incident`, `log_agent_run` | `run_agent` |
 | verify_agent | `assesmentAgent/verify-agent.md` | read + `find_nearby_buildings`, `upsert_incident`, `log_agent_run` | `run_agent` |

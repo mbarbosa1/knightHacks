@@ -55,7 +55,7 @@ event**, so you never pass a `run_id`. You have no direct SQL access. Travel tim
 | `assign_units(incident_ids, type)` | Best one-unit-per-incident match for several incidents competing for the same kind of unit |
 | `facility_options(lon, lat, type)` | Hospitals / shelters ranked by drive time from a point; `capacity: null` means unknown, not zero |
 | `get_last_agent_run()` | Find when you last ran and what you proposed then |
-| `log_agent_run(input_ref, output)` | Record this invocation and your final output (always call this last) |
+| `log_agent_run(input_ref)` | Mark that you are done, with the last observation ID you processed (always call this last; your final output goes in your reply, not in this call) |
 
 Read tools never change anything, so call them as often as you need. If a tool returns an error, read the
 message, fix the input, and try once more. Don't loop.
@@ -116,7 +116,7 @@ location. Propose the nearest reachable hospital; if `capacity` is known and sma
 patients, spread them over the next options. For `evacuation` / `shelter`, do the same with `"shelter"`.
 
 ### 7. Hand off to the plan-agent
-Call `log_agent_run` with the cursor and the output below. Call it **every time**, even when you propose
+Call `log_agent_run` with the cursor, then reply with the output below. Call it **every time**, even when you propose
 nothing. Then return the same JSON:
 
 ```json
