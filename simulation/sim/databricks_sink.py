@@ -10,6 +10,8 @@ Manual:
     ../.venv/bin/python -m sim.databricks_sink <run_id>     # one run
     ../.venv/bin/python -m sim.databricks_sink --pending    # every run not uploaded yet
     ../.venv/bin/python -m sim.databricks_sink --all        # every run (safe: existing rows are skipped)
+    ../.venv/bin/python -m sim.databricks_sink --events <run_id>   # what the agents did -> history.simulation_events
+    ../.venv/bin/python -m sim.databricks_sink --score <run_id> [agent_config]   # reveal truth -> eval.scorecards
 
 How it works:
   - Truth stays on disk first (LocalStorage). This module only reads those .jsonl files, so a
@@ -64,14 +66,19 @@ TABLES = {
 # 1. CONFIGURATION
 # =============================================================================
 
-def load_settings():
-    """{name: value} for the three settings, or None when any is missing (upload off)."""
-    file_values = {}
+def _env_file():
+    values = {}
     if ENV_FILE.exists():
         for line in ENV_FILE.read_text().splitlines():
             if '=' in line and not line.lstrip().startswith('#'):
                 k, v = line.split('=', 1)
-                file_values[k.strip()] = v.strip()
+                values[k.strip()] = v.strip()
+    return values
+
+
+def load_settings():
+    """{name: value} for the three settings, or None when any is missing (upload off)."""
+    file_values = _env_file()
     settings = {k: os.environ.get(k) or file_values.get(k) for k in SETTINGS}
     return settings if all(settings.values()) else None
 
@@ -133,13 +140,13 @@ class Databricks:
 # 3. UPLOAD ONE RUN
 # =============================================================================
 
-def merge_sql(table, key, cols):
+def merge_sql(table, key, cols, schema='truth'):
     """MERGE that inserts the rows of the :rows JSON parameter whose key is not in the table yet."""
     # Timestamps arrive as ISO strings; everything else parses straight to its type.
     struct = ', '.join(f'`{c}`: {"STRING" if t == "TIMESTAMP" else t}' for c, t in cols.items())
     select = ', '.join(f'CAST(r.`{c}` AS TIMESTAMP) AS `{c}`' if t == 'TIMESTAMP' else f'r.`{c}` AS `{c}`'
                        for c, t in cols.items())
-    return (f'MERGE INTO knighthacks.truth.{table} t '
+    return (f'MERGE INTO knighthacks.{schema}.{table} t '
             f'USING (SELECT {select} FROM (SELECT explode(from_json(:rows, \'ARRAY<STRUCT<{struct}>>\')) AS r)) s '
             f'ON t.`{key}` = s.`{key}` WHEN NOT MATCHED THEN INSERT *')
 
@@ -166,17 +173,83 @@ def upload_run(run_dir, db=None):
             path = run_dir / f'{table}.jsonl'
             if not path.exists():
                 continue
-            rows, sql, new_rows[table] = read_rows(path, key, cols), merge_sql(table, key, cols), 0
-            for i in range(0, len(rows), CHUNK):
-                r = db.sql(sql, [{'name': 'rows', 'type': 'STRING',
-                                  'value': json.dumps(rows[i:i + CHUNK], ensure_ascii=False)}])
-                data = (r.get('result') or {}).get('data_array') or [[0]]
-                new_rows[table] += int(data[0][-1] or 0)   # MERGE returns (affected, updated, deleted, inserted)
+            new_rows[table] = _merge_chunks(db, merge_sql(table, key, cols), read_rows(path, key, cols))
     except Exception as exc:
         _write_status(run_dir, 'failed', new_rows, str(exc))
         raise
     _write_status(run_dir, 'uploaded', new_rows)
     return new_rows
+
+
+def _merge_chunks(db, sql, rows):
+    """Send rows in CHUNK-sized MERGEs; returns how many were new."""
+    inserted = 0
+    for i in range(0, len(rows), CHUNK):
+        r = db.sql(sql, [{'name': 'rows', 'type': 'STRING', 'value': json.dumps(rows[i:i + CHUNK], ensure_ascii=False)}])
+        data = (r.get('result') or {}).get('data_array') or [[0]]
+        inserted += int(data[0][-1] or 0)   # MERGE returns (affected, updated, deleted, inserted)
+    return inserted
+
+
+# =============================================================================
+# 3b. AGENT HISTORY: Neon ops.operational_events -> Databricks history.simulation_events
+#     Everything agents (and the simulator / operator) changed during a run, for scoring.
+#     Reads Neon with the simulator login (DATABASE_URL in backend/.env), which may read the outbox.
+# =============================================================================
+
+EVENT_COLUMNS = {'event_id': 'STRING', 'run_id': 'STRING', 'table_name': 'STRING', 'row_id': 'STRING',
+                 'payload': 'STRING', 'created_at': 'TIMESTAMP'}
+
+
+def neon_events(run_id):
+    """The run's ops.operational_events rows, oldest first, shaped like history.simulation_events."""
+    import psycopg                       # pip install "psycopg[binary]" (agents/requirements.txt has it)
+    url = os.environ.get('DATABASE_URL') or _env_file().get('DATABASE_URL')
+    if not url:
+        raise DatabricksError(f'DATABASE_URL (Neon simulator login) is not set in {ENV_FILE}')
+    with psycopg.connect(url) as conn:
+        rows = conn.execute('SELECT event_id, run_id, table_name, row_id, payload, created_at '
+                            'FROM ops.operational_events WHERE run_id = %s ORDER BY created_at, event_id',
+                            (str(run_id),)).fetchall()
+    return [{'event_id': str(e), 'run_id': str(r), 'table_name': t, 'row_id': i,
+             'payload': json.dumps(p, ensure_ascii=False) if p is not None else None, 'created_at': c.isoformat()}
+            for e, r, t, i, p, c in rows]
+
+
+def export_events(run_id, db=None):
+    """Copy one run's Neon event log to Databricks. Safe to repeat (MERGE on event_id): run it again
+    after the agents did more work and only the new events are added. Returns (events in Neon, new)."""
+    db = db or Databricks(load_settings())
+    rows = neon_events(run_id)
+    return len(rows), _merge_chunks(db, merge_sql('simulation_events', 'event_id', EVENT_COLUMNS, 'history'), rows)
+
+
+# =============================================================================
+# 3c. SCORECARD: agents' beliefs vs the truth -> eval.scorecards (databricks/scorecard.sql)
+# =============================================================================
+
+SCORECARD_SQL = pathlib.Path(__file__).resolve().parents[2] / 'databricks' / 'scorecard.sql'
+
+
+def default_agent_config():
+    """Which setup is being scored: the model the agents used (LLM_MODEL in backend/.env)."""
+    model = os.environ.get('LLM_MODEL') or _env_file().get('LLM_MODEL') or 'unknown-model'
+    return model.split('/')[-1].lower()
+
+
+def score_run(run_id, agent_config=None, db=None):
+    """Copy the run's latest event log, then (re)score it. Scoring again replaces this run's earlier
+    rows for the same agent_config. Returns [(metric, value, details)]."""
+    db = db or Databricks(load_settings())
+    agent_config = agent_config or default_agent_config()
+    export_events(run_id, db)
+    params = [{'name': 'run_id', 'value': str(run_id), 'type': 'STRING'},
+              {'name': 'agent_config', 'value': agent_config, 'type': 'STRING'}]
+    db.sql('DELETE FROM knighthacks.eval.scorecards WHERE scenario_id = :run_id AND agent_config = :agent_config', params)
+    db.sql(SCORECARD_SQL.read_text(), params)
+    rows = db.sql('SELECT metric, value, details FROM knighthacks.eval.scorecards '
+                  'WHERE scenario_id = :run_id AND agent_config = :agent_config ORDER BY metric', params)
+    return [tuple(r) for r in (rows.get('result') or {}).get('data_array') or []]
 
 
 def _write_status(run_dir, status, new_rows, error=None):
@@ -233,11 +306,20 @@ def upload_pending_in_background():
 # =============================================================================
 
 def main(argv):
-    if len(argv) != 1:
+    if not argv or len(argv) > {'--events': 2, '--score': 3}.get(argv[0], 1):
         sys.exit(__doc__)
     settings = load_settings()
     if not settings:
         sys.exit(f'Databricks is not configured: set {", ".join(SETTINGS)} (environment or {ENV_FILE})')
+    if argv[0] == '--events':
+        total, new = export_events(argv[1], Databricks(settings))
+        sys.exit(print(f'{argv[1]}  {total} events in Neon, {new} new in Databricks history.simulation_events'))
+    if argv[0] == '--score':
+        config = argv[2] if len(argv) > 2 else default_agent_config()
+        print(f'Scoring {argv[1]} as agent_config {config!r} (event log copied first)...')
+        for metric, value, details in score_run(argv[1], config, Databricks(settings)):
+            print(f'  {metric:<22} {"-" if value is None else round(float(value), 3):<8} {details}')
+        sys.exit(0)
     runs_dir = pathlib.Path(LocalStorage().runs_dir)
     if argv[0] == '--pending':
         run_dirs = pending_runs(runs_dir)

@@ -104,9 +104,9 @@ CREATE TABLE IF NOT EXISTS knighthacks.history.simulation_events (
 
 CREATE TABLE IF NOT EXISTS knighthacks.eval.scorecards (
     scenario_id  STRING NOT NULL,
-    metric       STRING NOT NULL COMMENT 'e.g. incident_recall, incident_precision, road_status_accuracy, calibration_error, rumors_caught',
+    metric       STRING NOT NULL COMMENT 'rescue_found_rate, rescue_people_found, incident_precision, rumors_acted_on, rumors_caught, duplicate_incidents, road_block_recall, road_block_precision (databricks/scorecard.sql)',
     value        DOUBLE,
     details      STRING COMMENT 'JSON with counts behind the metric',
-    agent_config STRING COMMENT 'Model/prompt version being scored, e.g. qwen2.5-7b-base',
+    agent_config STRING COMMENT 'Setup being scored: the agents'' model (and version), e.g. qwen3-vl-8b-instruct',
     scored_at    TIMESTAMP
 ) COMMENT 'Scores for each run: agent beliefs vs ground truth';
