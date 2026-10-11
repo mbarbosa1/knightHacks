@@ -35,7 +35,9 @@ Sections in this file:
   3. Reading the map          (load_static_map)
   4. Writing a run            (save_run, save_truth_batch, save_observation, end_run)
 '''
-import json, urllib.error, urllib.request   # urllib is Python's built-in HTTP client: no extra package needed
+import json, urllib.error, urllib.request, time, uuid
+from pathlib import Path
+from .submission import append_report, atomic_json, lock_for, read_job, write_job   # urllib is Python's built-in HTTP client: no extra package needed
 from shapely.geometry import shape          # turns GeoJSON geometry dicts into shapely shapes (the simulator does geometry math on them)
 from .storage import LocalStorage, StaticMap
 
@@ -104,10 +106,10 @@ class ApiStorage:
         # Where everything that must NOT go to Neon is written (truth rows), plus a local copy of the
         # run and its observations so scripts/check_sim_run.py can compare Neon against them.
         self.truth_storage = truth_storage or LocalStorage()
-        # defer_observations=True: save_observation only queues reports; post_pending_observations()
-        # sends them later. sim/server.py uses this so the map gets its answer before ~300-600 reports
-        # (1.5-3 minutes of requests) have reached Neon.
+        # defer_observations=True: spool reports durably while generation runs.
+        # The server seals the snapshot, then submits it atomically before answering.
         self.defer_observations, self.pending_observations = defer_observations, []
+        self.active_run_id = None
 
     # =========================================================================
     # 2. HTTP HELPER
@@ -122,13 +124,18 @@ class ApiStorage:
         req = urllib.request.Request(self.base_url + path, method=method,
                                      data=None if body is None else json.dumps(body).encode(),
                                      headers={'Content-Type': 'application/json'})
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return json.load(r)
-        except urllib.error.HTTPError as e:
-            # urllib raises on any 4xx/5xx. Re-raise with the backend's {"detail": ...} message so the
-            # error says why (e.g. "409: Run has ended") instead of just the status code.
-            raise ApiError(f'{method} {path} -> {e.code}: {e.read().decode(errors="replace")}') from None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    return json.load(r)
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode(errors="replace")
+                if e.code not in (429, 502, 503, 504) or attempt == 2:
+                    raise ApiError(f'{method} {path} -> {e.code}: {detail}') from None
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                if attempt == 2:
+                    raise ApiError(f'{method} {path}: backend unavailable; submission retained for retry') from None
+            time.sleep(0.5 * (2 ** attempt))
 
     # =========================================================================
     # 3. READING THE MAP
@@ -173,16 +180,22 @@ class ApiStorage:
     # =========================================================================
 
     def save_run(self, run):
-        """Create the ops.simulation_runs row (status 'created'). Neon picks the id; returns it.
+        """Persist a stable run identity locally, then create it idempotently in Neon.
 
-        run.py passes a locally made uuid in run['id'], but the backend generates its own
-        (gen_random_uuid()), so the simulator adopts Neon's id. Every later row (observations,
-        truth rows' scenario_id) uses this returned id, which keeps Neon and the truth in sync.
+        A lost HTTP response can be retried with this same UUID; no second run
+        is created. Truth, observations and resources share that identity.
         """
-        row = self._call('POST', '/runs', {'map_version_id': run['map_version_id'], 'seed': run['seed'],
-                                           'hazard_types': run['hazard_types']})   # RunCreate in models.py
-        self.truth_storage.save_run({**run, 'id': row['id'], 'status': row['status']})
-        return row['id']
+        run_id = str(run['id'])
+        body = {'id': run_id, 'map_version_id':run['map_version_id'],
+                'seed':run['seed'], 'hazard_types':run['hazard_types']}
+        self.active_run_id = run_id
+        write_job(self.truth_storage.runs_dir, {
+            'run_id':run_id, 'create_body':body, 'phase':'preparing', 'last_error':None})
+        row = self._call('POST','/runs',body)
+        if row['id'] != run_id:
+            raise ApiError('Backend must support stable run IDs; restart the updated backend')
+        self.truth_storage.save_run({**run,'id':run_id,'status':row['status']})
+        return run_id
 
     def save_truth_batch(self, rows):
         """Truth rows (damage, road status, people, truth_links, scenario): local files only, never Neon.
@@ -198,21 +211,70 @@ class ApiStorage:
         from 'created' to 'running'.
         """
         if self.defer_observations:
+            append_report(self.truth_storage.runs_dir, obs)
             self.pending_observations.append(obs)
             return None
         row = self._call('POST', f'/runs/{obs["run_id"]}/observations', observation_body(obs))
         self.truth_storage.save_observation(obs)   # local copy only once Neon has accepted it
         return row
 
+    def prepare_ingestion(self, resources=None):
+        run_id = self.active_run_id
+        job = read_job(self.truth_storage.runs_dir,run_id)
+        job.update(phase='prepared', payload={
+            'observations':[observation_body(o) for o in self.pending_observations],
+            'resources':resources or []}, last_error=None)
+        write_job(self.truth_storage.runs_dir,job)
+        return job
+
     def post_pending_observations(self):
-        """Send the queued reports, in release order. Returns how many were posted."""
-        self.defer_observations = False
-        n = 0
-        while self.pending_observations:
-            self.save_observation(self.pending_observations[0])
-            self.pending_observations.pop(0)   # only drop it once Neon has it, so a retry resumes here
-            n += 1
-        return n
+        if not self.active_run_id:
+            raise ApiError('Create a run before submitting reports')
+        job = read_job(self.truth_storage.runs_dir,self.active_run_id)
+        if job['phase'] == 'preparing':
+            self.prepare_ingestion()
+        receipt = self.resume(self.active_run_id)
+        self.pending_observations.clear()
+        return receipt['stored_observations']
+
+    def resume(self, run_id):
+        root = self.truth_storage.runs_dir
+        with lock_for(run_id):
+            job = read_job(root,run_id)
+            if job['phase'] not in ('prepared','saved'):
+                raise ApiError('Generation was interrupted before the snapshot was complete; this run is not agent-ready')
+            try:
+                self._call('POST','/runs',job['create_body'])
+                receipt = self._call('POST',f'/runs/{run_id}/ingest',job['payload'])
+                if not receipt.get('ready'):
+                    raise ApiError('Backend did not confirm a committed snapshot')
+                job.update(phase='saved',receipt=receipt,last_error=None)
+                write_job(root,job)
+                # Rebuild the informational local mirror: retries do not duplicate lines.
+                # Keep the simulator's original row-shaped records for check_sim_run.py.
+                spool = Path(root)/str(run_id)/'pending_observations.jsonl'
+                if spool.exists():
+                    original = {o['id']:o for o in (json.loads(x) for x in spool.read_text().splitlines())}
+                    target = Path(root)/str(run_id)/'observations.jsonl'
+                    # Atomic JSON job remains the recovery source; mirror is informational.
+                    target.write_text(''.join(json.dumps(o,ensure_ascii=False)+'\n' for o in original.values()))
+                return receipt
+            except Exception as exc:
+                job.update(phase='prepared',last_error=str(exc))
+                write_job(root,job)
+                raise
+
+    def recover_prepared(self):
+        results = []
+        for path in Path(self.truth_storage.runs_dir).glob('*/submission.json'):
+            job = json.loads(path.read_text())
+            if job['phase'] == 'prepared':
+                try:
+                    results.append(self.resume(job['run_id']))
+                except Exception:
+                    # Error persisted by resume; manual retry stays available.
+                    pass
+        return results
 
     def end_run(self, run_id, status='completed', sim_time_s=None):
         """Mark the run 'completed' (or 'failed') and stamp ended_at (POST /runs/{id}/end).

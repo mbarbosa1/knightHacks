@@ -16,7 +16,11 @@ const env = import.meta.env;
 const API_BASE: string | undefined = env.VITE_API_BASE;
 const SIM_BASE: string = env.VITE_SIM_BASE ?? "http://127.0.0.1:8100";
 const MAP_VERSION: string = env.VITE_MAP_VERSION ?? "shinjuku-v1";
-export const RUN_ID: string | undefined = env.VITE_RUN_ID;
+const RUN_KEY = "knighthacks-active-run";
+function rememberedRun(): string | undefined {
+  try { return window.sessionStorage.getItem(RUN_KEY) ?? undefined; } catch { return undefined; }
+}
+export const RUN_ID: string | undefined = env.VITE_RUN_ID ?? rememberedRun();
 
 export type DamageLevel = "none" | "light" | "moderate" | "severe" | "collapsed";
 export type RoadStatus = "OPEN" | "LIMITED" | "BLOCKED";
@@ -52,6 +56,7 @@ export interface StaticMap {
 /** Hidden ground truth for one run. Only the operator's reveal-truth view may load this. */
 export interface RunTruth {
   run_id: string;
+  ingestion?: { ready: boolean; stored_observations?: number; stored_resources?: number };
   seed: number;
   scenario: { mw: number; depth_km: number; local_time?: string };
   intensity: { min: number; max: number; label: string };
@@ -123,22 +128,43 @@ export async function simulatorAvailable(): Promise<boolean> {
  * Ask the simulator for a new earthquake. Every call uses a new random seed, so depth, epicentre and
  * which buildings fail differ each time. magnitude null lets the seed pick the magnitude too.
  */
-export async function createEarthquake(magnitude: number | null): Promise<RunTruth> {
-  const response = await fetch(`${SIM_BASE}/runs`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(magnitude === null ? {} : { mw: magnitude }),
+export class SubmissionError extends Error {
+  constructor(message: string, public runId: string | null = null, public retryable = false) {
+    super(message);
+  }
+}
+
+async function submitEarthquake(url: string, body: unknown): Promise<RunTruth> {
+  const response = await fetch(url, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
-  if (!response.ok) throw new Error(`Simulator returned ${response.status}`);
-  return (await response.json()) as RunTruth;
+  const result = await response.json();
+  if (!response.ok) {
+    const detail = result.detail;
+    throw new SubmissionError(typeof detail === "string" ? detail : detail?.message ?? "Simulation could not be saved.",
+                              detail?.run_id ?? null, detail?.retryable ?? false);
+  }
+  if (!result.ingestion?.ready) {
+    throw new SubmissionError("This run was generated locally and has not been saved to Neon.");
+  }
+  try { window.sessionStorage.setItem(RUN_KEY, result.run_id); } catch { /* storage may be disabled */ }
+  return result as RunTruth;
+}
+
+export async function createEarthquake(magnitude: number | null): Promise<RunTruth> {
+  return submitEarthquake(`${SIM_BASE}/runs`, magnitude === null ? {} : { mw: magnitude });
+}
+
+export async function retryEarthquake(runId: string): Promise<RunTruth> {
+  return submitEarthquake(`${SIM_BASE}/runs/${runId}/retry`, {});
 }
 
 /** True once the backend and a run id are configured; until then the operational view is a placeholder. */
-export const operationalConnected = Boolean(API_BASE && RUN_ID);
+export const operationalConnected = Boolean(API_BASE);
 
-export async function loadOperationalState(): Promise<OperationalState> {
-  if (!operationalConnected) return EMPTY_OPERATIONAL;
-  const run = `${API_BASE}/runs/${RUN_ID}`;
+export async function loadOperationalState(runId: string | undefined = RUN_ID): Promise<OperationalState> {
+  if (!operationalConnected || !runId) return EMPTY_OPERATIONAL;
+  const run = `${API_BASE}/runs/${runId}`;
   // Field names follow the backend README; not yet exercised against a live run.
   const [incidents, roadRestrictions, resources] = await Promise.all([
     getJson<OperationalState["incidents"]>(`${run}/incidents?limit=1000`),

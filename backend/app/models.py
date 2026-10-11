@@ -24,6 +24,7 @@ class Point(InputModel):
 
 
 class RunCreate(InputModel):
+    id: UUID | None = None
     map_version_id: Identifier
     seed: int = Field(ge=-(2**63), le=2**63 - 1)
     hazard_types: list[Literal["earthquake", "flood"]] = Field(min_length=1)
@@ -91,3 +92,16 @@ class RoadRestrictionPut(InputModel):
     status: Literal["OPEN", "LIMITED", "BLOCKED"]
     source_observation_id: UUID | None = None
     sim_time_s: Nonnegative | None = None
+
+
+class IngestObservation(ObservationCreate):
+    id: UUID
+
+
+class InitialResource(ResourcePut):
+    id: UUID
+
+
+class SimulationIngest(InputModel):
+    observations: list[IngestObservation] = Field(max_length=10000)
+    resources: list[InitialResource] = Field(default_factory=list, max_length=1000)

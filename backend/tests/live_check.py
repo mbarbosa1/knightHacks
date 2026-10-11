@@ -136,6 +136,30 @@ async def main(env_file):
                 await request(app,"PUT",base+suffix,body,expected=409)
             await request(app,"POST",base+"/observations",{**obs,"id":str(uuid4())},expected=409)
             await request(app,"POST",base+"/observations",obs)
+            # Initial ingestion is atomic and repeatable, with a public readiness receipt.
+            stable_id = str(uuid4())
+            stable_body = {**run_body,"id":stable_id}
+            snapshot_run = await request(app,"POST","/runs",stable_body,expected=201)
+            assert (await request(app,"POST","/runs",stable_body,expected=201))["id"] == stable_id
+            snapshot_base = f"/runs/{stable_id}"
+            snapshot_obs = {**obs,"id":str(uuid4())}
+            snapshot_resource = {**resource,"id":str(uuid4())}
+            invalid = {"observations":[snapshot_obs],"resources":[{**snapshot_resource,"home_facility_id":"missing"}]}
+            await request(app,"POST",snapshot_base+"/ingest",invalid,expected=422)
+            assert (await request(app,"GET",snapshot_base+"/ingestion"))["ready"] is False
+            assert await request(app,"GET",snapshot_base+"/observations") == []
+            snapshot = {"observations":[snapshot_obs],"resources":[snapshot_resource]}
+            receipt = await request(app,"POST",snapshot_base+"/ingest",snapshot)
+            assert receipt["ready"] and receipt["stored_observations"] == receipt["stored_resources"] == 1
+            await request(app,"POST",snapshot_base+"/ingest",snapshot)
+            await request(app,"PUT",snapshot_base+f"/resources/{snapshot_resource['id']}",{**resource,"status":"busy"})
+            await request(app,"POST",snapshot_base+"/ingest",snapshot)
+            assert (await request(app,"GET",snapshot_base+"/resources"))[0]["status"] == "busy"
+            await request(app,"POST",snapshot_base+"/ingest",{"observations":[{**snapshot_obs,"original_text":"changed"}],"resources":[snapshot_resource]},expected=409)
+            feed = await request(app,"GET",snapshot_base+"/observations",query="limit=1")
+            assert feed[0]["id"] == snapshot_obs["id"] and "answer" not in feed[0]
+            assert await request(app,"GET",snapshot_base+"/observations",query=f"after={feed[0]['id']}") == []
+            await request(app,"GET",snapshot_base+"/observations",query=f"after={saved['id']}",expected=404)
             events = await (await conn.execute(
                 "SELECT table_name,count(*) AS count FROM ops.operational_events WHERE run_id=%s GROUP BY table_name", (run["id"],)
             )).fetchall()
