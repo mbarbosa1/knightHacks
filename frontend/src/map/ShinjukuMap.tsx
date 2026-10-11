@@ -7,10 +7,18 @@ import {
   createEarthquake,
   retryEarthquake,
   forgetRun,
+  DEFAULT_SPEED,
+  SPEEDS,
+  changeClock,
+  loadClock,
+  stopRun,
+  type RunClock,
   SubmissionError,
   RUN_ID,
   simulatorAvailable,
   loadOperationalState,
+  loadReportsSince,
+  type Report,
   loadRunTruth,
   loadStaticMap,
   operationalConnected,
@@ -26,6 +34,17 @@ export interface ShinjukuMapHandle {
   zoomIn(): void;
   zoomOut(): void;
   recenter(): void;
+  /** Fly to a place, e.g. where a report says it is. */
+  focus(lon: number, lat: number): void;
+}
+
+/** What the map knows, handed to the dashboard so its side panels can show it. The map itself stays clean. */
+export interface MapState {
+  view: MapView;
+  truth: RunTruth | null;
+  clock: RunClock | null;
+  operational: OperationalState;
+  reports: Report[];
 }
 
 const CENTER: [number, number] = [139.7034, 35.6938]; // Shinjuku Station
@@ -47,8 +66,20 @@ export const FACILITY_MARK = {
   police: ["P", "#3b5bdb", "police"],
   shelter: ["S", "#2b8a3e", "shelter"],
 } as const;
+/** One colour per way a report can arrive. */
+export const CHANNELS: Record<string, [label: string, color: string]> = {
+  emergency_call_119: ["119 call", "#d81e2c"],
+  eyewitness_text: ["text message", "#1c7ed6"],
+  social_media: ["social media", "#7048e8"],
+  fire_police_radio: ["fire / police radio", "#2b8a3e"],
+  responder_update: ["unit on the ground", "#e8590c"],
+};
+const REPORT_FRESH_MS = 5000;   // how long a new report stays highlighted on the map
+const REPORTS_REFRESH_MS = 2000;
 const UNIT_COLORS = ["match", ["get", "type"], "ambulance", "#0c8599", "fire_engine", "#e8590c", "#5f3dc4"];
 
+const formatClock = (s: number) =>
+  `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 const empty = (): GeoJSON.FeatureCollection => ({ type: "FeatureCollection", features: [] });
 const escapeHtml = (value: unknown) =>
   String(value ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c] ?? c);
@@ -56,6 +87,8 @@ const escapeHtml = (value: unknown) =>
 interface Props {
   /** Draw every road segment, not only the affected ones. A debugging aid; off by default. */
   showRoadGraph?: boolean;
+  /** Called whenever anything the side panels show has changed. */
+  onUpdate?: (state: MapState) => void;
 }
 
 /**
@@ -64,7 +97,7 @@ interface Props {
  *  - Operational view: what agents believe (incidents, road restrictions, units). A placeholder until
  *    runs are written to the database; the layers exist and fill in when data arrives.
  */
-export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function ShinjukuMap({ showRoadGraph = false }, ref) {
+export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function ShinjukuMap({ showRoadGraph = false, onUpdate }, ref) {
   const container = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const staticRef = useRef<StaticMap | null>(null);
@@ -72,13 +105,34 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
   const [error, setError] = useState<string | null>(null);
   const [truth, setTruth] = useState<RunTruth | null>(null);
   const [operational, setOperational] = useState<OperationalState>(EMPTY_OPERATIONAL);
-  const [view, setView] = useState<MapView>("truth");
+  const [view, setView] = useState<MapView>("operational");
+  // Reports for the run being followed, with the moment this page first saw each one.
+  const [reports, setReports] = useState<(Report & { seenAt: number })[]>([]);
+  const [, setPulse] = useState(0);
   const [simulator, setSimulator] = useState(false);
   const [magnitude, setMagnitude] = useState(7.0);
   const [randomMagnitude, setRandomMagnitude] = useState(false);
   const [working, setWorking] = useState(false);
   const [quakeError, setQuakeError] = useState<string | null>(null);
   const [retryRunId, setRetryRunId] = useState<string | null>(null);
+  const [speed, setSpeed] = useState<number>(DEFAULT_SPEED);
+  const [clock, setClock] = useState<RunClock | null>(null);
+
+  // The simulator keeps the clock; the map only asks what time it is.
+  useEffect(() => {
+    if (!truth) {
+      setClock(null);
+      return;
+    }
+    let stop = false;
+    const tick = () => loadClock().then((c) => !stop && setClock(c && c.run_id === truth.run_id ? c : null));
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
+  }, [truth]);
   // After Reset the map follows no run at all, not the one this tab remembered from before.
   const [detached, setDetached] = useState(false);
   const activeRunId = truth?.ingestion?.ready ? truth.run_id : detached ? undefined : RUN_ID;
@@ -91,7 +145,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
     setWorking(true);
     setQuakeError(null);
     try {
-      setTruth(await (retryId ? retryEarthquake(retryId) : createEarthquake(randomMagnitude ? null : magnitude)));
+      setTruth(await (retryId ? retryEarthquake(retryId) : createEarthquake(randomMagnitude ? null : magnitude, speed)));
       setRetryRunId(null);
       setDetached(false);
       setSimulator(true);
@@ -108,6 +162,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
     zoomIn: () => mapRef.current?.zoomIn(),
     zoomOut: () => mapRef.current?.zoomOut(),
     recenter: () => mapRef.current?.easeTo(HOME),
+    focus: (lon, lat) => mapRef.current?.easeTo({ center: [lon, lat], zoom: 16.5, duration: 700 }),
   }));
 
   // Build the map once: basemap, static layers, and empty layers for everything that arrives later.
@@ -184,6 +239,21 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
           },
         });
 
+        // Reports: a dot where each caller says they are. New ones are larger for a few seconds.
+        map.addSource("reports", { type: "geojson", data: empty() });
+        map.addLayer({
+          id: "reports",
+          type: "circle",
+          source: "reports",
+          paint: {
+            "circle-radius": ["case", ["get", "fresh"], 15, 7],
+            "circle-color": ["get", "color"],
+            "circle-opacity": ["case", ["get", "fresh"], 0.35, 0.95],
+            "circle-stroke-color": ["case", ["get", "fresh"], ["get", "color"], "#ffffff"],
+            "circle-stroke-width": ["case", ["get", "fresh"], 3, 2],
+          },
+        });
+
         map.addSource("incidents", { type: "geojson", data: empty() });
         map.addLayer({
           id: "incidents",
@@ -228,6 +298,18 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
           popup.setLngLat(event.lngLat).setHTML(lines.join("<br>")).addTo(map);
         });
         map.on("mouseleave", "buildings", () => popup.remove());
+        map.on("mousemove", "reports", (event) => {
+          const p = event.features?.[0]?.properties as Record<string, unknown> | undefined;
+          if (!p) return;
+          popup
+            .setLngLat(event.lngLat)
+            .setHTML(
+              `<strong>${escapeHtml(p.label)}</strong> · T+${escapeHtml(p.time)}<br>${escapeHtml(p.text)}` +
+                (p.place ? `<br><em>${escapeHtml(p.place)}</em>` : ""),
+            )
+            .addTo(map);
+        });
+        map.on("mouseleave", "reports", () => popup.remove());
 
         setTruth(runTruth);
         setReady(true);
@@ -261,6 +343,63 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
       window.clearInterval(timer);
     };
   }, [activeRunId]);
+
+  // Reports for the run being followed, fetched as they arrive.
+  useEffect(() => {
+    setReports([]);
+    if (!operationalConnected || !activeRunId) return;
+    let stop = false;
+    let cursor: string | undefined;
+    let busy = false;
+    const tick = async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        const fresh = await loadReportsSince(activeRunId, cursor);
+        if (!stop && fresh.length) {
+          cursor = fresh[fresh.length - 1].id;
+          const now = Date.now();
+          setReports((old) => [...old, ...fresh.map((r) => ({ ...r, seenAt: now }))]);
+        }
+      } catch {
+        // the next poll tries again from the same place
+      } finally {
+        busy = false;
+      }
+    };
+    tick();
+    const timer = window.setInterval(tick, REPORTS_REFRESH_MS);
+    const pulse = window.setInterval(() => setPulse((n) => n + 1), 1000);   // lets highlights fade
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+      window.clearInterval(pulse);
+    };
+  }, [activeRunId]);
+
+  // A dot where each caller says they are. Shown in both views: a report is not hidden truth.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const now = Date.now();
+    (map.getSource("reports") as GeoJSONSource).setData({
+      type: "FeatureCollection",
+      features: reports
+        .filter((r) => r.longitude !== null && r.latitude !== null)
+        .map((r) => ({
+          type: "Feature",
+          geometry: { type: "Point", coordinates: [r.longitude!, r.latitude!] },
+          properties: {
+            color: CHANNELS[r.channel]?.[1] ?? "#495057",
+            label: CHANNELS[r.channel]?.[0] ?? r.channel,
+            fresh: now - r.seenAt < REPORT_FRESH_MS,
+            time: formatClock(r.sim_time_s ?? 0),
+            text: r.text_en ?? r.original_text ?? "",
+            place: r.claimed_location ?? "",
+          },
+        })),
+    });
+  });
 
   useEffect(() => {
     const map = mapRef.current;
@@ -309,8 +448,25 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
     });
   }, [view, truth, operational, ready]);
 
-  const operationalEmpty =
-    operational.incidents.length + operational.roadRestrictions.length + operational.resources.length === 0;
+  useEffect(() => {
+    onUpdate?.({ view, truth, clock, operational, reports });
+  }, [view, truth, clock, operational, reports, onUpdate]);
+
+
+  // The bar carries no figures: counts and summaries live in the dashboard's side panels.
+  const notice = error
+    ? `Map data could not be loaded (${error}).`
+    : !ready
+      ? "Loading Shinjuku…"
+      : quakeError
+        ? quakeError
+        : working
+          ? "Generating the earthquake and saving it…"
+          : !simulator
+            ? "The simulator is not running. Start everything with ./dev.sh"
+            : clock?.last_error
+              ? "A report failed to save and is being retried."
+              : null;
 
   const controlsOff = !simulator || working || !ready || Boolean(error);
 
@@ -318,111 +474,107 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
     <>
       <div ref={container} className="map-canvas" />
 
-      {/* One bar for everything about the run: which view, what happened, and making a new earthquake. */}
+      {/* One row of controls. Everything informational is in the dashboard's side panels. */}
       <div className="map-bar">
-        <div className="map-bar-row">
-          <div className="map-view-switch" role="group" aria-label="Map view">
-            <button className={view === "truth" ? "active" : ""} onClick={() => setView("truth")}>
-              Ground truth
-            </button>
-            <button className={view === "operational" ? "active" : ""} onClick={() => setView("operational")}>
-              Operational
-            </button>
-          </div>
-          <div className="map-quake">
-            <label htmlFor="quake-magnitude">Magnitude {randomMagnitude ? "random" : magnitude.toFixed(1)}</label>
-            <input
-              id="quake-magnitude"
-              type="range"
-              min={MAGNITUDE_RANGE.min}
-              max={MAGNITUDE_RANGE.max}
-              step={MAGNITUDE_RANGE.step}
-              value={magnitude}
-              disabled={randomMagnitude || controlsOff}
-              onChange={(event) => setMagnitude(Number(event.target.value))}
-            />
-            <label className="map-quake-random">
-              <input
-                id="quake-random"
-                type="checkbox"
-                checked={randomMagnitude}
-                disabled={controlsOff}
-                onChange={(event) => setRandomMagnitude(event.target.checked)}
-              />
-              random
-            </label>
-            <button onClick={() => newEarthquake()} disabled={controlsOff}>
-              {working ? "Generating and saving…" : "Generate earthquake"}
-            </button>
-            {retryRunId && <button onClick={() => newEarthquake(retryRunId)} disabled={working}>Retry saving this run</button>}
-            <button
-              className="map-quake-reset"
-              onClick={() => {
-                setTruth(null);
-                setQuakeError(null);
-                setRetryRunId(null);
-                setDetached(true);
-                forgetRun();
-              }}
-              disabled={!truth || working}
-            >
-              Reset
-            </button>
-          </div>
+        <div className="map-view-switch" role="group" aria-label="Map view">
+          <button className={view === "operational" ? "active" : ""} onClick={() => setView("operational")}>
+            Operational
+          </button>
+          <button className={view === "truth" ? "active" : ""} onClick={() => setView("truth")}>
+            Ground truth
+          </button>
         </div>
-        {truth?.ingestion?.ready && !working && !quakeError && (
-          <div className="map-status" role="status">
-            Saved to Neon · {truth.ingestion.stored_observations} reports · {truth.ingestion.stored_resources} responder units
+        {truth && (
+          <div className="map-clock" role="status">
+            <b className="map-clock-time">T+{formatClock(clock?.sim_time_s ?? 0)}</b>
+            <button
+              className="map-clock-button"
+              disabled={!clock || clock.finished}
+              onClick={() => clock && changeClock({ playing: !clock.playing }).then((c) => c && setClock(c))}
+            >
+              {clock?.finished ? "Finished" : clock?.playing ? "Pause" : "Play"}
+            </button>
+            <div className="map-view-switch" role="group" aria-label="Simulation speed">
+              {SPEEDS.map((x) => (
+                <button
+                  key={x}
+                  className={(clock?.speed ?? speed) === x ? "active" : ""}
+                  disabled={!clock || clock.finished}
+                  onClick={() => {
+                    setSpeed(x);
+                    changeClock({ speed: x }).then((c) => c && setClock(c));
+                  }}
+                >
+                  {x}x
+                </button>
+              ))}
+            </div>
           </div>
         )}
-        <div className="map-status" aria-live="polite">
-          {error ? (
-            <span className="map-status-error">
-              Map data could not be loaded ({error}). Run <code>python -m sim.export --seed 42</code> in <code>simulation/</code>.
-            </span>
-          ) : !ready ? (
-            "Loading Shinjuku…"
-          ) : quakeError ? (
-            <span className="map-status-error">{quakeError}</span>
-          ) : working ? (
-            "Generating the simulation and waiting for Neon to confirm all reports and resources are saved…"
-          ) : !truth ? (
-            simulator ? (
-              <>
-                <b>Shinjuku, before the earthquake.</b> Generate one to see what happens. Each is new: depth, epicentre and
-                which buildings fail are random.
-              </>
-            ) : (
-              <>
-                <b>Shinjuku, before the earthquake.</b> The simulator is not running, so earthquakes cannot be generated.
-                Start everything with <code>./dev.sh</code>.
-              </>
-            )
-          ) : view === "truth" ? (
-            <>
-              <b>
-                Magnitude {truth.scenario.mw} · intensity {truth.intensity.label} (Japan scale)
-              </b>{" "}
-              · {truth.summary.buildings.collapsed ?? 0} collapsed · {truth.summary.buildings.severe ?? 0} severe ·{" "}
-              {truth.summary.roads.BLOCKED ?? 0} roads blocked · {truth.summary.people.trapped ?? 0} trapped · seed {truth.seed}
-            </>
-          ) : operationalEmpty ? (
-            <>
-              <b>Operational view.</b>{" "}
-              {operationalConnected
-                ? "No incidents, closures or units yet."
-                : "Not connected to a run yet: incidents, believed road closures and units appear here once runs are written to the database."}
-            </>
-          ) : (
-            <>
-              <b>Operational view.</b> {operational.incidents.length} incidents · {operational.roadRestrictions.length} road
-              restrictions · {operational.resources.length} units
-            </>
+        <div className="map-quake">
+          <label htmlFor="quake-magnitude">M {randomMagnitude ? "random" : magnitude.toFixed(1)}</label>
+          <input
+            id="quake-magnitude"
+            type="range"
+            min={MAGNITUDE_RANGE.min}
+            max={MAGNITUDE_RANGE.max}
+            step={MAGNITUDE_RANGE.step}
+            value={magnitude}
+            disabled={randomMagnitude || controlsOff}
+            onChange={(event) => setMagnitude(Number(event.target.value))}
+          />
+          <label className="map-quake-random">
+            <input
+              id="quake-random"
+              type="checkbox"
+              checked={randomMagnitude}
+              disabled={controlsOff}
+              onChange={(event) => setRandomMagnitude(event.target.checked)}
+            />
+            random
+          </label>
+          <button onClick={() => newEarthquake()} disabled={controlsOff}>
+            {working ? "Generating…" : "Generate"}
+          </button>
+          {retryRunId && (
+            <button onClick={() => newEarthquake(retryRunId)} disabled={working}>
+              Retry saving
+            </button>
           )}
+          <button
+            className="map-quake-reset"
+            onClick={() => {
+              stopRun();   // one run plays at a time: Reset stops its clock and closes it
+              setTruth(null);
+              setQuakeError(null);
+              setRetryRunId(null);
+              setDetached(true);
+              forgetRun();
+            }}
+            disabled={!truth || working}
+          >
+            Reset
+          </button>
         </div>
+        {notice && (
+          <div className={`map-notice${error || quakeError ? " map-status-error" : ""}`} aria-live="polite">
+            {notice}
+          </div>
+        )}
       </div>
 
       {/* The key only appears once there is something to explain. */}
+      {view === "operational" && reports.length > 0 && (
+        <div className="map-legend damage-legend">
+          {Object.entries(CHANNELS)
+            .filter(([channel]) => reports.some((r) => r.channel === channel))
+            .map(([channel, [label, color]]) => (
+              <span key={channel}>
+                <i className="legend-dot" style={{ background: color }} /> {label}
+              </span>
+            ))}
+        </div>
+      )}
       {truth && view === "truth" && (
         <div className="map-legend damage-legend">
           {DAMAGE_LEVELS.map((level) => (

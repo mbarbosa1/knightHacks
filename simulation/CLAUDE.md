@@ -109,6 +109,22 @@ Agent tool functions (plain Python, called by agents):
   - All reports are written to Neon at Generate, not over time. Until the live loop releases them on a clock, every consumer (agents, dashboard feed) must filter `sim_time_s <= current simulated time` and sort by `sim_time_s`, with one shared clock (seconds since `started_at` x an agreed speed). The feed endpoint orders by `received_at, id`, which is effectively random within one ingest.
 - `backend/.env` on Gerard's machine holds only the `simulator` login on purpose (no owner / map_import), so the destructive scripts cannot run from here.
 
+## 9d. Live loop (started 11 Oct; decisions from Gerard)
+Decided: reports arrive over time; speeds 10x / 20x (30x dropped 11 Oct: Gerard prefers a smooth demo over a fast one); one run plays at a time; a stand-in dispatcher moves units until the agents exist and must be easy to swap out (the movement code will only consume *decisions*, the same rows agents will write, so the stand-in must work from reports alone, not the answer key); one seeded mid-run collapse per run, with a switch to turn it off.
+- **Piece 1, done: clock + timed reports.** `sim/live.py` `LiveRun` owns the clock for one run (simulated s = real s x speed) and releases each report at its `sim_time_s` through `storage.save_observation`; a failed save is retried in order. `sim/server.py`: Generate saves the run + 13 units (snapshot has no reports), then `start_live`; `GET /clock`, `POST /clock {speed, playing}`, `POST /stop`. Starting a run, or Reset, stops the previous one and ends it in Neon (`completed`). `start_run(..., release_reports=False)` is what the service uses; the command line still releases everything at once. Map bar shows T+mm:ss, Pause, 10x/20x/30x, "N of M reports in". Verified live against Neon: reports arrive in time order.
+- Consequence for `scripts/check_sim_run.py` (Camila's): it reports "truth_links point at observations not in Neon" for a run stopped early, because the answer key exists for reports not yet released. That is expected now, not a leak.
+- Next pieces: 2 units moving (positions via `PUT /runs/{id}/resources/{id}`), 3 blocked-road discovery (`responder_update` + road restriction), 4 the mid-run collapse, 5 people worsening. Needed from others: decisions endpoints (Camila); a way for agents to call routing (plan: tool endpoints on the simulator service that use beliefs only).
+
+## 9e. Agent architecture (as Gerard described it, 11 Oct) — replaces the 4-agent plan in section 11
+Use this description only. A diagram of it was also shared, but its extra boxes ("code validates chosen plan", "reporting agent", "save proposal for review") were added by another Claude chat and Gerard does not know what was meant by them: do not design around those.
+1. First layer: **input agent** (the orchestrator).
+2. In parallel: **detection**, **medical** and **verification** agents.
+3. **Assessment coordination.**
+4. Sent to the response structure, in parallel: **resource agent** and **route agent**.
+5. Result: a reachable team with routes.
+6. **Plan agent:** the overall response and the report.
+Agreed order of work (11 Oct): finish the live loop first, talk about the agents after. What the simulation side has to offer them, whatever their internals: reports arriving over time (done), `ops.resources` kept current, and routing callable on believed road status.
+
 ## 10. Open TODOs
 - Note (10 Oct): this folder was renamed from `sim-data-package/` to `simulation/` when it was merged with `main`. `scripts/plateau/` was removed (see `docs/PROVENANCE.md`); the loader and validator now live at the repo root in `../scripts/`; the duplicate schema and design doc were removed in favour of `../database/`. `map_id` is NOT unique, never key on it.
 - [x] J-SHIS surface-soil mesh loaded (10 Oct): `data/jshis/` CSV -> `soil_amp` on all 5,335 buildings, ARV 1.29-1.64. Loaded into Neon by Camila.

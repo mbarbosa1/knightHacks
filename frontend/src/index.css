@@ -2276,9 +2276,10 @@ detail-tags span {
     left: 12px;
     right: 56px;
     display: flex;
-    flex-direction: column;
-    gap: 7px;
-    padding: 8px 10px;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 14px;
+    padding: 7px 10px;
     background: #ffffffed;
     border: 1px solid #d7dfe3;
     border-radius: 6px;
@@ -2321,10 +2322,15 @@ detail-tags span {
     flex-wrap: wrap;
     align-items: center;
     gap: 8px;
+    margin-left: auto;   /* earthquake controls sit at the right end of the bar */
+}
+
+.map-notice {
+    flex-basis: 100%;
 }
 
 .map-quake input[type="range"] {
-    width: 140px;
+    width: 110px;
     accent-color: var(--accent);
 }
 
@@ -2362,6 +2368,34 @@ detail-tags span {
 
 .map-status b {
     color: var(--text-primary);
+}
+
+.map-clock {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+}
+
+.map-clock-time {
+    font: 600 16px "DM Mono", monospace;
+    color: var(--text-primary);
+    min-width: 84px;
+}
+
+.map-clock-button {
+    border: 1px solid #d7dfe3;
+    border-radius: 4px;
+    background: transparent;
+    padding: 6px 11px;
+    font: 500 12.5px "DM Mono", monospace;
+    color: var(--text-secondary);
+    cursor: pointer;
+}
+
+.map-clock button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 .map-status-error {
@@ -2453,4 +2487,26 @@ detail-tags span {
 
 .map-panel .map-attribution {
     font-size: 9px;
+}
+
+.map-legend i.legend-dot {
+    border-radius: 50%;
+}
+
+.map-latest {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin-top: 5px;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.map-latest i {
+    flex: none;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
 }

@@ -34,7 +34,7 @@ class Router:
     def node(self, place):
         if isinstance(place, (tuple, list)):
             d = np.hypot((self._xy[:, 0] - place[0]) * self._kx, self._xy[:, 1] - place[1])
-            return int(self._nodes[int(d.argmin())])
+            return self._nodes[int(d.argmin())].item()   # a plain Python value, whatever type the node ids are
         return place
 
     def _metres(self, a, b):

@@ -156,9 +156,49 @@ async function submitEarthquake(url: string, body: unknown): Promise<RunTruth> {
   return result as RunTruth;
 }
 
-export async function createEarthquake(magnitude: number | null): Promise<RunTruth> {
-  return submitEarthquake(`${SIM_BASE}/runs`, magnitude === null ? {} : { mw: magnitude });
+export async function createEarthquake(magnitude: number | null, speed: number = DEFAULT_SPEED): Promise<RunTruth> {
+  return submitEarthquake(`${SIM_BASE}/runs`, magnitude === null ? { speed } : { mw: magnitude, speed });
 }
+
+/** How many simulated seconds pass per real second. */
+export const SPEEDS = [10, 20] as const;
+export const DEFAULT_SPEED = 20;
+
+/** The live run's clock, kept by the simulator. run_id is null when nothing is playing. */
+export interface RunClock {
+  run_id: string | null;
+  sim_time_s?: number;
+  end_s?: number;
+  speed?: number;
+  playing: boolean;
+  finished: boolean;
+  reports_released?: number;
+  reports_total?: number;
+  last_error?: string | null;
+}
+
+export async function loadClock(): Promise<RunClock | null> {
+  try {
+    return await getJson<RunClock>(`${SIM_BASE}/clock`);
+  } catch {
+    return null;
+  }
+}
+
+async function postSim(path: string, body: unknown): Promise<RunClock | null> {
+  try {
+    const response = await fetch(`${SIM_BASE}${path}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    return response.ok ? ((await response.json()) as RunClock) : null;
+  } catch {
+    return null;
+  }
+}
+
+export const changeClock = (change: { speed?: number; playing?: boolean }) => postSim("/clock", change);
+/** Stop the live run and close it. */
+export const stopRun = () => postSim("/stop", {});
 
 export async function retryEarthquake(runId: string): Promise<RunTruth> {
   return submitEarthquake(`${SIM_BASE}/runs/${runId}/retry`, {});
@@ -177,4 +217,33 @@ export async function loadOperationalState(runId: string | undefined = RUN_ID): 
     getJson<OperationalState["resources"]>(`${run}/resources?limit=1000`),
   ]);
   return { incidents, roadRestrictions, resources };
+}
+
+/** A report as the backend's feed returns it (GET /runs/{id}/observations): what agents see, nothing more. */
+export interface Report {
+  id: string;
+  channel: string;
+  original_text: string | null;
+  text_en: string | null;
+  lang: string | null;
+  claimed_location: string | null;
+  location_precision: string | null;
+  source_reliability: number | null;
+  sim_time_s: number | null;
+  longitude: number | null;
+  latitude: number | null;
+}
+
+/** Reports that arrived after `after` (a report id), oldest first. The feed is a cursor, so each poll only brings the new ones. */
+export async function loadReportsSince(runId: string, after?: string): Promise<Report[]> {
+  if (!API_BASE) return [];
+  const out: Report[] = [];
+  let cursor = after;
+  for (let page = 0; page < 5; page++) {
+    const batch = await getJson<Report[]>(`${API_BASE}/runs/${runId}/observations?limit=1000${cursor ? `&after=${cursor}` : ""}`);
+    out.push(...batch);
+    if (batch.length < 1000) break;
+    cursor = batch[batch.length - 1].id;
+  }
+  return out;
 }

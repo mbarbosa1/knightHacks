@@ -61,6 +61,40 @@ def test_random_earthquake_and_limits(client):
     assert client.get('/health').json()['magnitude_range'] == [5.8, 8.0]
 
 
+def test_reports_arrive_on_the_clock_and_one_run_plays_at_a_time(client):
+    import json, time
+    first = client.post('/runs', json={'seed': 42, 'mw': 7.4, 'speed': 20}).json()
+    assert first['clock']['run_id'] == first['run_id'] and first['clock']['reports_total'] == 507
+    assert first['clock']['speed'] == 20 and first['clock']['playing']
+    saved = server._state['storage'].runs_dir / first['run_id'] / 'observations.jsonl'
+    assert not saved.exists()                                     # nothing is released at Generate
+    time.sleep(1.8)                                               # ~36 simulated seconds at 20x
+    clock = client.get('/clock').json()
+    assert 20 < clock['sim_time_s'] < 80 and 0 < clock['reports_released'] < 30
+    released = [json.loads(l) for l in open(saved)]
+    assert len(released) == client.get('/clock').json()['reports_released'] or len(released) > 0
+    assert all(r['sim_time_s'] <= client.get('/clock').json()['sim_time_s'] for r in released)
+    assert [r['sim_time_s'] for r in released] == sorted(r['sim_time_s'] for r in released)
+
+    assert client.post('/clock', json={'speed': 30}).status_code == 422
+    paused = client.post('/clock', json={'playing': False, 'speed': 10}).json()
+    assert paused['speed'] == 10 and not paused['playing']
+    time.sleep(0.4)
+    assert client.get('/clock').json()['sim_time_s'] == paused['sim_time_s']
+
+    first_clock = server._state['live']
+    second = client.post('/runs', json={'mw': 6.5}).json()         # a new earthquake stops the one before
+    assert first_clock.finished and client.get('/clock').json()['run_id'] == second['run_id']
+    assert second['clock']['speed'] == 20
+    run_file = json.load(open(server._state['storage'].runs_dir / first['run_id'] / 'simulation_run.json'))
+    assert run_file['status'] == 'completed' and run_file['ended_at']
+
+    assert client.post('/stop').json()['finished']
+    assert client.get('/clock').json() == {'run_id': None, 'finished': True, 'playing': False}
+    assert client.post('/clock', json={'playing': True}).status_code == 409
+    assert client.post('/runs', json={'speed': 7}).status_code == 422
+
+
 @pytest.fixture
 def neon_client(monkeypatch,tmp_path):
     from types import SimpleNamespace
@@ -116,3 +150,5 @@ def test_failed_save_is_not_success_and_same_run_can_be_retried(neon_client):
     retry = client.post(f'/runs/{run_id}/retry',json={})
     assert retry.status_code == 200 and retry.json()['run_id'] == run_id
     assert retry.json()['ingestion']['ready']
+    assert retry.json()['clock']['run_id'] == run_id      # a run saved on retry starts its clock too
+    server.stop_live()
