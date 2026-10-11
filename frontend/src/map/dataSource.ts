@@ -218,3 +218,32 @@ export async function loadOperationalState(runId: string | undefined = RUN_ID): 
   ]);
   return { incidents, roadRestrictions, resources };
 }
+
+/** A report as the backend's feed returns it (GET /runs/{id}/observations): what agents see, nothing more. */
+export interface Report {
+  id: string;
+  channel: string;
+  original_text: string | null;
+  text_en: string | null;
+  lang: string | null;
+  claimed_location: string | null;
+  location_precision: string | null;
+  source_reliability: number | null;
+  sim_time_s: number | null;
+  longitude: number | null;
+  latitude: number | null;
+}
+
+/** Reports that arrived after `after` (a report id), oldest first. The feed is a cursor, so each poll only brings the new ones. */
+export async function loadReportsSince(runId: string, after?: string): Promise<Report[]> {
+  if (!API_BASE) return [];
+  const out: Report[] = [];
+  let cursor = after;
+  for (let page = 0; page < 5; page++) {
+    const batch = await getJson<Report[]>(`${API_BASE}/runs/${runId}/observations?limit=1000${cursor ? `&after=${cursor}` : ""}`);
+    out.push(...batch);
+    if (batch.length < 1000) break;
+    cursor = batch[batch.length - 1].id;
+  }
+  return out;
+}
