@@ -424,7 +424,14 @@ function App() {
             {/* The response at a glance: where the 13 units are, and what has happened to the people. */}
             <Metric icon={<Navigation size={14} />} label="ON THE WAY" value={pad(clock?.units?.en_route)} detail="units driving" />
             <Metric icon={<MapPin size={14} />} label="ON SCENE" value={pad(clock?.units?.busy)} detail="units working" />
-            <Metric icon={<Check size={14} />} label="AVAILABLE" value={pad(clock?.units?.available)} detail="units free to send" />
+            <Metric
+              icon={<Check size={14} />}
+              label="AVAILABLE"
+              value={pad(clock?.units?.available)}
+              detail={units.length
+                ? `${units.filter((u) => u.status === "available" && !u.destination).length} at station · ${units.filter((u) => u.status === "available" && u.destination).length} in the field`
+                : "units free to send"}
+            />
             <Metric icon={<ArrowUpRight size={14} />} label="RESCUED" value={pad(clock?.rescued)} detail="people freed" />
             <Metric icon={<ShieldCheck size={14} />} label="TREATED" value={pad(clock?.treated)} detail="critical treated" />
             <Metric icon={<AlertTriangle size={14} />} label="DIED WAITING" value={pad(clock?.died_waiting)} detail="not reached in time" warning />
