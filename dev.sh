@@ -15,6 +15,9 @@ PY="$ROOT/.venv/bin/python"
 export BACKEND_URL="${BACKEND_URL:-http://127.0.0.1:8000}"
 export VITE_API_BASE="${VITE_API_BASE:-$BACKEND_URL}"
 export VITE_SIM_BASE="${VITE_SIM_BASE:-http://127.0.0.1:8100}"
+# Generate also starts the agents for the new run (they need the SSH tunnel to the model: agents/PIPELINE.md).
+# SIM_AGENTS=0 ./dev.sh turns that off; SIM_AUTO_DISPATCH=1 ./dev.sh uses the stand-in dispatcher instead.
+export SIM_AGENTS="${SIM_AGENTS:-1}"
 [ -d "$ROOT/frontend/node_modules" ] || { echo "Installing the website's libraries (first run only)..."; (cd "$ROOT/frontend" && npm install --no-audit --no-fund); }
 
 
@@ -23,6 +26,7 @@ stop() { trap - EXIT INT TERM; echo; echo "Stopping..."; kill "${pids[@]}" 2>/de
 trap stop EXIT INT TERM
 
 echo "Simulator  -> http://127.0.0.1:8100"
+[ "$SIM_AGENTS" = 1 ] && [ "${SIM_AUTO_DISPATCH:-0}" != 1 ] && echo "Agents     -> start with each new earthquake (log: simulation/runs/<run_id>/agents.log)"
 (cd "$ROOT/simulation" && exec "$PY" -m uvicorn sim.server:app --port 8100 --log-level warning) &
 pids+=($!)
 

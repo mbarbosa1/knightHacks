@@ -274,6 +274,49 @@ export interface Report {
   latitude: number | null;
 }
 
+/** One invocation of an agent and what it concluded (ops.agent_runs). */
+export interface AgentRun {
+  id: string;
+  agent: string;
+  created_at: string;
+  duration_ms: number | null;
+  output: {
+    summary?: string;
+    situation_summary?: string;
+    error?: string;
+    incidents?: unknown[];
+    /** response_agent: what was really sent, recorded by code. */
+    dispatched?: { unit_id: string; incident_id: string; eta_s: number }[];
+    refused?: { unit_id: string; incident_id: string; reason: string }[];
+    not_covered?: { incident?: string; type?: string; reason?: string }[];
+  } | null;
+}
+
+/** What the agents concluded in this run, newest first. Empty when the backend is not connected. */
+export async function loadAgentRuns(runId: string): Promise<AgentRun[]> {
+  if (!API_BASE) return [];
+  try {
+    return await getJson<AgentRun[]>(`${API_BASE}/runs/${runId}/agent-runs?limit=40`);
+  } catch {
+    return [];
+  }
+}
+
+/** Whether the simulator has the agents running for the live run. */
+export interface AgentsStatus {
+  run_id: string | null;
+  running: boolean;
+  enabled: boolean;
+}
+
+export async function loadAgentsStatus(): Promise<AgentsStatus | null> {
+  try {
+    return await getJson<AgentsStatus>(`${SIM_BASE}/agents`);
+  } catch {
+    return null;
+  }
+}
+
 /** Reports that arrived after `after` (a report id), oldest first. The feed is a cursor, so each poll only brings the new ones. */
 export async function loadReportsSince(runId: string, after?: string): Promise<Report[]> {
   if (!API_BASE) return [];

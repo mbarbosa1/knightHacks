@@ -121,6 +121,18 @@ def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
             (run_id, limit, offset),
         )).fetchall()
 
+    @app.get("/runs/{run_id}/agent-runs")
+    async def agent_runs(run_id: UUID, connection: Connection, limit: int = Query(50, ge=1, le=500),
+                         include_in_agent: bool = False):
+        """What the agents concluded, newest first: one entry per invocation with its final output.
+        in_agent writes one entry per report, so it is left out unless asked for."""
+        await repository.require_run(connection, run_id)
+        return await (await connection.execute(
+            """SELECT id, agent, input_ref, output, duration_ms, created_at FROM ops.agent_runs
+               WHERE run_id=%s AND (%s OR agent <> 'in_agent') ORDER BY created_at DESC, id LIMIT %s""",
+            (run_id, include_in_agent, limit),
+        )).fetchall()
+
     @app.put("/runs/{run_id}/road-restrictions/{road_id}")
     async def road_restriction(run_id: UUID, road_id: str, body: RoadRestrictionPut, connection: Connection):
         return await repository.put_road_restriction(connection, run_id, road_id, body)

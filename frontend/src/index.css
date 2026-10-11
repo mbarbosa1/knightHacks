@@ -2630,3 +2630,47 @@ detail-tags span {
 .search-box + .report-list {
     margin-top: 9px;
 }
+
+/* Agent activity: what each agent concluded and what units report back, newest first. */
+.activity-list {
+    max-height: 290px;
+    overflow-y: auto;
+    padding-right: 2px;
+}
+
+.activity-item {
+    border-left: 3px solid var(--border);
+}
+
+.activity-item.activity-respond {
+    border-left-color: #e8590c;
+}
+
+.activity-item.activity-assess {
+    border-left-color: #1c7ed6;
+}
+
+.activity-item.activity-field {
+    border-left-color: #2b8a3e;
+    background: #fff;
+}
+
+.activity-item.activity-field>strong {
+    font-weight: 500;
+}
+
+.activity-item.activity-error {
+    border-left-color: #adb5bd;
+    opacity: 0.75;
+}
+
+.activity-panel .mini-live {
+    color: #2b8a3e;
+    background: #ebfbee;
+    border-color: #b2f2bb;
+}
+
+.activity-panel .mini-live i {
+    background: #2b8a3e;
+    box-shadow: 0 0 6px #2b8a3e88;
+}

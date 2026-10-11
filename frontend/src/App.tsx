@@ -30,9 +30,27 @@ import {
 import { type MockReport, type ReportKind } from "./data/mockReports";
 import { CHANNELS, UNIT_COLOR, UNIT_LABEL, ShinjukuMap, formatClock, type ShinjukuMapHandle } from "./map/ShinjukuMap";
 import type { MapState } from "./map/ShinjukuMap";
-import type { LiveUnit, OperationalState, Report } from "./map/dataSource";
+import { loadAgentRuns, loadAgentsStatus } from "./map/dataSource";
+import type { AgentRun, AgentsStatus, LiveUnit, OperationalState, Report } from "./map/dataSource";
 
 type BelievedIncident = OperationalState["incidents"][number];
+
+/** One line of the agent activity feed: an agent's conclusion, or word from a unit in the field. */
+interface Activity {
+  key: string;
+  at: number;                      // simulated seconds since the earthquake
+  kind: "assess" | "respond" | "field" | "error";
+  who: string;
+  title: string;
+  lines: string[];
+  note?: string;
+}
+const AGENT_NAME: Record<string, string> = {
+  detect_agent: "Detect agent",
+  medical_agent: "Medical agent",
+  response_agent: "Response agent",
+};
+const AGENTS_REFRESH_MS = 3000;
 
 /** Units that are doing something come first: driving, then working, then free again, then never sent. */
 const unitOrder = (unit: LiveUnit) =>
@@ -120,6 +138,81 @@ function App() {
       ? (unit.destination.building_id && mapRef.current?.buildingName(unit.destination.building_id)) ||
         `${unit.destination.lat.toFixed(4)}° N, ${unit.destination.lon.toFixed(4)}° E`
       : "";
+  // What the agents concluded, asked of the backend every few seconds. An entry is stamped with the simulated
+  // time at which the dashboard first saw it, so it can sit in one timeline with the units' own reports.
+  const runId = truth?.ingestion?.ready ? truth.run_id : null;
+  const [agentRuns, setAgentRuns] = useState<(AgentRun & { seenAt: number })[]>([]);
+  const [agentsStatus, setAgentsStatus] = useState<AgentsStatus | null>(null);
+  const simNow = useRef(0);
+  simNow.current = clock?.sim_time_s ?? 0;
+  useEffect(() => {
+    setAgentRuns([]);
+    setAgentsStatus(null);
+    if (!runId) return;
+    let stop = false;
+    const tick = async () => {
+      const [runs, status] = await Promise.all([loadAgentRuns(runId), loadAgentsStatus()]);
+      if (stop) return;
+      setAgentsStatus(status);
+      setAgentRuns((previous) => {
+        const seen = new Map(previous.map((run) => [run.id, run.seenAt]));
+        return runs.map((run) => ({ ...run, seenAt: seen.get(run.id) ?? simNow.current }));
+      });
+    };
+    tick();
+    const timer = window.setInterval(tick, AGENTS_REFRESH_MS);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
+  }, [runId]);
+  const agentsLive = Boolean(runId && agentsStatus?.running && agentsStatus.run_id === runId);
+
+  const activity: Activity[] = useMemo(() => {
+    const incidents = mapState?.operational.incidents ?? [];
+    const place = (incidentId: string) => {
+      const incident = incidents.find((i) => i.id === incidentId);
+      if (!incident) return "an incident";
+      const name = incident.building_id ? mapRef.current?.buildingName(incident.building_id) : null;
+      return `${believedPeople(incident)}${name ? ` at ${name}` : ""}`;
+    };
+    const unitName = (unitId: string) => units.find((unit) => unit.id === unitId)?.name ?? "a unit";
+    const out: Activity[] = [];
+    for (const run of agentRuns) {
+      const who = AGENT_NAME[run.agent];
+      const output = run.output;
+      if (!who || !output) continue;                       // the orchestrator's own bookkeeping is not shown
+      const took = run.duration_ms ? `${Math.round(run.duration_ms / 1000)} s` : undefined;
+      if (output.error) {
+        out.push({ key: run.id, at: run.seenAt, kind: "error", who, title: "Could not finish this round", lines: [output.error.slice(0, 160)], note: took });
+      } else if (run.agent === "response_agent") {
+        const sent = output.dispatched ?? [];
+        out.push({
+          key: run.id, at: run.seenAt, kind: "respond", who, note: took,
+          title: sent.length ? `Sent ${sent.length} unit${sent.length === 1 ? "" : "s"}` : "Sent nobody",
+          lines: [
+            ...sent.map((d) => `${unitName(d.unit_id)} → ${place(d.incident_id)}`),
+            ...(output.refused ?? []).map((r) => `Could not send ${unitName(r.unit_id)}: ${r.reason}`),
+            ...((output.not_covered?.length ?? 0) > 0 ? [`${output.not_covered!.length} need${output.not_covered!.length === 1 ? "" : "s"} left uncovered`] : []),
+          ],
+        });
+      } else {
+        const said = output.situation_summary ?? output.summary;
+        const found = output.incidents?.length;
+        out.push({
+          key: run.id, at: run.seenAt, kind: "assess", who, note: took,
+          title: found !== undefined ? `Assessed reports · ${found} incident${found === 1 ? "" : "s"}` : "Assessed reports",
+          lines: said ? [said] : [],
+        });
+      }
+    }
+    for (const report of observations ?? []) {
+      if (report.channel !== "responder_update") continue;
+      out.push({ key: report.id, at: report.sim_time_s ?? 0, kind: "field", who: "From the field", title: report.text_en ?? "", lines: [] });
+    }
+    return out.sort((a, b) => b.at - a.at).slice(0, 40);
+  }, [agentRuns, observations, units, mapState?.operational.incidents]);
+
   const visibleReports = useMemo(
     () =>
       reports.filter(
@@ -322,6 +415,38 @@ function App() {
         </section>
 
         <aside className="right-column">
+          <section className="panel progress-panel activity-panel">
+            <div className="panel-heading">
+              <div>
+                <Signal size={14} />
+                <span>AGENT ACTIVITY</span>
+              </div>
+              {agentsLive
+                ? <span className="mini-live"><i /> AGENTS LIVE</span>
+                : <span className="observed">{runId ? (agentsStatus?.enabled ? "AGENTS STOPPED" : "AGENTS OFF") : "NO RUN"}</span>}
+            </div>
+            <div className="route-status-list activity-list">
+              {activity.map((entry) => (
+                <div className={`route-status-item activity-item activity-${entry.kind}`} key={entry.key}>
+                  <div className="route-status-top">
+                    <span>{entry.who}{entry.note ? ` · ${entry.note}` : ""}</span>
+                    <b>T+{formatClock(entry.at)}</b>
+                  </div>
+                  <strong>{entry.title}</strong>
+                  {entry.lines.map((line, index) => <small key={index}>{line}</small>)}
+                </div>
+              ))}
+              {activity.length === 0 && (
+                <div className="panel-empty">
+                  {!runId
+                    ? "No run is playing."
+                    : agentsLive
+                      ? "The agents are reading the first reports…"
+                      : "Nothing from the agents yet. They start with each new earthquake when ./dev.sh is running."}
+                </div>
+              )}
+            </div>
+          </section>
           <section className="panel progress-panel">
             <div className="panel-heading">
               <div>

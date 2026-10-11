@@ -198,3 +198,40 @@ def test_failed_save_is_not_success_and_same_run_can_be_retried(neon_client):
     assert retry.json()['ingestion']['ready']
     assert retry.json()['clock']['run_id'] == run_id      # a run saved on retry starts its clock too
     server.stop_live()
+
+
+def test_agents_start_with_a_run_and_stop_with_it(monkeypatch, tmp_path):
+    """SIM_AGENTS=1: Generate also launches the orchestrator for the new run, and stopping the run stops it."""
+    import sys, time
+    started = []
+
+    class Process:
+        def __init__(self, cmd, **kwargs):
+            self.cmd, self.cwd, self.env, self.stopped = cmd, kwargs['cwd'], kwargs['env'], False
+            kwargs['stdout'].write('Loading the run and its map...\n'); kwargs['stdout'].flush()
+            started.append(self)
+        def poll(self): return 0 if self.stopped else None
+        def terminate(self): self.stopped = True
+        def wait(self, timeout=None): return 0
+    monkeypatch.setattr(server.subprocess, 'Popen', Process)
+    monkeypatch.setattr(server, 'LocalStorage', lambda: LocalStorage(runs_dir=tmp_path))
+    monkeypatch.setattr(server, 'BACKEND_URL', 'http://backend')
+    client = TestClient(server.app)
+
+    monkeypatch.setattr(server, 'AGENTS', False)
+    server.start_agents('run-0')
+    assert started == [] and client.get('/agents').json() == {'run_id': None, 'running': False, 'enabled': False, 'log': []}
+
+    monkeypatch.setattr(server, 'AGENTS', True)
+    server.start_agents('run-1')
+    assert started[0].cmd == [sys.executable, '-m', 'agents.orchestrator', 'run-1', '--watch']
+    assert started[0].cwd == server.REPO_ROOT and started[0].env['BACKEND_URL'] == 'http://backend'
+    assert client.get('/agents').json() == {'run_id': 'run-1', 'running': True, 'enabled': True, 'log': ['Loading the run and its map...']}
+    server.start_agents('run-2')                       # a new run replaces the one before
+    assert started[0].stopped and not started[1].stopped and client.get('/agents').json()['run_id'] == 'run-2'
+    server.stop_live()
+    assert started[1].stopped and client.get('/agents').json()['running'] is False
+
+    monkeypatch.setattr(server, 'AUTO_DISPATCH', True)  # the stand-in and the agents never both dispatch
+    server.start_agents('run-3')
+    assert len(started) == 2

@@ -22,6 +22,7 @@ class ContractTests(unittest.TestCase):
             ("/runs/{run_id}/road-restrictions/{road_id}", "put"),
             ("/runs/{run_id}/decisions/{decision_id}", "put"),
             ("/runs/{run_id}/decisions", "get"),
+            ("/runs/{run_id}/agent-runs", "get"),
         ):
             self.assertIn(method, paths[path])
 
