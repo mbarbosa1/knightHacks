@@ -6,6 +6,7 @@ import {
   MAGNITUDE_RANGE,
   createEarthquake,
   retryEarthquake,
+  forgetRun,
   SubmissionError,
   RUN_ID,
   simulatorAvailable,
@@ -78,7 +79,9 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
   const [working, setWorking] = useState(false);
   const [quakeError, setQuakeError] = useState<string | null>(null);
   const [retryRunId, setRetryRunId] = useState<string | null>(null);
-  const activeRunId = truth?.ingestion?.ready ? truth.run_id : RUN_ID;
+  // After Reset the map follows no run at all, not the one this tab remembered from before.
+  const [detached, setDetached] = useState(false);
+  const activeRunId = truth?.ingestion?.ready ? truth.run_id : detached ? undefined : RUN_ID;
 
   useEffect(() => {
     simulatorAvailable().then(setSimulator);
@@ -90,6 +93,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
     try {
       setTruth(await (retryId ? retryEarthquake(retryId) : createEarthquake(randomMagnitude ? null : magnitude)));
       setRetryRunId(null);
+      setDetached(false);
       setSimulator(true);
     } catch (cause) {
       setSimulator(await simulatorAvailable());
@@ -243,8 +247,8 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
 
   // Operational state: polled while a run is connected, otherwise empty.
   useEffect(() => {
+    setOperational(EMPTY_OPERATIONAL);   // never keep showing the previous run's units
     if (!operationalConnected || !activeRunId) return;
-    setOperational(EMPTY_OPERATIONAL);
     let stop = false;
     const tick = () =>
       loadOperationalState(activeRunId)
@@ -357,6 +361,8 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
                 setTruth(null);
                 setQuakeError(null);
                 setRetryRunId(null);
+                setDetached(true);
+                forgetRun();
               }}
               disabled={!truth || working}
             >

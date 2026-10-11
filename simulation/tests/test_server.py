@@ -36,7 +36,7 @@ def test_same_seed_replays_and_truth_can_be_fetched_again(client):
     assert client.get(f"/runs/{a['run_id']}/truth").json() == a
     assert client.get('/runs/nope/truth').status_code == 404
     reports = client.get(f"/runs/{a['run_id']}/reports").json()
-    assert len(reports) == a['summary']['reports'] == 487
+    assert len(reports) == a['summary']['reports'] == 507
     assert [r['sim_time_s'] for r in reports] == sorted(r['sim_time_s'] for r in reports)
     assert {r['answer']['match_type'] for r in reports} == {'matched', 'misleading', 'fabricated', 'unmatched'}
     assert all(r['answer']['building_id'] in a['building_damage'] for r in reports if r['answer']['building_id'])
