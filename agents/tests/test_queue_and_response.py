@@ -38,7 +38,7 @@ def queue_orchestrator(records, assessed=()):
     orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
     orch.run_id, orch.cursor, orch.batch_size, orch.in_workers, orch.parallel_batches = 'run', None, 2, 1, 3
     orch.tools = QueueTools(records, assessed)
-    orch.response, orch._responded_to = {}, None   # no response agent in these tests
+    orch.response, orch._responded_to, orch._respond_lock = {}, None, __import__('threading').Lock()   # no response agent here
     orch.assessment = {n: ('instructions', ['log_agent_run']) for n in ('detect_agent', 'medical_agent')}
     return orch
 
@@ -131,3 +131,70 @@ def test_follow_switches_when_a_new_earthquake_is_generated(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         orchestrator.follow()
     assert made == ['run-A', 'run-B'] and cycled == ['run-A', 'run-A', 'run-B']
+
+
+# ---- human in the loop: the response agent proposes, the operator approves ---------------
+
+class ProposalTools:
+    run_id = 'run'
+
+    def __init__(self, drafts=(), free=('F1', 'A1')):
+        self.drafts, self.free, self.closed, self.proposed = list(drafts), set(free), [], []
+
+    def _units(self):
+        return [{'id': u, 'status': 'available' if u in self.free else 'en_route'} for u in ('F1', 'A1', 'P1')]
+
+    def proposals(self, status='draft'):
+        return self.drafts
+
+    def close_proposal(self, d, status, reason=None):
+        self.closed.append((d['id'], status, reason))
+
+    def propose_dispatch(self, unit_id, incident_id, unit_type=None, eta_s=None):
+        self.proposed.append((unit_id, incident_id, unit_type, eta_s))
+        return {'id': f'd{len(self.proposed)}'}
+
+
+def situation():
+    return {'incidents': [{'incident_id': 'I1', 'could_use': ['fire_engine', 'ambulance'],
+                           'nearest_free': {'fire_engine': [{'unit_id': 'F1', 'travel_time_s': 60}],
+                                            'ambulance': [{'unit_id': 'A1', 'travel_time_s': 30}]}}],
+            'free_units': {'fire_engine': 1, 'ambulance': 1},
+            'suggested': [{'unit_id': 'F1', 'incident_id': 'I1'}, {'unit_id': 'A1', 'incident_id': 'I1'}]}
+
+
+def test_pending_proposals_are_not_offered_again():
+    orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
+    orch.tools = ProposalTools(drafts=[{'id': 'd0', 'incident_id': 'I1', 'assignments': [{'resource_id': 'F1', 'type': 'fire_engine'}]}])
+    out = orch._without_pending(situation())
+    assert out['incidents'][0]['could_use'] == ['ambulance'] and 'fire_engine' not in out['incidents'][0]['nearest_free']
+    assert out['suggested'] == [{'unit_id': 'A1', 'incident_id': 'I1'}] and orch.tools.closed == []
+
+
+def test_stale_proposals_expire():
+    orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
+    orch.tools = ProposalTools(drafts=[{'id': 'd0', 'incident_id': 'I1', 'assignments': [{'resource_id': 'F1', 'type': 'fire_engine'}]},
+                                       {'id': 'd9', 'incident_id': 'GONE', 'assignments': [{'resource_id': 'A1', 'type': 'ambulance'}]}],
+                               free=('A1',))
+    orch._without_pending(situation())
+    assert orch.tools.closed == [('d0', 'invalidated', 'unit no longer free'), ('d9', 'invalidated', 'incident no longer needs a unit')]
+
+
+def test_propose_mode_saves_drafts_instead_of_dispatching(monkeypatch):
+    monkeypatch.setattr(orchestrator, 'RESPONSE_MODE', 'propose')
+    tools = ProposalTools()
+    tools.incidents_to_cover = lambda: situation()
+    tools.toolbox = lambda name, names, done=None: ([], {'dispatch_units': lambda real: pytest.fail('must not dispatch')})
+    tools.log_agent_run = lambda *a, **k: None
+
+    def agent(instructions, payload, specs, functions, max_steps=6):
+        out = functions['dispatch_units']([{'unit': 'F1', 'incident': 'I1'}, {'unit': 'A1', 'incident': 'I1'}])
+        assert [s['unit'] for s in out['sent']] == ['F1', 'A1']
+        return {'output': {'summary': 'proposed'}, 'tool_calls': [], 'steps': 2}
+    monkeypatch.setattr(orchestrator, 'run_agent', agent)
+    monkeypatch.setattr(orchestrator, '_brief', lambda s: ({}, {'F1': 'F1', 'A1': 'A1', 'I1': 'I1'}))
+    orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
+    orch.tools, orch.response, orch._responded_to, orch.cursor = tools, {'response_agent': ('md', ['dispatch_units'])}, None, 'o1'
+    result = orch.respond()
+    assert tools.proposed == [('F1', 'I1', 'fire_engine', 60), ('A1', 'I1', 'ambulance', 30)]
+    assert result['output']['mode'] == 'propose' and len(result['output']['proposed']) == 2

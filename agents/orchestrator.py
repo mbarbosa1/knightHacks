@@ -46,6 +46,10 @@ ASSESSMENT_MODULES = {m.AGENT: m for m in (load_agent('assesmentAgent/detect-age
 ASSESSMENT_AGENTS = {name: (str(m.INSTRUCTIONS.relative_to(AGENTS_DIR)), m.TOOLS) for name, m in ASSESSMENT_MODULES.items()}
 
 
+# Human in the loop (default): the response agent PROPOSES dispatches; an operator approves each one on the website,
+# which is what sends the unit. RESPONSE_MODE=dispatch sends units at once, with no approval.
+RESPONSE_MODE = 'dispatch' if __import__('os').environ.get('RESPONSE_MODE', '').lower() == 'dispatch' else 'propose'
+
 # The response agent runs after each assessment batch (and when units come free): it reads the incidents and
 # the units, and dispatches. Resource and plan are one agent, with no drafts or approval; routing is code.
 RESPONSE_AGENTS = {
@@ -55,13 +59,14 @@ RESPONSE_AGENTS = {
 
 
 class Orchestrator:
-    def __init__(self, run_id, instructions_override=None, batch_size=5, in_workers=6, parallel_batches=3):
+    def __init__(self, run_id, instructions_override=None, batch_size=3, in_workers=6, parallel_batches=4):
         self.in_agent = InAgent.for_run(run_id)
         self.tools = self.in_agent.tools          # one RunTools (map loaded once) shared by every agent
         self.run_id = run_id
         self.batch_size = batch_size
         self.in_workers = in_workers
-        self.parallel_batches = parallel_batches   # assessment batches in flight at once (the model server batches requests)
+        self.parallel_batches = parallel_batches  # assessment batches in flight at once
+        self._respond_lock = __import__('threading').Lock()   # one response agent run at a time
         self.cursor = None                        # last observation id handed to the assessment agents
         self.assessment = {}                      # name -> (instructions, tool names) for agents that exist
         for name, (path, tools) in ASSESSMENT_AGENTS.items():
@@ -127,6 +132,11 @@ class Orchestrator:
         self.tools.log_agent_run('assessment_coordinator', last, handoff, run_key=f'coordinator:{last}')
         print(f'  batch {number}: coordinator    {len(handoff["incidents"])} incidents, '
               f'{len(handoff["needs_response"])} need a response', flush=True)
+        if handoff['needs_response'] and self._respond_lock.acquire(blocking=False):
+            try:              # propose right away, not after every batch of the cycle (one response at a time)
+                self.respond()
+            finally:
+                self._respond_lock.release()
         return True
 
     # ---- stage 3: the response agent ---------------------------------------
@@ -138,6 +148,8 @@ class Orchestrator:
             return None
         try:
             situation = self.tools.incidents_to_cover()
+            if RESPONSE_MODE == 'propose':
+                situation = self._without_pending(situation)
         except Exception as exc:   # no live run in the simulator, or it is not running: nothing to dispatch
             print(f'  response skipped: {exc}', flush=True)
             return None
@@ -154,11 +166,30 @@ class Orchestrator:
         dispatch = functions['dispatch_units']
         refs = {full: short for short, full in ids.items()}
 
+        eta = {(i['incident_id'], u['unit_id']): (t, u['travel_time_s'])
+               for i in situation['incidents'] for t, us in i['nearest_free'].items() for u in us}
+
+        def propose(real):
+            """Human in the loop: each choice becomes a draft for the operator (Approve dispatches it)."""
+            outcome, used = {'sent': [], 'refused': []}, set()
+            for a in real:
+                key = (a['incident_id'], a['unit_id'])
+                if key not in eta or a['unit_id'] in used:
+                    reason = 'already proposed in this list' if a['unit_id'] in used else \
+                             'not one of the free units listed for this incident'
+                    outcome['refused'].append({**a, 'reason': reason})
+                    continue
+                unit_type, eta_s = eta[key]
+                d = self.tools.propose_dispatch(a['unit_id'], a['incident_id'], unit_type, eta_s)
+                used.add(a['unit_id'])
+                outcome['sent'].append({**a, 'eta_s': eta_s, 'decision_id': d['id']})
+            return outcome
+
         def dispatch_units(assignments):
             real = [{'unit_id': ids.get(str((a or {}).get('unit')).upper(), (a or {}).get('unit')),
                      'incident_id': ids.get(str((a or {}).get('incident')).upper(), (a or {}).get('incident'))}
                     for a in assignments or []]
-            outcome = dispatch(real)
+            outcome = propose(real) if RESPONSE_MODE == 'propose' else dispatch(real)
             sent.extend(outcome['sent'])
             refused.extend(outcome['refused'])
             short = lambda r: {'unit': refs.get(r['unit_id'], r['unit_id']), 'incident': refs.get(r['incident_id'], r['incident_id'])}
@@ -172,7 +203,8 @@ class Orchestrator:
         except Exception as exc:
             result = {'error': f'{type(exc).__name__}: {exc}', 'output': {}, 'tool_calls': [], 'steps': None}
         result['seconds'] = round(time.monotonic() - started, 1)
-        result['output'] = {**result['output'], 'dispatched': sent, 'refused': refused,
+        result['output'] = {**result['output'], 'mode': RESPONSE_MODE,
+                            ('proposed' if RESPONSE_MODE == 'propose' else 'dispatched'): sent, 'refused': refused,
                             **({'error': result['error']} if 'error' in result else {})}
         self.tools.log_agent_run(name, self.cursor or 'no-reports-yet', result['output'], int(result['seconds'] * 1000))
         try:   # what it left behind, so an unchanged situation is not handed to it again
@@ -181,6 +213,32 @@ class Orchestrator:
             self._responded_to = None
         print(f'  response: {_response_summary(result)}', flush=True)
         return result
+
+    def _without_pending(self, situation):
+        """Propose mode: leave out what is already waiting for the operator, and drop drafts that went stale
+        (their unit is no longer free, or the incident was resolved), so nothing is proposed twice."""
+        free = {u['id'] for u in self.tools._units() if u['status'] == 'available'}
+        open_ids = {i['incident_id'] for i in situation['incidents']}
+        pending = []
+        for d in self.tools.proposals('draft'):
+            unit = (d['assignments'] or [{}])[0].get('resource_id')
+            if unit not in free or d['incident_id'] not in open_ids:
+                self.tools.close_proposal(d, 'invalidated', 'unit no longer free' if unit not in free
+                                          else 'incident no longer needs a unit')
+            else:
+                pending.append(d)
+        busy = {(d['assignments'] or [{}])[0].get('resource_id') for d in pending}
+        for i in situation['incidents']:
+            waiting = [(d['assignments'] or [{}])[0].get('type') for d in pending if d['incident_id'] == i['incident_id']]
+            for t in waiting:
+                if t in i['could_use']:
+                    i['could_use'].remove(t)
+            i['nearest_free'] = {t: [u for u in us if u['unit_id'] not in busy]
+                                 for t, us in i['nearest_free'].items() if t in i['could_use']}
+        situation['incidents'] = [i for i in situation['incidents'] if i['could_use']]
+        situation['suggested'] = [x for x in situation['suggested'] if x['unit_id'] not in busy
+                                  and any(x['incident_id'] == i['incident_id'] for i in situation['incidents'])]
+        return situation
 
     # ---- one pass over everything new ---------------------------------------
 
@@ -213,7 +271,8 @@ class Orchestrator:
             done = list(pool.map(self.assess_and_log, batches, range(1, len(batches) + 1)))
         assessed = sum(len(b) for b, ok in zip(batches, done) if ok)
         if assessed:
-            self.respond()   # new incidents: who goes where
+            with self._respond_lock:
+                self.respond()   # anything the batches left (e.g. units that came free meanwhile)
         return len(reports) + assessed
 
     def watch(self, interval_s=10, chunk=10):
@@ -248,7 +307,7 @@ def current_run():
         return None
 
 
-def follow(override=None, batch_size=5, parallel=3, chunk=10, interval_s=10):
+def follow(override=None, batch_size=3, parallel=4, chunk=12, interval_s=5):
     """Work on whichever earthquake the website is showing, and switch by itself when someone clicks Generate."""
     orch = None
     print('Following the simulator: agents work on the earthquake the website shows (Ctrl+C to stop)...', flush=True)
@@ -305,7 +364,8 @@ def _brief(situation):
 
 def _response_summary(result):
     out = result['output']
-    return {'seconds': result['seconds'], 'steps': result['steps'], 'dispatched': len(out['dispatched']),
+    return {'seconds': result['seconds'], 'steps': result['steps'], 'mode': out.get('mode'),
+            'proposed' if out.get('mode') == 'propose' else 'dispatched': len(out.get('proposed', out.get('dispatched', []))),
             'refused': [r['reason'] for r in out['refused']][:5],
             'tool_errors': [c['error'] for c in result['tool_calls'] if not c['ok']][:5],
             'not_covered': len(out.get('not_covered') or []), 'summary': (out.get('summary') or '')[:300],
@@ -318,15 +378,15 @@ def main():
     ap.add_argument('--follow', action='store_true',
                     help='work on the run the website shows, switching when a new earthquake is generated')
     ap.add_argument('--watch', action='store_true', help='keep checking for new reports')
-    ap.add_argument('--batch-size', type=int, default=5)
-    ap.add_argument('--parallel', type=int, default=3, help='assessment batches at the same time (default 3)')
+    ap.add_argument('--batch-size', type=int, default=3)
+    ap.add_argument('--parallel', type=int, default=4, help='assessment batches at the same time (default 4)')
     ap.add_argument('--limit', type=int, help='only take this many new reports (with --watch: per cycle, default 10)')
     ap.add_argument('--instructions', action='append', default=[], metavar='AGENT=PATH',
                     help='use this .md for an agent instead of agents/<group>/<name>.md')
     a = ap.parse_args()
     override = dict(x.split('=', 1) for x in a.instructions)
     if a.follow:
-        return follow(override, a.batch_size, a.parallel, a.limit or 10)
+        return follow(override, a.batch_size, a.parallel, a.limit or 12)
     if not a.run_id:
         ap.error('give a run_id, or use --follow')
     print('Loading the run and its map...', flush=True)

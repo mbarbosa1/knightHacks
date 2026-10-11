@@ -82,6 +82,7 @@ def fake_orchestrator(agents):
     orch = orchestrator.Orchestrator.__new__(orchestrator.Orchestrator)
     orch.run_id, orch.cursor, orch.tools = 'run', None, FakeTools()
     orch.assessment = {name: ('instructions', ['log_agent_run']) for name in agents}
+    orch.response, orch._responded_to, orch._respond_lock = {}, None, __import__('threading').Lock()
     return orch
 
 

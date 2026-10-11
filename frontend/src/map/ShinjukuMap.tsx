@@ -2,6 +2,7 @@ import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "re
 import maplibregl, { type GeoJSONSource, type Map as MapLibreMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import {
+  incidentPriority,
   EMPTY_OPERATIONAL,
   MAGNITUDE_RANGE,
   createEarthquake,
@@ -241,15 +242,6 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
           },
         });
 
-        // Filled by the live loop and the agents later; empty for now.
-        map.addSource("routes", { type: "geojson", data: empty() });
-        map.addLayer({
-          id: "routes",
-          type: "line",
-          source: "routes",
-          layout: { "line-cap": "round", "line-join": "round" },
-          paint: { "line-color": ["get", "color"], "line-width": 3, "line-opacity": 0.7, "line-dasharray": [1, 1.5] },
-        });
 
         map.addSource("buildings", { type: "geojson", data: staticMap.buildings, promoteId: "id" });
         map.addLayer({
@@ -286,12 +278,39 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
           },
         });
 
+        // Incidents the agents built, above the report dots and clearly different from them: a soft halo plus
+        // a large solid marker, coloured by priority (critical red, high orange, medium amber, low grey).
+        // Routes of units on the way, drawn ABOVE the 3D buildings (a layer added after them is not hidden by
+        // them): a thin line in the unit's colour on a white casing. It shortens as the unit drives along it.
+        map.addSource("routes", { type: "geojson", data: empty() });
+        map.addLayer({ id: "routes-casing", type: "line", source: "routes",
+                       layout: { "line-cap": "round", "line-join": "round" },
+                       paint: { "line-color": "#ffffff", "line-width": 5, "line-opacity": 0.85 } });
+        map.addLayer({ id: "routes", type: "line", source: "routes",
+                       layout: { "line-cap": "round", "line-join": "round" },
+                       paint: { "line-color": ["get", "color"], "line-width": 3, "line-opacity": 0.95 } });
         map.addSource("incidents", { type: "geojson", data: empty() });
+        const priorityColor = ["match", ["get", "priority"], "critical", "#c1121f", "high", "#e8590c", "medium", "#f2a900", "#868e96"];
+        map.addLayer({
+          id: "incidents-halo",
+          type: "circle",
+          source: "incidents",
+          paint: { "circle-radius": ["match", ["get", "priority"], "critical", 15, 12], "circle-color": priorityColor as never,
+                   "circle-opacity": 0.14, "circle-blur": 0.5 },
+        });
         map.addLayer({
           id: "incidents",
           type: "circle",
           source: "incidents",
-          paint: { "circle-radius": 9, "circle-color": "rgba(216,30,44,0.2)", "circle-stroke-color": "#d81e2c", "circle-stroke-width": 2 },
+          paint: { "circle-radius": ["match", ["get", "priority"], "critical", 9, 8], "circle-color": priorityColor as never,
+                   "circle-stroke-color": "#ffffff", "circle-stroke-width": 1.5 },
+        });
+        map.addLayer({
+          id: "incidents-label",
+          type: "symbol",
+          source: "incidents",
+          layout: { "text-field": ["get", "label"], "text-size": 9, "text-font": ["Noto Sans Bold"], "text-allow-overlap": true },
+          paint: { "text-color": "#ffffff" },
         });
         map.addSource("units", { type: "geojson", data: empty() });
         map.addLayer({
@@ -478,9 +497,34 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
       type: "FeatureCollection",
       features: (showOps ? operational.incidents : [])
         .filter((incident) => incident.location)
-        .map((incident) => ({ type: "Feature", geometry: incident.location!, properties: { id: incident.id, status: incident.status } })),
+        .map((incident) => {
+          const p = incidentPriority(incident);
+          const people = p.trapped + p.critical + p.injured;
+          return { type: "Feature", geometry: incident.location!,
+                   properties: { id: incident.id, status: incident.status, priority: p.priority, label: people ? String(people) : "!" } };
+        }),
     });
   }, [view, truth, operational, ready]);
+
+  // A unit's position arrives twice a second; in between, its marker glides there instead of jumping.
+  const glides = useRef(new Map<maplibregl.Marker, { from: [number, number]; to: [number, number]; start: number }>());
+  const glide = (marker: maplibregl.Marker, to: [number, number]) => {
+    const at = marker.getLngLat();
+    glides.current.set(marker, { from: [at.lng, at.lat], to, start: performance.now() });
+  };
+  useEffect(() => {
+    let frame = 0;
+    const step = (now: number) => {
+      for (const [marker, g] of glides.current) {
+        const t = Math.min(1, (now - g.start) / UNITS_REFRESH_MS);
+        marker.setLngLat([g.from[0] + (g.to[0] - g.from[0]) * t, g.from[1] + (g.to[1] - g.from[1]) * t]);
+        if (t >= 1) glides.current.delete(marker);
+      }
+      frame = requestAnimationFrame(step);
+    };
+    frame = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(frame);
+  }, []);
 
   // Units, in the operational view. One still parked at its station is not drawn: it is under the station's pin.
   useEffect(() => {
@@ -491,6 +535,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
     const markers = unitMarkers.current;
     for (const [id, marker] of markers) {
       if (!shown.some((unit) => unit.id === id)) {
+        glides.current.delete(marker);
         marker.remove();
         markers.delete(id);
       }
@@ -504,7 +549,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
         marker = new maplibregl.Marker({ element: el, anchor: "center" }).setLngLat([unit.lon, unit.lat]).addTo(map);
         markers.set(unit.id, marker);
       }
-      marker.setLngLat([unit.lon, unit.lat]);
+      glide(marker, [unit.lon, unit.lat]);
       const el = marker.getElement();
       // Keep MapLibre's own classes on the element: they position it.
       el.classList.add("map-unit");

@@ -337,6 +337,35 @@ class RunTools:
         return {'dispatched': True, 'decision_id': d['id'], 'version': d['version'], 'unit_id': unit_id,
                 'incident_id': incident_id, 'eta_s': d['eta_s']}
 
+    # ---- proposals: the response agent suggests, an operator approves ------------------
+    # A proposal is an ops.decisions row with status 'draft'. The website lists them under each incident with
+    # Approve / Reject: Approve dispatches the unit through the simulator (POST /dispatch) and marks the draft
+    # 'approved'; Reject marks it 'invalidated'. Drafts use versions from PROPOSAL_VERSION_BASE up, because the
+    # simulator numbers the decisions it records when a unit is really sent 1, 2, 3... per incident.
+
+    PROPOSAL_VERSION_BASE = 1000
+
+    def proposals(self, status='draft'):
+        """Proposed dispatches (decisions with a proposal version), optionally of one status."""
+        return [d for d in _get(f'/runs/{self.run_id}/decisions', limit=1000)
+                if d['version'] >= self.PROPOSAL_VERSION_BASE and status in (None, d['status'])]
+
+    def propose_dispatch(self, unit_id, incident_id, unit_type=None, eta_s=None, why=None):
+        """Save 'send this unit to this incident' as a draft for an operator to approve. Sends nobody."""
+        taken = [d['version'] for d in _get(f'/runs/{self.run_id}/decisions', limit=1000)
+                 if d['incident_id'] == incident_id and d['version'] >= self.PROPOSAL_VERSION_BASE]
+        body = {'incident_id': incident_id, 'version': max(taken, default=self.PROPOSAL_VERSION_BASE - 1) + 1,
+                'assignments': [{'resource_id': unit_id, 'type': unit_type, 'proposed_by': 'response_agent',
+                                 **({'why': why} if why else {})}],
+                'eta_s': eta_s, 'status': 'draft'}
+        return _put(f'/runs/{self.run_id}/decisions/{uuid.uuid4()}', body)
+
+    def close_proposal(self, decision, status, reason=None):
+        """Mark a proposal approved / invalidated (keeps everything else as it was)."""
+        body = {k: decision.get(k) for k in ('incident_id', 'version', 'assignments', 'eta_s')}
+        return _put(f'/runs/{self.run_id}/decisions/{decision["id"]}',
+                    {**body, 'status': status, 'invalidated_reason': reason})
+
     def list_decisions(self, status=None):
         """Dispatch decisions of this event: who was sent where, and which were invalidated and why."""
         return [{'decision_id': d['id'], 'incident_id': d['incident_id'], 'version': d['version'], 'status': d['status'],
@@ -657,6 +686,13 @@ def _sim(method, path, body=None):
     if r.status_code in (409, 422):
         detail = r.json().get('detail')
         raise ToolError(detail if isinstance(detail, str) else json.dumps(detail))
+    return r.raise_for_status().json()
+
+
+def _put(path, body):
+    r = httpx.put(BACKEND_URL + path, json=body, timeout=60)
+    if r.status_code in (409, 422):
+        raise ToolError(f'backend refused ({r.status_code}): {r.json().get("detail")}')
     return r.raise_for_status().json()
 
 

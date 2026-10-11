@@ -2630,3 +2630,216 @@ detail-tags span {
 .search-box + .report-list {
     margin-top: 9px;
 }
+
+/* ---- Incidents · priority: the agents' incidents, most urgent first, with proposals to approve ---- */
+.incidents-panel {
+    padding: 0 10px 9px;
+}
+
+.incident-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 330px;
+    overflow-y: auto;
+}
+
+.incident-row {
+    border: 1px solid var(--border);
+    border-left: 4px solid #868e96;
+    border-radius: 6px;
+    background: var(--surface-muted);
+    overflow: hidden;
+}
+
+.incident-row.priority-critical { border-left-color: #c1121f; }
+.incident-row.priority-high { border-left-color: #e8590c; }
+.incident-row.priority-medium { border-left-color: #f2a900; }
+
+.incident-main {
+    display: grid;
+    grid-template-columns: auto auto 1fr;
+    align-items: center;
+    gap: 3px 7px;
+    width: 100%;
+    padding: 7px 8px;
+    border: 0;
+    background: transparent;
+    text-align: left;
+    cursor: pointer;
+}
+
+.incident-main:hover { background: var(--surface-subtle); }
+
+.incident-rank {
+    color: var(--text-muted);
+    font: 10px "DM Mono", monospace;
+}
+
+.incident-main strong {
+    font-size: 12px;
+    color: var(--text-primary);
+}
+
+.incident-main small {
+    grid-column: 1 / -1;
+    color: var(--text-secondary);
+    font-size: 10.5px;
+    line-height: 1.35;
+}
+
+.priority-badge {
+    padding: 2px 5px;
+    border-radius: 3px;
+    color: #fff;
+    background: #868e96;
+    font: 600 8px "DM Mono", monospace;
+    letter-spacing: 0.04em;
+}
+
+.priority-badge.priority-critical { background: #c1121f; }
+.priority-badge.priority-high { background: #e8590c; }
+.priority-badge.priority-medium { background: #f2a900; color: #2b2100; }
+
+.proposal {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    padding: 6px 8px;
+    border-top: 1px dashed var(--border);
+    background: #fffaf0;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.proposal b { color: var(--text-primary); }
+
+.proposal-actions {
+    display: flex;
+    gap: 5px;
+}
+
+.proposal-actions button {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font: 600 10.5px "DM Sans", sans-serif;
+    cursor: pointer;
+}
+
+.proposal-actions .approve {
+    border: 1px solid #1f7a3d;
+    color: #fff;
+    background: #2b8a3e;
+}
+
+.proposal-actions .reject {
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    background: var(--surface);
+}
+
+.proposal-actions button:disabled { opacity: 0.6; cursor: wait; }
+
+.proposal-error {
+    color: var(--accent-dark);
+    font-size: 10.5px;
+}
+
+.proposals-waiting {
+    color: #b94a0a !important;
+    background: #fff4e6;
+    border: 1px solid #f5c08a;
+    padding: 1px 6px;
+    border-radius: 3px;
+}
+
+@keyframes proposals-pulse {
+    50% { opacity: 0.55; }
+}
+
+/* ---- Right column fits the screen: the incident queue takes the free space and scrolls inside, like the
+        incoming feed; the other panels keep a fixed height and scroll inside too. ---- */
+.right-column {
+    height: calc(100vh - 142px);
+    min-height: 660px;
+    overflow: hidden;
+}
+
+.right-column > .panel {
+    flex: 0 0 auto;
+    min-height: 0;
+}
+
+.right-column > .incidents-panel {
+    flex: 1 1 0;
+    min-height: 240px;
+    display: flex;
+    flex-direction: column;
+    color: var(--text-primary);
+    background: var(--surface);
+    border: 1px solid var(--border);
+}
+
+.incidents-panel .panel-heading span,
+.incidents-panel .panel-heading svg {
+    color: var(--text-primary);
+}
+
+.incident-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
+    padding-right: 2px;
+}
+
+.incident-row {
+    flex-shrink: 0;           /* never squash a row: that hid the Approve buttons */
+}
+
+.incident-row.has-proposal {
+    box-shadow: 0 0 0 1px #f5c08a inset;
+}
+
+.right-column > .progress-panel {
+    max-height: 150px;
+    overflow-y: auto;
+}
+
+.right-column > .details-panel {
+    max-height: 190px;
+    overflow-y: auto;
+}
+
+.right-column > .dispatch-panel {
+    flex: 0 1 auto;
+    max-height: 210px;
+    overflow-y: auto;
+}
+
+/* Vehicles on the map: a small square badge in the unit's colour with its letter, like the station pins.
+   On scene: a thin steady ring. Free again: faded. */
+.map-unit {
+    width: 18px;
+    height: 18px;
+    border-radius: 3px;
+    border: 1.5px solid #ffffff;
+    background: var(--unit);
+    box-shadow: 0 0 0 1px #18212b55, 0 1px 4px #18212b44;
+    color: #ffffff;
+    font: 600 10px/15px "DM Mono", ui-monospace, monospace;
+    text-align: center;
+    z-index: 3;
+}
+
+.map-unit-busy {
+    box-shadow: 0 0 0 1px #18212b55, 0 0 0 4px color-mix(in srgb, var(--unit) 30%, transparent);
+}
+
+.map-unit-free {
+    opacity: 0.5;
+}

@@ -30,7 +30,8 @@ import {
 import { type MockReport, type ReportKind } from "./data/mockReports";
 import { CHANNELS, UNIT_COLOR, UNIT_LABEL, ShinjukuMap, formatClock, type ShinjukuMapHandle } from "./map/ShinjukuMap";
 import type { MapState } from "./map/ShinjukuMap";
-import type { LiveUnit, OperationalState, Report } from "./map/dataSource";
+import type { Decision, LiveUnit, OperationalState, Report } from "./map/dataSource";
+import { approveProposal, incidentPriority, rejectProposal } from "./map/dataSource";
 
 type BelievedIncident = OperationalState["incidents"][number];
 
@@ -115,6 +116,29 @@ function App() {
   );
   const driving = units.filter((unit) => unit.status === "en_route");
   const roadsRestricted = mapState?.operational.roadRestrictions.filter((road) => road.status !== "OPEN").length ?? 0;
+  // The priority queue: the incidents the agents built, most urgent first, with what was proposed and sent.
+  const runId = clock?.run_id ?? truth?.run_id ?? null;
+  const decisions: Decision[] = mapState?.operational.decisions ?? [];
+  const unitName = (id: string) => units.find((u) => u.id === id)?.name ?? "A unit";
+  const queue = useMemo(
+    () => (mapState?.operational.incidents ?? [])
+      .filter((i) => i.status !== "resolved")
+      .map((i) => ({ incident: i, ...incidentPriority(i),
+                     waiting: decisions.some((d) => d.status === "draft" && d.incident_id === i.id) }))
+      .sort((a, b) => Number(b.waiting) - Number(a.waiting) || a.rank - b.rank),
+    [mapState?.operational.incidents, decisions],
+  );
+  const pending = decisions.filter((d) => d.status === "draft");
+  const [acting, setActing] = useState<Record<string, string>>({});   // decision id -> "sending" | error text
+  const decide = async (d: Decision, incident: BelievedIncident, approve: boolean) => {
+    if (!runId) return;
+    setActing((a) => ({ ...a, [d.id]: approve ? "sending" : "rejecting" }));
+    const problem = approve ? await approveProposal(runId, d, incident) : (await rejectProposal(runId, d), null);
+    setActing((a) => ({ ...a, [d.id]: problem ?? "done" }));
+    // Approved: follow the vehicle as it sets off on its route.
+    const unit = approve && !problem ? units.find((u) => u.id === d.assignments?.[0]?.resource_id) : null;
+    if (unit) mapRef.current?.focus(unit.lon, unit.lat);
+  };
   const destinationName = (unit: LiveUnit) =>
     unit.destination
       ? (unit.destination.building_id && mapRef.current?.buildingName(unit.destination.building_id)) ||
@@ -322,6 +346,71 @@ function App() {
         </section>
 
         <aside className="right-column">
+          <section className="panel incidents-panel">
+            <div className="panel-heading">
+              <div>
+                <AlertTriangle size={14} />
+                <span>INCIDENTS · PRIORITY</span>
+              </div>
+              <span className={pending.length ? "observed proposals-waiting" : "observed"}>
+                {pending.length ? `${pending.length} TO APPROVE` : `${queue.length} OPEN`}
+              </span>
+            </div>
+            <div className="incident-list">
+              {queue.map(({ incident, priority, trapped, critical, injured, waiting }, index) => {
+                const proposals = pending.filter((d) => d.incident_id === incident.id);
+                const onIt = units.filter((u) => u.destination?.incident_id === incident.id && u.status !== "available");
+                const where = incident.building_id ? mapRef.current?.buildingName(incident.building_id) : null;
+                const at = incident.location?.coordinates;
+                return (
+                  <div className={`incident-row priority-${priority}${waiting ? " has-proposal" : ""}`} key={incident.id}>
+                    <button className="incident-main" onClick={() => at && mapRef.current?.focus(at[0], at[1])}>
+                      <span className="incident-rank">{index + 1}</span>
+                      <span className={`priority-badge priority-${priority}`}>{priority.toUpperCase()}</span>
+                      <strong>
+                        {[trapped && `${trapped} trapped`, critical && `${critical} critical`, injured && `${injured} injured`]
+                          .filter(Boolean).join(" · ") || "Damage, no casualties known"}
+                      </strong>
+                      <small>
+                        {where ?? "Location from reports"} · {incident.status} · {incident.evidence?.supports.length ?? 0} report
+                        {(incident.evidence?.supports.length ?? 0) === 1 ? "" : "s"}
+                        {onIt.length ? ` · ${onIt.map((u) => UNIT_LABEL[u.type] ?? u.type).join(", ")} on it` : ""}
+                      </small>
+                    </button>
+                    {proposals.map((d) => {
+                      const unit = d.assignments?.[0]?.resource_id ?? "";
+                      const state = acting[d.id];
+                      return (
+                        <div className="proposal" key={d.id}>
+                          <span>
+                            Agent proposes <b>{unitName(unit)}</b>
+                            {d.eta_s != null ? ` · ETA ${Math.max(1, Math.round(d.eta_s / 60))} min` : ""}
+                          </span>
+                          {state && state !== "done" && state !== "sending" && state !== "rejecting"
+                            ? <em className="proposal-error">{state}</em>
+                            : (
+                              <span className="proposal-actions">
+                                <button className="approve" disabled={Boolean(state)} onClick={() => decide(d, incident, true)}>
+                                  <Check size={12} /> {state === "sending" ? "Sending…" : "Approve"}
+                                </button>
+                                <button className="reject" disabled={Boolean(state)} onClick={() => decide(d, incident, false)}>
+                                  <X size={12} /> Reject
+                                </button>
+                              </span>
+                            )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+              {queue.length === 0 && (
+                <div className="panel-empty">
+                  {runId ? "No incidents yet. The agents build them from the reports as they come in." : "No run is playing."}
+                </div>
+              )}
+            </div>
+          </section>
           <section className="panel progress-panel">
             <div className="panel-heading">
               <div>
