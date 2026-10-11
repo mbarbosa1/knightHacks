@@ -28,10 +28,11 @@ Every batch is logged to Neon as an ops.agent_runs row (agent 'orchestrator') wi
 tool calls and errors. Each agent's own entry (agent = its name, output = its final answer, or its error) is
 written here too: the agent's log_agent_run(input_ref) call only tells us which report it got to.
 '''
-import argparse, concurrent.futures, pathlib, time
+import argparse, concurrent.futures, math, pathlib, time
 from agents.llm import run_agent
 from agents.tools import RunTools
 from agents.loader import load_agent
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 _in_agent = load_agent('assesmentAgent/in-agent/in_agent.py')
 InAgent, IN_AGENT = _in_agent.InAgent, _in_agent.AGENT
@@ -58,6 +59,71 @@ RESPONSE_AGENTS = {
 }
 
 
+class MedicalLocation(BaseModel):
+    model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
+    longitude: float = Field(ge=-180, le=180)
+    latitude: float = Field(ge=-90, le=90)
+
+    @field_validator('longitude', 'latitude', mode='before')
+    @classmethod
+    def reject_boolean(cls, value):
+        if isinstance(value, bool):
+            raise ValueError('coordinates must be numbers, not booleans')
+        return value
+
+
+class MedicalPlace(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    name: str | None = None
+    building_id: str | None = None
+    location: MedicalLocation | None = None
+    trapped: StrictInt | None = Field(default=None, ge=0, le=2**31 - 1)
+    critical: StrictInt | None = Field(default=None, ge=0, le=2**31 - 1)
+    injured: StrictInt | None = Field(default=None, ge=0, le=2**31 - 1)
+    priority: StrictInt = Field(ge=1, le=3)
+    why: str = ''
+    observation_ids: list[str] = Field(min_length=1)
+
+    @field_validator('location', mode='before')
+    @classmethod
+    def no_point_is_no_location(cls, value):
+        """A vague report has no point; the model writes that as {longitude: null, latitude: null}."""
+        if isinstance(value, dict) and value.get('longitude') is None and value.get('latitude') is None:
+            return None
+        return value
+
+    @field_validator('trapped', 'critical', 'injured', 'priority', mode='before')
+    @classmethod
+    def parse_integer_string(cls, value):
+        if isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
+            return int(value.strip())
+        return value
+
+
+class MedicalOutput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    situation_summary: str = ''
+    places: list[MedicalPlace]
+
+
+def validate_medical_output(output, batch):
+    """Validate the entire result before logging success or changing the queue."""
+    result = MedicalOutput.model_validate(output).model_dump()
+    by_id = {record['observation_id']: record for record in batch}
+    for place in result['places']:
+        if any(source not in by_id for source in place['observation_ids']):
+            raise ValueError('medical observation_ids must come from the current batch')
+        candidates = {
+            candidate['building_id']
+            for source in place['observation_ids']
+            for candidate in (by_id[source].get('location') or {}).get('building_candidates', [])
+            if (by_id[source].get('location') or {}).get('precision') in ('gps', 'address')
+        }
+        if place['building_id'] not in candidates:
+            place['building_id'] = None
+    return result
+
+
 class Orchestrator:
     def __init__(self, run_id, instructions_override=None, batch_size=3, in_workers=6, parallel_batches=4):
         self.in_agent = InAgent.for_run(run_id)
@@ -67,7 +133,9 @@ class Orchestrator:
         self.in_workers = in_workers
         self.parallel_batches = parallel_batches  # assessment batches in flight at once
         self._respond_lock = __import__('threading').Lock()   # one response agent run at a time
+        self._queue_lock = __import__('threading').Lock()     # the medical queue, updated by parallel batches
         self.cursor = None                        # last observation id handed to the assessment agents
+        self.medical_queue = []                   # places with hurt people, from medical_agent; local only, never saved
         self.assessment = {}                      # name -> (instructions, tool names) for agents that exist
         for name, (path, tools) in ASSESSMENT_AGENTS.items():
             md = pathlib.Path((instructions_override or {}).get(name) or AGENTS_DIR / path)
@@ -105,11 +173,16 @@ class Orchestrator:
         Each agent's run() also writes its ops.agent_runs entry (its answer, or its error)."""
         def one(name):
             instructions, _ = self.assessment[name]
-            return name, ASSESSMENT_MODULES[name].run(self.tools, batch, cursor, instructions)
+            validate = validate_medical_output if name == 'medical_agent' else None   # Camila: check before saving
+            return name, ASSESSMENT_MODULES[name].run(self.tools, batch, cursor, instructions, validate=validate)
 
         with concurrent.futures.ThreadPoolExecutor(max(1, len(self.assessment))) as pool:
             results = dict(pool.map(one, self.assessment))
         self.cursor = batch[-1]['observation_id']
+        medical = (results.get('medical_agent') or {}).get('output')
+        with self._queue_lock:                      # batches run in parallel
+            for place in (medical or {}).get('places', []):
+                self.add_to_medical_queue(place)
         return results
 
     def assess_and_log(self, batch, number):
@@ -240,6 +313,27 @@ class Orchestrator:
                                   and any(x['incident_id'] == i['incident_id'] for i in situation['incidents'])]
         return situation
 
+    # ---- medical queue: where people need help, most urgent first (in memory) ----
+
+    def add_to_medical_queue(self, place):
+        """Add one place from medical_agent, or merge it into the same place already queued (same building, or
+        within 100 m when there is no building). Two reports of "3 trapped" are the same 3 people, so counts
+        keep the highest reported, not the sum; priority keeps the most urgent."""
+        place = MedicalPlace.model_validate(place).model_dump()
+        same = next((q for q in self.medical_queue if _same_place(q, place)), None)
+        if same is None:
+            self.medical_queue.append(place)
+        else:
+            for k in ('trapped', 'critical', 'injured'):
+                counts = [v for v in (same.get(k), place.get(k)) if v is not None]
+                same[k] = max(counts) if counts else None
+            if place['priority'] < same['priority']:   # the more urgent report describes the place
+                same.update(priority=place['priority'], why=place.get('why') or same.get('why'),
+                            name=place.get('name') or same.get('name'))
+            same['observation_ids'] += [o for o in place['observation_ids'] if o not in same['observation_ids']]
+            same['building_id'] = same.get('building_id') or place.get('building_id')
+        self.medical_queue.sort(key=_queue_order)
+
     # ---- one pass over everything new ---------------------------------------
 
     # ---- the queue ------------------------------------------------------------
@@ -271,9 +365,20 @@ class Orchestrator:
             done = list(pool.map(self.assess_and_log, batches, range(1, len(batches) + 1)))
         assessed = sum(len(b) for b, ok in zip(batches, done) if ok)
         if assessed:
+            self.print_medical_queue()
             with self._respond_lock:
                 self.respond()   # anything the batches left (e.g. units that came free meanwhile)
         return len(reports) + assessed
+
+    def print_medical_queue(self, top=10):
+        if 'medical_agent' not in self.assessment:
+            return
+        print(f'Medical queue ({len(self.medical_queue)} places, most urgent first):', flush=True)
+        for n, q in enumerate(self.medical_queue[:top], 1):
+            counts = ', '.join(f'{q[k]} {k}' for k in ('critical', 'trapped', 'injured') if q.get(k)) or 'number unknown'
+            where = q.get('name') or q.get('building_id') or q.get('location')
+            print(f'  {n}. [P{q["priority"]}] {where}: {counts}. {q.get("why") or ""}', flush=True)
+
 
     def watch(self, interval_s=10, chunk=10):
         """Keep going while reports arrive. Each cycle takes at most `chunk` new reports, so the first incidents
@@ -283,6 +388,25 @@ class Orchestrator:
             if not self.cycle(chunk):
                 self.respond()   # no new reports, but a unit may have come free or reported from the scene
                 time.sleep(interval_s)
+
+
+def _queue_order(q):
+    """Priority first, then most people trapped or critical, then most injured. A place where people were
+    reported with no number counts as at least one, so "people trapped" isn't ranked below "1 injured"."""
+    counts = [q.get(k) for k in ('critical', 'trapped', 'injured')]
+    serious = (q.get('critical') or 0) + (q.get('trapped') or 0) or (1 if all(c is None for c in counts) else 0)
+    return q['priority'], -serious, -(q.get('injured') or 0)
+
+
+def _same_place(a, b, within_m=100):
+    if a.get('building_id') and b.get('building_id'):
+        return a['building_id'] == b['building_id']
+    la, lb = a.get('location') or {}, b.get('location') or {}
+    if None in (la.get('longitude'), la.get('latitude'), lb.get('longitude'), lb.get('latitude')):
+        return False
+    dx = (la['longitude'] - lb['longitude']) * 111_320 * math.cos(math.radians(la['latitude']))
+    dy = (la['latitude'] - lb['latitude']) * 110_540
+    return math.hypot(dx, dy) <= within_m
 
 
 def _summary(result):

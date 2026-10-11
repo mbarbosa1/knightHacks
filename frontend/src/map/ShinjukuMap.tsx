@@ -506,6 +506,26 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
     });
   }, [view, truth, operational, ready]);
 
+  // The whole route appears at once; as the vehicle drives, the line is cut at the vehicle every frame, so it
+  // always runs from where the vehicle is drawn to the destination and shrinks smoothly behind it.
+  const latest = useRef<{ units: LiveUnit[]; view: MapView }>({ units: [], view: "operational" });
+  const drawRoutes = () => {
+    const routes = mapRef.current?.getSource("routes") as GeoJSONSource | undefined;
+    if (!routes) return;
+    const driving = latest.current.view === "operational"
+      ? latest.current.units.filter((u) => u.status === "en_route" && u.route && u.route.length > 1) : [];
+    routes.setData({
+      type: "FeatureCollection",
+      features: driving.map((unit) => {
+        const at = unitMarkers.current.get(unit.id)?.getLngLat();
+        // unit.route starts where the simulator last placed the vehicle; the marker glides toward that point.
+        const coords: [number, number][] = at ? [[at.lng, at.lat], ...unit.route!] : unit.route!;
+        return { type: "Feature", geometry: { type: "LineString", coordinates: coords },
+                 properties: { id: unit.id, color: UNIT_COLOR[unit.type] ?? UNIT_COLOR.police } };
+      }),
+    });
+  };
+
   // A unit's position arrives twice a second; in between, its marker glides there instead of jumping.
   const glides = useRef(new Map<maplibregl.Marker, { from: [number, number]; to: [number, number]; start: number }>());
   const glide = (marker: maplibregl.Marker, to: [number, number]) => {
@@ -520,6 +540,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
         marker.setLngLat([g.from[0] + (g.to[0] - g.from[0]) * t, g.from[1] + (g.to[1] - g.from[1]) * t]);
         if (t >= 1) glides.current.delete(marker);
       }
+      if (glides.current.size) drawRoutes();   // vehicles moved this frame: keep each line attached to its vehicle
       frame = requestAnimationFrame(step);
     };
     frame = requestAnimationFrame(step);
@@ -557,16 +578,8 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
       el.classList.toggle("map-unit-free", unit.status === "available");
       el.title = `${unit.name}: ${UNIT_STATUS[unit.status] ?? unit.status}${unit.helped ? `, ${unit.helped} helped` : ""}`;
     }
-    (map.getSource("routes") as GeoJSONSource).setData({
-      type: "FeatureCollection",
-      features: shown
-        .filter((unit) => unit.status === "en_route" && unit.route)
-        .map((unit) => ({
-          type: "Feature",
-          geometry: { type: "LineString", coordinates: unit.route! },
-          properties: { id: unit.id, color: UNIT_COLOR[unit.type] ?? UNIT_COLOR.police },
-        })),
-    });
+    latest.current = { units: shown, view };
+    drawRoutes();
   }, [view, units, ready]);
 
   useEffect(() => {

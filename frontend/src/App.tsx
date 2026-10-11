@@ -129,6 +129,17 @@ function App() {
     [mapState?.operational.incidents, decisions],
   );
   const pending = decisions.filter((d) => d.status === "draft");
+  // Finished jobs and incidents the operator cleared from the panels (this tab only; nothing is deleted).
+  const [dismissed, setDismissed] = useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(window.sessionStorage.getItem("kyu-dismissed") ?? "[]")); } catch { return new Set(); }
+  });
+  const dismiss = (key: string) => setDismissed((old) => {
+    const next = new Set(old).add(key);
+    try { window.sessionStorage.setItem("kyu-dismissed", JSON.stringify([...next])); } catch { /* storage off */ }
+    return next;
+  });
+  const jobKey = (u: LiveUnit) => `job:${u.id}:${u.decision?.id ?? ""}`;
+  const jobsFor = (incidentId: string) => units.filter((u) => u.destination?.incident_id === incidentId);
   const [acting, setActing] = useState<Record<string, string>>({});   // decision id -> "sending" | error text
   const decide = async (d: Decision, incident: BelievedIncident, approve: boolean) => {
     if (!runId) return;
@@ -357,8 +368,11 @@ function App() {
               </span>
             </div>
             <div className="incident-list">
-              {queue.map(({ incident, priority, trapped, critical, injured, waiting }, index) => {
+              {queue.filter(({ incident }) => !dismissed.has(`incident:${incident.id}`))
+                .map(({ incident, priority, trapped, critical, injured, waiting }, index) => {
                 const proposals = pending.filter((d) => d.incident_id === incident.id);
+                const jobs = jobsFor(incident.id);
+                const allDone = jobs.length > 0 && !waiting && jobs.every((u) => u.status === "available");
                 const onIt = units.filter((u) => u.destination?.incident_id === incident.id && u.status !== "available");
                 const where = incident.building_id ? mapRef.current?.buildingName(incident.building_id) : null;
                 const at = incident.location?.coordinates;
@@ -377,6 +391,21 @@ function App() {
                         {onIt.length ? ` · ${onIt.map((u) => UNIT_LABEL[u.type] ?? u.type).join(", ")} on it` : ""}
                       </small>
                     </button>
+                    {jobs.length > 0 && (
+                      <div className="incident-jobs">
+                        {jobs.map((u) => (
+                          <span key={u.id} className={`job job-${u.status}`}>
+                            {UNIT_LETTER_LABEL[u.type] ?? "U"} {u.status === "en_route" ? "on the way"
+                              : u.status === "busy" ? "on scene" : `done${u.helped ? ` · ${u.helped} helped` : ""}`}
+                          </span>
+                        ))}
+                        {allDone && (
+                          <button className="dismiss" title="Clear from the list" onClick={() => dismiss(`incident:${incident.id}`)}>
+                            <X size={11} /> Units done
+                          </button>
+                        )}
+                      </div>
+                    )}
                     {proposals.map((d) => {
                       const unit = d.assignments?.[0]?.resource_id ?? "";
                       const state = acting[d.id];
@@ -521,9 +550,20 @@ function App() {
                   <strong>{unit.name}</strong>
                   <span className={unit.status === "available" ? "team-ready" : "team-enroute"}>{unitState(unit)}</span>
                   <span className="team-eta">{unit.decision ? `v${unit.decision.version}` : "—"}</span>
-                  {unit.destination && (
+                  {unit.destination && unit.status === "available" && !dismissed.has(jobKey(unit)) && (
+                    <div className="team-route team-done">
+                      <span>DONE</span>
+                      {destinationName(unit)}
+                      <b>{unit.helped ? `${unit.helped} helped` : ""}</b>
+                      <span className="dismiss" role="button" title="Clear this finished job"
+                            onClick={(event) => { event.stopPropagation(); dismiss(jobKey(unit)); }}>
+                        <X size={11} />
+                      </span>
+                    </div>
+                  )}
+                  {unit.destination && unit.status !== "available" && (
                     <div className="team-route">
-                      <span>{unit.status === "available" ? "WAS AT" : unit.status === "busy" ? "AT" : "TO"}</span>
+                      <span>{unit.status === "busy" ? "AT" : "TO"}</span>
                       {destinationName(unit)}
                       <b>{unit.helped ? `${unit.helped} helped` : ""}</b>
                     </div>
@@ -611,6 +651,8 @@ function App() {
     </div>
   );
 }
+
+const UNIT_LETTER_LABEL: Record<string, string> = { fire_engine: "Engine", ambulance: "Ambulance", police: "Patrol" };
 
 function KyuBotMark() {
   return (

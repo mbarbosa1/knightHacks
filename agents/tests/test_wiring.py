@@ -76,6 +76,7 @@ class FakeTools:
 
     def log_agent_run(self, agent, input_ref, output, duration_ms=None, run_key=None):
         self.logged.append((agent, input_ref, output))
+        return {'id': f'{agent}-audit'}
 
 
 def fake_orchestrator(agents):
@@ -83,26 +84,32 @@ def fake_orchestrator(agents):
     orch.run_id, orch.cursor, orch.tools = 'run', None, FakeTools()
     orch.assessment = {name: ('instructions', ['log_agent_run']) for name in agents}
     orch.response, orch._responded_to, orch._respond_lock = {}, None, __import__('threading').Lock()
+    orch.medical_queue, orch._queue_lock = [], __import__('threading').Lock()
     return orch
 
 
 def test_orchestrator_logs_each_agents_final_answer(monkeypatch):
     def agent(instructions, payload, specs, functions):
         functions['log_agent_run'](input_ref='obs2')
-        return {'output': {'incidents': [{'incident_id': 'i1'}], 'situation_summary': 'ok'}, 'tool_calls': [], 'steps': 2}
+        return {'output': {'incidents': [{'incident_id': 'i1'}], 'situation_summary': 'ok'}
+                if 'detect' in instructions else {'places': [], 'situation_summary': 'ok'},
+                'tool_calls': [], 'steps': 2}
     monkeypatch.setattr(runner, 'run_agent', agent)
     orch = fake_orchestrator(['detect_agent', 'medical_agent'])
+    orch.assessment['detect_agent'] = ('detect', ['log_agent_run'])
     results = orch.assess([{'observation_id': 'obs1'}, {'observation_id': 'obs2'}])
     assert set(results) == {'detect_agent', 'medical_agent'} and orch.cursor == 'obs2'
-    assert sorted(orch.tools.logged) == [(n, 'obs2', {'incidents': [{'incident_id': 'i1'}], 'situation_summary': 'ok'})
-                                         for n in ('detect_agent', 'medical_agent')]
+    assert sorted(orch.tools.logged) == [
+        ('detect_agent', 'obs2', {'incidents': [{'incident_id': 'i1'}], 'situation_summary': 'ok'}),
+        ('medical_agent', 'obs2', {'places': [], 'situation_summary': 'ok'})]
+    assert results['medical_agent']['audit_id'] == 'medical_agent-audit'
 
 
 def test_orchestrator_logs_a_failed_agent_and_keeps_the_others(monkeypatch):
     def agent(instructions, payload, specs, functions):
         if 'boom' in instructions:
             raise RuntimeError('model server error 500')
-        return {'output': {'incidents': []}, 'tool_calls': [], 'steps': 1}
+        return {'output': {'places': []}, 'tool_calls': [], 'steps': 1}
     monkeypatch.setattr(runner, 'run_agent', agent)
     orch = fake_orchestrator(['detect_agent', 'medical_agent'])
     orch.assessment['detect_agent'] = ('boom', ['log_agent_run'])
@@ -110,7 +117,7 @@ def test_orchestrator_logs_a_failed_agent_and_keeps_the_others(monkeypatch):
     assert 'error' in results['detect_agent'] and 'error' not in results['medical_agent']
     logged = dict((a, out) for a, _, out in orch.tools.logged)
     assert logged['detect_agent'] == {'error': 'RuntimeError: model server error 500'}
-    assert logged['medical_agent'] == {'incidents': []}
+    assert logged['medical_agent'] == {'places': [], 'situation_summary': ''}
 
 
 # ---- write tools check their input before any database call ----------------------

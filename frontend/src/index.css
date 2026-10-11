@@ -2843,3 +2843,43 @@ detail-tags span {
 .map-unit-free {
     opacity: 0.5;
 }
+
+/* Each unit's job on an incident, and clearing finished ones */
+.incident-jobs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    padding: 0 8px 7px 30px;
+}
+
+.job {
+    padding: 1px 6px;
+    border-radius: 3px;
+    font: 9.5px "DM Mono", monospace;
+    color: var(--text-secondary);
+    background: var(--surface-subtle);
+    border: 1px solid var(--border);
+}
+
+.job-en_route { color: #0b5f6e; border-color: #a8d8e0; background: #eef9fb; }
+.job-busy { color: #8a3c08; border-color: #f5c08a; background: #fff4e6; }
+.job-available { color: #1f6b35; border-color: #b6dfc1; background: #effaf2; }
+
+.dismiss {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    margin-left: auto;
+    padding: 1px 6px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text-muted);
+    background: var(--surface);
+    font: 9.5px "DM Sans", sans-serif;
+    cursor: pointer;
+}
+
+.dismiss:hover { color: var(--text-primary); border-color: var(--text-muted); }
+
+.team-done > span:first-child { color: #1f6b35; }

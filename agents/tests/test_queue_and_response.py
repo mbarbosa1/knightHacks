@@ -39,6 +39,7 @@ def queue_orchestrator(records, assessed=()):
     orch.run_id, orch.cursor, orch.batch_size, orch.in_workers, orch.parallel_batches = 'run', None, 2, 1, 3
     orch.tools = QueueTools(records, assessed)
     orch.response, orch._responded_to, orch._respond_lock = {}, None, __import__('threading').Lock()   # no response agent here
+    orch.medical_queue, orch._queue_lock = [], __import__('threading').Lock()
     orch.assessment = {n: ('instructions', ['log_agent_run']) for n in ('detect_agent', 'medical_agent')}
     return orch
 
@@ -74,7 +75,7 @@ def test_one_agent_failing_still_completes_the_batch(monkeypatch):
     def half(instructions, payload, specs, functions):
         if half.calls.append(1) or len(half.calls) % 2:
             raise RuntimeError('one down')
-        return {'output': {}, 'tool_calls': [], 'steps': 1}
+        return {'output': {'places': [], 'situation_summary': ''}, 'tool_calls': [], 'steps': 1}   # valid for both
     half.calls = []
     monkeypatch.setattr(runner, 'run_agent', half)
     orch = queue_orchestrator(RECORDS[:2])
