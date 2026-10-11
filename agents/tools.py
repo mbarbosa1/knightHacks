@@ -182,14 +182,22 @@ class RunTools:
                 'WHERE run_id = %s ORDER BY road_id', (self.run_id,)).fetchall())
 
     def upsert_incident(self, status, location=None, uncertainty_m=None, building_id=None,
-                        person_groups=None, evidence=None, incident_id=None, sim_time_s=None):
+                        person_groups=None, evidence=None, incident_id=None, sim_time_s=None, **extra):
         """Create (no incident_id) or replace (incident_id given) one incident. Pass the FULL new state:
         this replaces the incident, it does not merge. Returns the stored incident.
+
+        No duplicates: a create for something this run already has (an incident citing one of the same
+        reports, or on the same building) is merged into that incident instead, and the result says
+        "merged_into_existing": true. Agents running in parallel (detect ‖ medical) both try to create the
+        incident for a new report; a per-run lock makes the check-and-create one step.
 
         location {longitude, latitude}; person_groups [{group_id, est_count, condition, needs, confidence}];
         evidence {supports: [observation ids], contradicts: [observation ids]}."""
         if status not in INCIDENT_STATUSES:
             raise ToolError(f'status must be one of {INCIDENT_STATUSES}, got {status!r}')
+        if incident_id is not None and not _is_uuid(incident_id):
+            raise ToolError(f'incident_id {incident_id!r} is not an incident id: use an id from list_incidents or '
+                            f'find_nearby_incidents to update, or leave incident_id out to create a new incident')
         evidence = {'supports': list((evidence or {}).get('supports') or []),
                     'contradicts': list((evidence or {}).get('contradicts') or [])}
         group_ids = [g.get('group_id') for g in person_groups or []]
@@ -198,10 +206,28 @@ class RunTools:
         lon, lat = (location or {}).get('longitude'), (location or {}).get('latitude')
         if (lon is None) != (lat is None):
             raise ToolError('location needs both longitude and latitude, or neither')
-        new_id = incident_id or str(uuid.uuid4())
+        new_id, merged = incident_id or str(uuid.uuid4()), False
         with _db() as conn:
             self._require_live(conn)
             self._require_observations(conn, evidence['supports'] + evidence['contradicts'])
+            if incident_id is None:
+                conn.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', ('incidents:' + self.run_id,))
+                existing = conn.execute(
+                    '''SELECT id, status, building_id, uncertainty_m, person_groups, evidence,
+                              public.ST_X(geom) AS lon, public.ST_Y(geom) AS lat
+                       FROM ops.incidents
+                       WHERE run_id = %s AND (evidence->'supports' ?| %s::text[] OR (%s::text IS NOT NULL AND building_id = %s))
+                       ORDER BY created_at LIMIT 1''',
+                    (self.run_id, evidence['supports'], building_id, building_id)).fetchone()
+                if existing:
+                    new_id, merged = str(existing['id']), True
+                    building_id = building_id or existing['building_id']
+                    if lon is None and existing['lon'] is not None:
+                        lon, lat = existing['lon'], existing['lat']
+                    uncertainty_m = uncertainty_m if uncertainty_m is not None else existing['uncertainty_m']
+                    person_groups = _merge_groups(existing['person_groups'], person_groups)
+                    old = existing['evidence'] or {}
+                    evidence = {k: list(dict.fromkeys((old.get(k) or []) + evidence[k])) for k in ('supports', 'contradicts')}
             try:
                 row = conn.execute(
                     f'''INSERT INTO ops.incidents AS i (id, run_id, geom, uncertainty_m, status, building_id, person_groups, evidence)
@@ -224,10 +250,12 @@ class RunTools:
                                         (new_id, self.run_id)).fetchone()
                 if existing is None:
                     raise ToolError(f'incident {new_id} belongs to another run')
-                return _json(existing)
+                return {**_json(existing), **({'merged_into_existing': True} if merged else {})}
             row = dict(row)
             _event(conn, self.run_id, 'incidents', new_id, 'INSERT' if row.pop('created') else 'UPDATE', row, sim_time_s)
-            return _json(row)
+            return {**_json(row), **({'merged_into_existing': True} if merged else {}),
+                    **({'ignored_fields': sorted(extra), 'note': 'incidents do not store these fields; '
+                        'put them (e.g. prediction, priority) in your final answer'} if extra else {})}
 
     def set_road_restriction(self, road_id, status, source_observation_id=None, sim_time_s=None):
         """Mark one road segment OPEN / LIMITED / BLOCKED (both directions of a street are separate ids).
@@ -431,6 +459,21 @@ class RunTools:
                                (self.run_id, agent)).fetchone()
             return _json(row) if row else None
 
+    def agent_outputs(self, agent):
+        """This agent's successful outputs in this run, oldest first (e.g. in_agent records for a later agent)."""
+        with _db() as conn:
+            return [r['output'] for r in conn.execute(
+                "SELECT output FROM ops.agent_runs WHERE run_id = %s AND agent = %s AND output->>'error' IS NULL "
+                'ORDER BY created_at', (self.run_id, agent)).fetchall()]
+
+    def assessed_observations(self):
+        """Observation ids in a completed assessment batch (the orchestrator's queue bookkeeping)."""
+        with _db() as conn:
+            return {r['o'] for r in conn.execute(
+                """SELECT jsonb_array_elements_text(output->'observation_ids') AS o FROM ops.agent_runs
+                   WHERE run_id = %s AND agent = 'orchestrator' AND output->>'stage' = 'assessment'
+                     AND coalesce((output->>'complete')::boolean, true)""", (self.run_id,)).fetchall()}
+
     def processed_inputs(self, agent):
         """input_ref of every successful entry of this agent (output.error is null): work already done."""
         with _db() as conn:
@@ -553,6 +596,23 @@ TOOL_SPECS = {
                       {'input_ref': {'type': 'string', 'description': 'last observation id you processed'}},
                       ['input_ref']),
 }
+
+
+def _is_uuid(value):
+    try:
+        uuid.UUID(str(value))
+        return True
+    except ValueError:
+        return False
+
+
+def _merge_groups(old, new):
+    """Person groups of two writers for one incident: same group_id -> the newer one, others kept."""
+    if new is None:
+        return old
+    groups = {g.get('group_id'): g for g in old or []}
+    groups.update({g['group_id']: g for g in new})
+    return list(groups.values())
 
 
 SECOND_ENGINE_FROM = 8   # trapped people from which a second engine is worth sending

@@ -1,7 +1,7 @@
 """End to end on a real, live run: the model on the AMD server (tunnel open), ./dev.sh, Neon.
 Skipped unless AGENTS_LIVE_RUN=<run_id> is set:
 
-    AGENTS_LIVE_RUN=<run_id> .venv/bin/python -m pytest agents/tests -m live -s
+    AGENT_LLM=on AGENTS_LIVE_RUN=<run_id> .venv/bin/python -m pytest agents/tests -m live -s
 """
 import os
 import pytest
@@ -33,4 +33,5 @@ def test_assessment_agents_run_on_one_report(agent):
     batch = [agent.normalize(report)]
     for name, result in orch.assess(batch).items():
         assert 'error' not in result, f'{name}: {result.get("error")}'
-        assert any(c['tool'] == 'log_agent_run' and c['ok'] for c in result['tool_calls']), f'{name} did not log its run'
+        assert isinstance(result['output'], dict) and 'incidents' in result['output'], f'{name}: no hand-off JSON'
+        # log_agent_run(input_ref) is optional for the model: the runner writes every agent's ops.agent_runs entry

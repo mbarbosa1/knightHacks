@@ -149,4 +149,4 @@ which plans on believed road status: `incidents_to_cover`, `dispatch_units`, `di
   | `invalidate_decision(decision_id, reason)` | status `invalidated` + `invalidated_reason` | `ops.decisions` |
 
   Every routing tool plans on the agents' beliefs (`list_road_restrictions`), never on truth.
-- `assesmentAgent/detect-agent/detect_tools.py` is replaced by `agents/tools.py`.
+- Each agent folder has its instructions and code: `detect-agent/detect_agent.py`, `medical-agent/medical_agent.py` (tool lists live there), and `assessment-coordinator/assessment_coordinator.py` merges their answers. `detect_tools.py` was removed (replaced by `agents/tools.py`).

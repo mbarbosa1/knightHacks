@@ -19,7 +19,7 @@ Each record is saved in Neon as one ops.agent_runs row (agent 'in_agent', input_
 its ops.operational_events row (needs AGENTS_DATABASE_URL in backend/.env). Re-running is safe: reports
 with a successful record are skipped, failed ones are retried and their entry replaced.
 '''
-import argparse, collections, concurrent.futures, pathlib, sys, time
+import argparse, collections, concurrent.futures, json, pathlib, sys, time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))   # repo root, when run as a script
 from agents.llm import ask_json  # noqa: E402
 from agents.tools import RunTools  # noqa: E402
@@ -131,6 +131,58 @@ def locate(obs, reading, tools):
 
 
 # =============================================================================
+# 2b. UNIT REPORTS (code only): rescue units send exact facts as JSON (channel responder_update,
+#     simulation/sim/units.py). Read them directly: instant, never misread, exact building / road ids.
+# =============================================================================
+
+DAMAGE_TO_EVENT = {'collapsed': 'building_collapse', 'severe': 'building_damage', 'moderate': 'building_damage',
+                   'light': 'building_damage', 'none': 'no_damage', None: 'other'}
+
+
+def read_unit_report(obs):
+    """(reading, location) for a responder_update, or None when its text is not the units' JSON."""
+    try:
+        facts = json.loads(obs['original_text'])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(facts, dict):
+        return None
+    action, n = facts.get('action'), lambda k: facts.get(k) if isinstance(facts.get(k), int) else None
+    trapped = n('still_trapped') if action == 'rescued' else n('trapped')
+    critical = n('still_critical') if action == 'treated' else n('critical')
+    injured = (critical or 0) + (n('injured') or 0) if critical is not None or n('injured') is not None else None
+    if facts.get('status') in ('BLOCKED', 'LIMITED'):
+        event = 'road_blocked' if facts['status'] == 'BLOCKED' else 'road_limited'
+    elif action == 'assessed':
+        event = DAMAGE_TO_EVENT.get(facts.get('damage_level'), 'other')
+    elif trapped:
+        event = 'people_trapped'
+    elif critical:
+        event = 'injuries'
+    else:
+        event = 'no_damage' if action == 'nothing_found' else 'other'
+    reading = {
+        'event_type': event, 'summary_en': obs.get('text_en') or obs['original_text'],
+        'building': {'type': None, 'floors': None, 'name': None},
+        'people': {'trapped': trapped, 'injured': injured, 'unhurt_evacuated': None,
+                   'count_is_estimate': False if trapped is not None or injured is not None else None,
+                   'trapped_mentioned': bool(trapped), 'injured_mentioned': bool(injured)},
+        'hazards': [], 'secondhand': False, 'urgency': 5 if (trapped or critical) else 2 if event != 'no_damage' else 1,
+        'model_confidence': 1.0,
+        'unit_report': facts,           # the raw facts: action, count, unit_id ... for detect / medical
+    }
+    lon, lat = obs.get('longitude'), obs.get('latitude')
+    roads = facts.get('road_ids') or ([facts['road_id']] if facts.get('road_id') else [])
+    location = {'stated': None, 'precision': 'exact', 'point': [lon, lat] if lon is not None else None,
+                'uncertainty_m': 0, 'street_name': None,
+                'building_candidates': [{'building_id': facts['building_id'], 'distance_m': 0.0, 'fits_description': True}]
+                                       if facts.get('building_id') else [],
+                'buildings_fitting_description': 1 if facts.get('building_id') else None,
+                'road_candidates': [{'road_id': r, 'distance_m': 0.0, 'name_match': None} for r in roads]}
+    return reading, location
+
+
+# =============================================================================
 # 3. THE AGENT
 # =============================================================================
 
@@ -156,9 +208,14 @@ class InAgent:
                   'lang': obs['lang'], 'source_reliability': obs.get('source_reliability'),
                   'sim_time_s': obs.get('sim_time_s'), 'error': None}
         try:
-            reading = read_report(obs, self.instructions)
-            record.update({k: v for k, v in reading.items() if k != 'street_name'})
-            record['location'] = locate(obs, reading, self.tools)
+            unit = read_unit_report(obs) if obs.get('channel') == 'responder_update' else None
+            if unit:                                  # exact facts from a rescue unit: no model call
+                reading, record['location'] = unit
+                record.update(reading)
+            else:
+                reading = read_report(obs, self.instructions)
+                record.update({k: v for k, v in reading.items() if k != 'street_name'})
+                record['location'] = locate(obs, reading, self.tools)
         except Exception as exc:
             record['error'] = f'{type(exc).__name__}: {exc}'
         record['duration_ms'] = int((time.monotonic() - started) * 1000)
