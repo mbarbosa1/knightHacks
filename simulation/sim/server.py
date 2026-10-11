@@ -6,12 +6,17 @@
     GET  /runs/{id}/truth   the same truth again (operator reveal-truth only)
     GET  /runs/{id}/reports the run's reports in arrival order, each with its answer key (operator only)
     GET  /runs/{id}/dispatch units sent by a stand-in dispatcher (sim/standin.py), for designing the map
+    GET  /clock             the live run's clock: simulated time, speed, reports released so far
+    POST /clock             {"speed": 10|20, "playing": true|false}
+    POST /stop              stop the live run and close it
 
 This serves hidden ground truth and has no login: keep it on localhost. Agents must never call it.
 
 With BACKEND_URL set (e.g. http://127.0.0.1:8000), the map comes from Neon through the backend and every
-new run is stored there. POST /runs returns success only after the reports, initial resources and
-readiness receipt commit together. Prepared submissions survive restart and can be retried.
+new run is stored there. POST /runs returns success only after the initial resources and readiness
+receipt commit together. Prepared submissions survive restart and can be retried.
+Reports are not part of that snapshot: the live loop (sim/live.py) releases each one when the run's
+clock reaches it. One run is live at a time; starting another stops and closes the one before.
 The default is Neon mode; SIM_LOCAL_ONLY=1 explicitly selects a local-only developer demo.
 
 SIM_GEMINI=1 has Gemini write the report wording (needs GEMINI_API_KEY; see sim/report_writer.py). It adds up to
@@ -25,6 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from . import databricks_sink
 from .export import run_truth
+from .live import DEFAULT_SPEED, SPEEDS, LiveRun
 from .routing import Router
 from .run import start_run
 from .scenario import MW_RANGE
@@ -50,7 +56,8 @@ async def lifespan(app):
 app = FastAPI(title='Shinjuku simulator', version='0.2.0', lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origin_regex=r'http://(localhost|127\.0\.0\.1):\d+',
                    allow_methods=['GET', 'POST'], allow_headers=['Content-Type'])
-_state = {'storage': None, 'map': None, 'router': None, 'runs': collections.OrderedDict(), 'reports': {}, 'dispatch': {}}
+_state = {'storage': None, 'map': None, 'router': None, 'runs': collections.OrderedDict(), 'reports': {}, 'dispatch': {},
+          'live': None, 'live_storage': None}
 
 
 def _map():
@@ -92,21 +99,54 @@ def saved_view(run_id, name):
         raise HTTPException(404,'Run view not found')
 
 
+def stop_live():
+    """Stop the clock of the run that is live, if any, and close it. One run plays at a time."""
+    live, storage = _state['live'], _state['live_storage']
+    _state['live'] = _state['live_storage'] = None
+    if live is None:
+        return None
+    live.stop()
+    try:
+        storage.end_run(live.run_id, sim_time_s=live.state()['sim_time_s'])
+    except Exception as exc:   # closing is tidying up; never let it block the next earthquake
+        log.warning('run %s: could not be closed (%s)', live.run_id, exc)
+    return live.state()
+
+
+def start_live(run_id, reports, speed):
+    """Start the clock for a run. Reports go to the same place the run was created: Neon through the
+    backend, or local files."""
+    stop_live()
+    storage = ApiStorage(BACKEND_URL) if BACKEND_URL else _map()[0]
+    _state['live_storage'] = storage
+    _state['live'] = LiveRun(run_id, reports, storage, speed=speed).start()
+    return _state['live'].state()
+
+
+class ClockChange(BaseModel):
+    speed: int | None = Field(default=None, description=f'one of {SPEEDS}')
+    playing: bool | None = None
+
+
 class NewRun(BaseModel):
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1, description='omit for a random earthquake')
     mw: float | None = Field(default=None, ge=MW_RANGE[0], le=MW_RANGE[1], description='omit to let the seed pick the magnitude')
+    speed: int = Field(default=DEFAULT_SPEED, description=f'simulated seconds per real second: one of {SPEEDS}')
 
 
 @app.get('/health')
 def health():
     return {'status':'ok','magnitude_range':list(MW_RANGE),'storage_mode':'neon' if BACKEND_URL else 'local-demo',
-            'truth_upload':'databricks' if databricks_sink.enabled() else 'off',
+            'speeds':list(SPEEDS),'truth_upload':'databricks' if databricks_sink.enabled() else 'off',
             'report_wording':'gemini' if GEMINI else 'templates'}
+
 
 
 @app.post('/runs', status_code=201)
 def new_run(body: NewRun):
     """The seed decides depth, epicentre and every damage roll; mw only overrides the magnitude."""
+    if body.speed not in SPEEDS:
+        raise HTTPException(422, f'speed must be one of {list(SPEEDS)}')
     storage, static_map = _map()
     if BACKEND_URL:   # one durable submission per run; save the complete snapshot before success
         storage = ApiStorage(BACKEND_URL, defer_observations=True)
@@ -115,7 +155,9 @@ def new_run(body: NewRun):
         writer = None
         if GEMINI:
             from .report_writer import write_reports as writer
-        truth, sc, _ = start_run(seed, storage=storage, static_map=static_map, mw=body.mw, writer=writer)
+        truth, sc, _ = start_run(seed, storage=storage, static_map=static_map, mw=body.mw, writer=writer,
+                                 release_reports=False)
+
         if BACKEND_URL:
             storage.prepare_ingestion(initial_resources(static_map,truth.run_id))
         data = run_truth(truth,sc,static_map)
@@ -136,6 +178,8 @@ def new_run(body: NewRun):
         _state['runs'][truth.run_id] = data
         _state['reports'][truth.run_id] = report_view
         _state['dispatch'][truth.run_id] = dispatch_view
+        # Only now, with the run confirmed saved, does its clock start and the previous run's stop.
+        data['clock'] = start_live(truth.run_id, truth.reports, body.speed)
     except Exception as exc:
         log.error('Simulation submission failed: %s',exc)
         raise submission_error(storage,exc) from exc
@@ -185,6 +229,29 @@ def truth(run_id: str):
     return _state['runs'][run_id]
 
 
+@app.get('/clock')
+def clock():
+    """The live run's clock. {'run_id': None} when nothing is playing."""
+    live = _state['live']
+    return live.state() if live else {'run_id': None, 'finished': True, 'playing': False}
+
+
+@app.post('/clock')
+def change_clock(body: ClockChange):
+    live = _state['live']
+    if live is None:
+        raise HTTPException(409, 'No run is live')
+    if body.speed is not None and body.speed not in SPEEDS:
+        raise HTTPException(422, f'speed must be one of {list(SPEEDS)}')
+    return live.set(speed=body.speed, playing=body.playing)
+
+
+@app.post('/stop')
+def stop():
+    """Stop the live run and close it (the map's Reset). Safe to call when nothing is playing."""
+    return stop_live() or {'run_id': None, 'finished': True, 'playing': False}
+
+
 @app.post('/runs/{run_id}/retry')
 def retry_submission(run_id: str):
     if not BACKEND_URL:
@@ -195,6 +262,9 @@ def retry_submission(run_id: str):
         data = saved_view(run_id,'truth_view.json')
         data['ingestion'] = storage.resume(run_id)
         _state['runs'][run_id] = data
+        # The save went through this time, so the run's clock starts now, as it would have at Generate.
+        reports = [{'observation': {k: v for k, v in r.items() if k != 'answer'}} for r in saved_view(run_id, 'reports_view.json')]
+        data['clock'] = start_live(run_id, reports, DEFAULT_SPEED)
         return data
     except HTTPException:
         raise

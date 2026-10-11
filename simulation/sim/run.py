@@ -19,10 +19,13 @@ SIMULATOR_VERSION = '0.1.0'
 
 
 def start_run(seed, storage=None, static_map=None, scenario=None, map_version='shinjuku-v1', mw=None, writer=None,
-              save_reports=None):
+              save_reports=None, release_reports=True):
     """writer: optional wording function for generate_reports (e.g. report_writer.write_reports).
     save_reports: optional path for every report with its recipe and links, in the shape of Gerard's sample file.
-    That file holds the answer key, so it is for the simulator team only, never for agents."""
+    That file holds the answer key, so it is for the simulator team only, never for agents.
+    release_reports=False computes everything but saves no reports: the live loop (sim/live.py) releases
+    them on the clock instead. The default releases them all at once, for the command line."""
+
     storage = storage or LocalStorage()
     static_map = static_map or storage.load_static_map(map_version)
     sc = scenario or random_scenario(seed, mw=mw)
@@ -38,7 +41,6 @@ def start_run(seed, storage=None, static_map=None, scenario=None, map_version='s
     compute_building_damage(static_map, sc, truth)
     compute_road_damage(static_map, truth)
     compute_people(static_map, sc, truth)
-    # Until the live loop exists, every report is released at once, stamped with the time it would arrive.
     start = datetime.datetime.fromisoformat(now)
     truth.reports = generate_reports(static_map, sc, truth, writer=writer)
     if save_reports:
@@ -47,7 +49,8 @@ def start_run(seed, storage=None, static_map=None, scenario=None, map_version='s
     for item in truth.reports:
 
         obs = item['observation']
-        storage.save_observation({**obs, 'received_at': (start + datetime.timedelta(seconds=obs['sim_time_s'])).isoformat()})
+        if release_reports:   # all at once, stamped with the time each would have arrived
+            storage.save_observation({**obs, 'received_at': (start + datetime.timedelta(seconds=obs['sim_time_s'])).isoformat()})
         for link in item['links']:
             truth.add_link(obs['id'], link['match_type'], link['truth_entity_type'], link['truth_entity_id'],
                            link['truth_simulation_time_s'])

@@ -38,7 +38,8 @@ import {
 } from "lucide-react";
 import { mockReports, type MockReport, type ReportKind } from "./data/mockReports";
 import { ShinjukuMap, type ShinjukuMapHandle } from "./map/ShinjukuMap";
-import { loadReports, type Observation } from "./map/dataSource";
+import type { MapState } from "./map/ShinjukuMap";
+import type { Report } from "./map/dataSource";
 
 interface Incident {
   id: string;
@@ -89,7 +90,7 @@ const incidents: Incident[] = [
  * eyewitness texts and fire/police radio; Social = social media (CHANNEL_GROUP in simulation/sim/reports.py).
  * Time is simulation time since the earthquake, not a clock time.
  */
-function toReport(o: Observation): MockReport {
+function toReport(o: Report): MockReport {
   const t = Math.max(0, Math.round(o.sim_time_s ?? 0));
   const text = o.text_en ?? o.original_text ?? "";
   return {
@@ -147,18 +148,11 @@ function App() {
   const [dispatched, setDispatched] = useState(false);
   const [utc, setUtc] = useState(new Date());
   const mapRef = useRef<ShinjukuMapHandle>(null);
-  // The saved run the map shows, and its reports from the backend. Until there is one, the sample reports.
-  const [runId, setRunId] = useState<string | null>(null);
-  const [observations, setObservations] = useState<Observation[] | null>(null);
-  useEffect(() => {
-    setObservations(null);
-    if (!runId) return;
-    let cancelled = false;
-    loadReports(runId)
-      .then((rows) => { if (!cancelled) setObservations(rows.length ? rows : null); })
-      .catch((cause) => console.warn("Could not load this run's reports; showing sample reports", cause));
-    return () => { cancelled = true; };
-  }, [runId]);
+  // The map follows the saved run and collects its reports as the live clock releases them into Neon
+  // (Gemini-worded when the simulator runs with SIM_GEMINI=1). The feed shows the same list, so it fills in one
+  // by one. With no saved run on the map yet, the sample reports.
+  const [mapState, setMapState] = useState<MapState | null>(null);
+  const observations: Report[] | null = mapState?.truth?.ingestion?.ready ? mapState.reports : null;
   const reports: MockReport[] = useMemo(
     () => observations
       ? [...observations].sort((a, b) => (b.sim_time_s ?? 0) - (a.sim_time_s ?? 0)).map(toReport)   // newest first
@@ -336,7 +330,11 @@ function App() {
               </button>
             ))}
             {visibleReports.length === 0 && (
-              <div className="empty-state">No reports match this search.</div>
+              <div className="empty-state">
+                {reports.length === 0
+                  ? "No reports yet. They arrive as the simulation clock runs."
+                  : "No reports match this search."}
+              </div>
             )}
           </div>
           <button className="sources-button">
@@ -371,7 +369,7 @@ function App() {
             className="map-panel"
             aria-label="3D simulation map"
           >
-            <ShinjukuMap ref={mapRef} onRunChange={setRunId} />
+            <ShinjukuMap ref={mapRef} onUpdate={setMapState} />
             <div className="map-toolbar">
               <button aria-label="Zoom in" onClick={() => mapRef.current?.zoomIn()}>
                 <PlusIcon />
