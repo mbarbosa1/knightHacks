@@ -10,6 +10,10 @@ Planning uses what is *believed* about the roads. Driving meets what is *true*.
 On scene the unit does the work its type can do, on the people who are really there: an engine frees
 the trapped, an ambulance treats the critical, a patrol looks and reports what it sees. Two units of a
 type at one building work twice as fast. When nothing is left for it, the unit reports and is free.
+
+People who are left waiting get worse: from WORSEN_AFTER_S on, every WORSEN_EVERY_S a share of the
+trapped at a building become critical and a share of the critical die. A unit with the right skill
+working at the building stops that for the people it helps.
 """
 import json, math, threading, uuid
 from dataclasses import dataclass, field
@@ -23,6 +27,9 @@ RESCUE_S_OTHER = 20
 TREAT_S = 30              # to treat one critical person
 ASSESS_S = 120            # for a patrol to look the scene over and report
 NOTHING_S = 60            # a unit that finds nothing it can do stays this long before it is free again
+WORSEN_AFTER_S = 600      # how long people can wait before any of them get worse
+WORSEN_EVERY_S = 300      # and how often after that
+WORSEN_SHARE = 0.2        # the share that gets worse each time (rounded up: a lone person does)
 NEEDS = {'rescue': 'trapped', 'medical': 'critical'}     # skill -> the people it helps
 OUTCOME = {'rescue': 'rescued', 'medical': 'treated'}    # skill -> what those people become
 RESPONDER_RELIABILITY = 0.98
@@ -71,7 +78,8 @@ class Fleet:
         self.lock = threading.RLock()   # the clock thread moves units while requests dispatch and read them
         self._on_decision = on_decision or (lambda row: None)
         self._versions = {}        # incident_id -> last decision version used
-        self.outcomes = {'rescued': 0, 'treated': 0}
+        self.outcomes = {'rescued': 0, 'treated': 0, 'died_waiting': 0}
+        self._worsen_next = WORSEN_AFTER_S
         self._groups = {}          # building_id -> {condition: people group id}
         for gid, g in getattr(truth, 'people', {}).items():
             self._groups.setdefault(g['building_id'], {})[g['condition']] = gid
@@ -170,11 +178,16 @@ class Fleet:
             for unit in self.units.values():
                 if unit.status == 'en_route':
                     self._advance(unit, now_s)
-            while True:   # work on scene, strictly in time order so units sharing a building take turns
+            while True:   # work on scene and people worsening, strictly in time order
                 due = [u for u in self.units.values() if u.status == 'busy' and u.task['work']['next_s'] <= now_s]
-                if not due:
+                first = min(due, key=lambda u: (u.task['work']['next_s'], u.id)) if due else None
+                if self._worsen_next <= now_s and (first is None or self._worsen_next <= first.task['work']['next_s']):
+                    self._worsen(self._worsen_next)
+                    self._worsen_next += WORSEN_EVERY_S
+                elif first is not None:
+                    self._work(first)
+                else:
                     break
-                self._work(min(due, key=lambda u: (u.task['work']['next_s'], u.id)))
 
     def _advance(self, unit, now_s):
         t, G = unit.task, self.router.G
@@ -238,17 +251,34 @@ class Fleet:
                 return
         self._leave(unit, at_s)
 
+    def _move_people(self, building_id, n, source, condition, at_s):
+        """n people at a building leave one group (by its condition) for another, in the truth."""
+        people = self.truth.people
+        gid = self._groups[building_id][source]
+        g = people[gid]
+        self.truth.set_people(gid, building_id, g['count'] - n, g['condition'], g['mobility'], g['language'], at_s)
+        to = self._groups[building_id].setdefault(condition, f'{building_id}:{condition}')
+        self.truth.set_people(to, building_id, people.get(to, {}).get('count', 0) + n, condition,
+                              g['mobility'], g['language'], at_s)
+
+    def _worsen(self, at_s):
+        """People still waiting get worse, except where a unit that can help them is at work."""
+        helped = {(u.task['destination']['building_id'], u.task['work']['skill'])
+                  for u in self.units.values() if u.status == 'busy' and u.task['work']['working']}
+        for building_id, groups in self._groups.items():
+            trapped = 0 if (building_id, 'rescue') in helped else self._waiting(building_id, 'rescue')
+            critical = 0 if (building_id, 'medical') in helped else self._waiting(building_id, 'medical')
+            if critical:   # counted before anyone joins them: the newly critical are not at risk yet
+                dying = math.ceil(critical * WORSEN_SHARE)
+                self._move_people(building_id, dying, 'critical', 'deceased', at_s)
+                self.outcomes['died_waiting'] += dying
+            if trapped:
+                self._move_people(building_id, math.ceil(trapped * WORSEN_SHARE), 'trapped', 'critical', at_s)
+
     def _help_one(self, building_id, skill, at_s):
         """One person changes in the truth: trapped -> rescued, or critical -> treated."""
-        people, outcome = self.truth.people, OUTCOME[skill]
-        gid = self._groups[building_id][NEEDS[skill]]
-        g = people[gid]
-        self.truth.set_people(gid, building_id, g['count'] - 1, g['condition'], g['mobility'], g['language'], at_s)
-        helped = f'{building_id}:{outcome}'
-        self.truth.set_people(helped, building_id, people.get(helped, {}).get('count', 0) + 1, outcome,
-                              g['mobility'], g['language'], at_s)
-        self._groups[building_id][outcome] = helped
-        self.outcomes[outcome] += 1
+        self._move_people(building_id, 1, NEEDS[skill], OUTCOME[skill], at_s)
+        self.outcomes[OUTCOME[skill]] += 1
 
     def _leave(self, unit, at_s):
         """Nothing left here for this unit: it reports what it did (or saw) and is free where it stands."""

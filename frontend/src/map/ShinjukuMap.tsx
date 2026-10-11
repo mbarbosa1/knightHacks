@@ -11,6 +11,8 @@ import {
   SPEEDS,
   changeClock,
   loadClock,
+  loadUnits,
+  type LiveUnit,
   stopRun,
   type RunClock,
   SubmissionError,
@@ -76,7 +78,12 @@ export const CHANNELS: Record<string, [label: string, color: string]> = {
 };
 const REPORT_FRESH_MS = 5000;   // how long a new report stays highlighted on the map
 const REPORTS_REFRESH_MS = 2000;
-const UNIT_COLORS = ["match", ["get", "type"], "ambulance", "#0c8599", "fire_engine", "#e8590c", "#5f3dc4"];
+const UNIT_COLOR = { fire_engine: "#e8590c", ambulance: "#0c8599", police: "#5f3dc4" } as const;
+const UNIT_LABEL = { fire_engine: "fire engine", ambulance: "ambulance", police: "police patrol" } as const;
+const UNIT_COLORS = ["match", ["get", "type"], "ambulance", UNIT_COLOR.ambulance, "fire_engine", UNIT_COLOR.fire_engine, UNIT_COLOR.police];
+const UNIT_LETTER = { fire_engine: "E", ambulance: "A", police: "P" } as const;
+const UNIT_STATUS = { en_route: "on the way", busy: "working on scene", available: "free" } as const;
+const UNITS_REFRESH_MS = 500;
 
 const formatClock = (s: number) =>
   `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
@@ -101,6 +108,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
   const container = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const staticRef = useRef<StaticMap | null>(null);
+  const unitMarkers = useRef(new Map<string, maplibregl.Marker>());
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [truth, setTruth] = useState<RunTruth | null>(null);
@@ -117,6 +125,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
   const [retryRunId, setRetryRunId] = useState<string | null>(null);
   const [speed, setSpeed] = useState<number>(DEFAULT_SPEED);
   const [clock, setClock] = useState<RunClock | null>(null);
+  const [units, setUnits] = useState<LiveUnit[]>([]);
 
   // The simulator keeps the clock; the map only asks what time it is.
   useEffect(() => {
@@ -128,6 +137,20 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
     const tick = () => loadClock().then((c) => !stop && setClock(c && c.run_id === truth.run_id ? c : null));
     tick();
     const timer = window.setInterval(tick, 1000);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
+  }, [truth]);
+
+  // The simulator moves the units; the map asks where they are twice a second while a run is on screen.
+  useEffect(() => {
+    setUnits([]);
+    if (!truth) return;
+    let stop = false;
+    const tick = () => loadUnits().then((u) => !stop && setUnits(u));
+    tick();
+    const timer = window.setInterval(tick, UNITS_REFRESH_MS);
     return () => {
       stop = true;
       window.clearInterval(timer);
@@ -216,7 +239,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
           type: "line",
           source: "routes",
           layout: { "line-cap": "round", "line-join": "round" },
-          paint: { "line-color": "#1c7ed6", "line-width": 4, "line-opacity": 0.85 },
+          paint: { "line-color": ["get", "color"], "line-width": 3, "line-opacity": 0.7, "line-dasharray": [1, 1.5] },
         });
 
         map.addSource("buildings", { type: "geojson", data: staticMap.buildings, promoteId: "id" });
@@ -266,7 +289,15 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
           id: "units",
           type: "circle",
           source: "units",
-          paint: { "circle-radius": 7, "circle-color": UNIT_COLORS as never, "circle-stroke-color": "#ffffff", "circle-stroke-width": 2 },
+          paint: {
+            // Driving: a solid dot. Working on scene: a dark ring around it. Free again after a job: faded.
+            "circle-radius": ["match", ["get", "status"], "busy", 9, 7],
+            "circle-color": UNIT_COLORS as never,
+            "circle-opacity": ["match", ["get", "status"], "available", 0.45, 1],
+            "circle-stroke-color": ["match", ["get", "status"], "busy", "#18212b", "#ffffff"],
+            "circle-stroke-width": ["match", ["get", "status"], "busy", 3, 2],
+            "circle-stroke-opacity": ["match", ["get", "status"], "available", 0.6, 1],
+          },
         });
 
         for (const facility of staticMap.facilities) {
@@ -440,13 +471,49 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
         .filter((incident) => incident.location)
         .map((incident) => ({ type: "Feature", geometry: incident.location!, properties: { id: incident.id, status: incident.status } })),
     });
-    (map.getSource("units") as GeoJSONSource).setData({
-      type: "FeatureCollection",
-      features: (showOps ? operational.resources : [])
-        .filter((unit) => unit.location)
-        .map((unit) => ({ type: "Feature", geometry: unit.location!, properties: { id: unit.id, type: unit.type, name: unit.name } })),
-    });
   }, [view, truth, operational, ready]);
+
+  // Units, in the operational view. One still parked at its station is not drawn: it is under the station's pin.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const shown = view === "operational" ? units.filter((unit) => unit.destination) : [];
+    // A square lettered badge per unit, so it cannot be mistaken for a report dot or a station pin.
+    const markers = unitMarkers.current;
+    for (const [id, marker] of markers) {
+      if (!shown.some((unit) => unit.id === id)) {
+        marker.remove();
+        markers.delete(id);
+      }
+    }
+    for (const unit of shown) {
+      let marker = markers.get(unit.id);
+      if (!marker) {
+        const el = document.createElement("div");
+        el.style.setProperty("--unit", UNIT_COLOR[unit.type] ?? UNIT_COLOR.police);
+        el.textContent = UNIT_LETTER[unit.type] ?? "?";
+        marker = new maplibregl.Marker({ element: el, anchor: "center" }).setLngLat([unit.lon, unit.lat]).addTo(map);
+        markers.set(unit.id, marker);
+      }
+      marker.setLngLat([unit.lon, unit.lat]);
+      const el = marker.getElement();
+      // Keep MapLibre's own classes on the element: they position it.
+      el.classList.add("map-unit");
+      el.classList.toggle("map-unit-busy", unit.status === "busy");
+      el.classList.toggle("map-unit-free", unit.status === "available");
+      el.title = `${unit.name}: ${UNIT_STATUS[unit.status] ?? unit.status}${unit.helped ? `, ${unit.helped} helped` : ""}`;
+    }
+    (map.getSource("routes") as GeoJSONSource).setData({
+      type: "FeatureCollection",
+      features: shown
+        .filter((unit) => unit.status === "en_route" && unit.route)
+        .map((unit) => ({
+          type: "Feature",
+          geometry: { type: "LineString", coordinates: unit.route! },
+          properties: { id: unit.id, color: UNIT_COLOR[unit.type] ?? UNIT_COLOR.police },
+        })),
+    });
+  }, [view, units, ready]);
 
   useEffect(() => {
     onUpdate?.({ view, truth, clock, operational, reports });
@@ -509,6 +576,11 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
                 </button>
               ))}
             </div>
+            {view === "operational" && clock?.rescued !== undefined && (
+              <span className="map-clock-totals">
+                <b>{clock.rescued}</b> rescued · <b>{clock.treated ?? 0}</b> treated
+              </span>
+            )}
           </div>
         )}
         <div className="map-quake">
@@ -564,8 +636,15 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
       </div>
 
       {/* The key only appears once there is something to explain. */}
-      {view === "operational" && reports.length > 0 && (
+      {view === "operational" && (reports.length > 0 || units.some((u) => u.destination)) && (
         <div className="map-legend damage-legend">
+          {(Object.keys(UNIT_COLOR) as (keyof typeof UNIT_COLOR)[])
+            .filter((type) => units.some((u) => u.destination && u.type === type))
+            .map((type) => (
+              <span key={type}>
+                <i className="legend-unit" style={{ background: UNIT_COLOR[type] }}>{UNIT_LETTER[type]}</i> {UNIT_LABEL[type]}
+              </span>
+            ))}
           {Object.entries(CHANNELS)
             .filter(([channel]) => reports.some((r) => r.channel === channel))
             .map(([channel, [label, color]]) => (

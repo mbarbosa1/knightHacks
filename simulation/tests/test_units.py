@@ -124,11 +124,11 @@ def test_an_engine_frees_the_trapped_one_by_one_then_reports_and_is_free():
     f, unit, G, reports, links, _ = fleet(people={'trapped': 3, 'critical': 2})
     f.dispatch(unit.id, now_s=0, building_id='bldg_x')   # arrives at 20 s; 60 s per person in a collapsed building
     f.tick(79)
-    assert unit.status == 'busy' and f.outcomes == {'rescued': 0, 'treated': 0}
+    assert unit.status == 'busy' and f.outcomes == {'rescued': 0, 'treated': 0, 'died_waiting': 0}
     f.tick(81)
     assert f.outcomes['rescued'] == 1 and f.truth.people['bldg_x:g0']['count'] == 2
-    f.tick(10_000)
-    assert unit.status == 'available' and f.outcomes == {'rescued': 3, 'treated': 0}
+    f.tick(500)
+    assert unit.status == 'available' and f.outcomes == {'rescued': 3, 'treated': 0, 'died_waiting': 0}
     assert f.truth.people['bldg_x:g0']['count'] == 0 and f.truth.people['bldg_x:rescued'] ['count'] == 3
     assert f.truth.people['bldg_x:g1']['count'] == 2                      # an engine does not treat the critical
     assert [c[0] for c in f.truth.changes if c[1] == 'rescued'] == [80, 140, 200]
@@ -159,8 +159,8 @@ def test_two_engines_work_twice_as_fast_and_a_less_damaged_building_is_quicker()
 def test_an_ambulance_treats_the_critical_and_the_wrong_unit_finds_nothing_to_do():
     f, unit, G, reports, *_ = fleet(types=('ambulance',), people={'trapped': 2, 'critical': 2})
     f.dispatch(unit.id, now_s=0, building_id='bldg_x')
-    f.tick(10_000)
-    assert f.outcomes == {'rescued': 0, 'treated': 2} and unit.task['left_s'] == 20 + 2 * 30
+    f.tick(500)
+    assert f.outcomes == {'rescued': 0, 'treated': 2, 'died_waiting': 0} and unit.task['left_s'] == 20 + 2 * 30
     assert f.truth.people['bldg_x:treated']['count'] == 2 and f.truth.people['bldg_x:g0']['count'] == 2
 
     f, unit, G, reports, *_ = fleet(types=('ambulance',), people={'trapped': 5})
@@ -168,7 +168,7 @@ def test_an_ambulance_treats_the_critical_and_the_wrong_unit_finds_nothing_to_do
     f.tick(79)
     assert unit.status == 'busy'                                           # a minute is lost finding that out
     f.tick(81)
-    assert unit.status == 'available' and f.outcomes == {'rescued': 0, 'treated': 0}
+    assert unit.status == 'available' and f.outcomes == {'rescued': 0, 'treated': 0, 'died_waiting': 0}
     assert json.loads(reports[-1]['original_text'])['action'] == 'nothing_found' and f.truth.changes == []
 
 
@@ -182,3 +182,23 @@ def test_a_patrol_looks_and_reports_what_is_really_there():
     assert json.loads(reports[0]['original_text']) == {'unit_id': unit.id, 'building_id': 'bldg_x', 'action': 'assessed',
                                                        'damage_level': 'collapsed', 'trapped': 5, 'critical': 1, 'injured': 7, 'deceased': 0}
     assert 'building collapsed' in reports[0]['text_en'] and '5 trapped' in reports[0]['text_en']
+
+
+def test_people_left_waiting_get_worse_unless_the_right_unit_is_working_there():
+    f, unit, *_ = fleet(people={'trapped': 6, 'critical': 5})           # nobody is sent
+    f.tick(599)
+    assert f.truth.changes == []
+    f.tick(600)                                                           # a fifth (rounded up) get worse
+    count = lambda condition: next((g['count'] for g in f.truth.people.values() if g['condition'] == condition), 0)
+    assert (count('trapped'), count('critical'), count('deceased')) == (4, 6, 1) and f.outcomes['died_waiting'] == 1
+    f.tick(900)
+    assert (count('trapped'), count('critical'), count('deceased')) == (3, 5, 3)
+
+    f, unit, *_ = fleet(people={'trapped': 30, 'critical': 5})           # an engine at work: the trapped hold on
+    f.dispatch(unit.id, now_s=0, building_id='bldg_x')
+    f.tick(600)
+    assert count('trapped') == 30 - 9 and count('critical') == 4 and count('deceased') == 1   # 9 freed; critical untreated
+
+    f, unit, *_ = fleet(people={'trapped': 1})                            # a lone trapped person: critical, then dead
+    f.tick(900)
+    assert (count('trapped'), count('critical'), count('deceased')) == (0, 0, 1)

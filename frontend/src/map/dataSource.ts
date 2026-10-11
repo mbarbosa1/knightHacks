@@ -162,7 +162,7 @@ export async function createEarthquake(magnitude: number | null, speed: number =
 
 /** How many simulated seconds pass per real second. */
 export const SPEEDS = [10, 20] as const;
-export const DEFAULT_SPEED = 20;
+export const DEFAULT_SPEED = 10;   // at 20x a big earthquake's reports reach Neon late
 
 /** The live run's clock, kept by the simulator. run_id is null when nothing is playing. */
 export interface RunClock {
@@ -175,6 +175,34 @@ export interface RunClock {
   reports_released?: number;
   reports_total?: number;
   last_error?: string | null;
+  /** People the units have freed and treated so far, and people who died waiting. */
+  rescued?: number;
+  treated?: number;
+  died_waiting?: number;
+}
+
+/** One responder unit as the simulator has it right now. */
+export interface LiveUnit {
+  id: string;
+  name: string;
+  type: "fire_engine" | "ambulance" | "police";
+  status: "available" | "en_route" | "busy";
+  lon: number;
+  lat: number;
+  /** The road ahead while it drives; null otherwise. */
+  route: [number, number][] | null;
+  /** null until the unit has been sent somewhere. */
+  destination: { lon: number; lat: number; building_id: string | null; incident_id: string | null } | null;
+  helped: number;
+}
+
+/** Where every unit of the live run is. Empty when nothing is playing. */
+export async function loadUnits(): Promise<LiveUnit[]> {
+  try {
+    return await getJson<LiveUnit[]>(`${SIM_BASE}/units`);
+  } catch {
+    return [];
+  }
 }
 
 export async function loadClock(): Promise<RunClock | null> {
