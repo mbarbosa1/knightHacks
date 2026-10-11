@@ -251,6 +251,7 @@ class NewRun(BaseModel):
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1, description='omit for a random earthquake')
     mw: float | None = Field(default=None, ge=MW_RANGE[0], le=MW_RANGE[1], description='omit to let the seed pick the magnitude')
     speed: int = Field(default=DEFAULT_SPEED, description=f'simulated seconds per real second: one of {SPEEDS}')
+    paused: bool = Field(default=False, description='create the run with its clock held at T+0 until POST /clock {playing: true}')
 
 
 @app.get('/health')
@@ -301,6 +302,8 @@ def new_run(body: NewRun):
         # Only now, with the run confirmed saved, does its clock start and the previous run's stop.
         data['clock'] = start_live(truth.run_id, truth.reports, body.speed, static_map, truth,
                                    auto_dispatch=dispatch_view if AUTO_DISPATCH else None)
+        if body.paused:   # held at the start: nothing is released and nobody moves until Start is pressed
+            data['clock'] = _state['live'].set(playing=False)
     except Exception as exc:
         log.error('Simulation submission failed: %s',exc)
         raise submission_error(storage,exc) from exc

@@ -423,6 +423,12 @@ class RunTools:
                 refused.append({'unit_id': unit_id, 'incident_id': incident_id, 'reason': str(exc)})
         return {'sent': sent, 'refused': refused}
 
+    def _in_district(self, lon, lat):
+        """True when there is at least one building of this map within OUTSIDE_DISTRICT_M of the point."""
+        within_m = OUTSIDE_DISTRICT_M
+        p = to_metres(Point(lon, lat))
+        return any(self._bldg_m[i].distance(p) <= within_m for i in self._bldgs.query(p.buffer(within_m)))
+
     def incidents_to_cover(self, limit=10):
         """The response picture in one call: every incident that is not resolved, with the people believed
         there by condition, the units already on it, what units reported from the scene, the kinds of unit it
@@ -449,7 +455,10 @@ class RunTools:
             on_it = [{'unit_id': u['id'], 'type': u['type'], 'status': u['status']} for u in units
                      if u['status'] != 'available' and (u['destination'] or {}).get('incident_id') == i['id']]
             field = reports.get(i['id'], [])
-            located = bool(i['building_id'] or i['location'])
+            # Somewhere a unit could find something: a building on this map, or a point with buildings around
+            # it. A vague or false report can put an incident outside the district, where nothing exists.
+            located = i['building_id'] in self.map.building_geoms or bool(
+                i['location'] and self._in_district(i['location']['longitude'], i['location']['latitude']))
             incidents.append({'incident_id': i['id'], 'status': i['status'], 'people': people, 'needs': sorted(needs),
                               'has_location': located, 'units_on_it': on_it, 'field_reports': field[-3:],
                               'could_use': _could_use(i['status'], people, on_it, field) if located else []})
@@ -667,6 +676,7 @@ def _merge_groups(old, new):
 
 
 SECOND_ENGINE_FROM = 8   # trapped people from which a second engine is worth sending
+OUTSIDE_DISTRICT_M = 80  # an incident with no building of the map this close is outside the district: nobody is sent
 SAFE_CONDITIONS = ('safe', 'unhurt_evacuated', 'deceased', 'minor')
 
 

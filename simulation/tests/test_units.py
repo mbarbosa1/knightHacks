@@ -186,22 +186,23 @@ def test_a_patrol_looks_and_reports_what_is_really_there():
 
 def test_people_left_waiting_get_worse_unless_the_right_unit_is_working_there():
     f, unit, *_ = fleet(people={'trapped': 6, 'critical': 5})           # nobody is sent
-    f.tick(599)
-    assert f.truth.changes == []
-    f.tick(600)                                                           # a fifth (rounded up) get worse
+    f.tick(899)
+    assert f.truth.changes == []                                          # fifteen minutes before anyone gets worse
+    f.tick(900)                                                           # then a tenth, to the nearest person
     count = lambda condition: next((g['count'] for g in f.truth.people.values() if g['condition'] == condition), 0)
-    assert (count('trapped'), count('critical'), count('deceased')) == (4, 6, 1) and f.outcomes['died_waiting'] == 1
-    f.tick(900)
-    assert (count('trapped'), count('critical'), count('deceased')) == (3, 5, 3)
+    assert (count('trapped'), count('critical'), count('deceased')) == (5, 5, 1) and f.outcomes['died_waiting'] == 1
+    f.tick(1200)
+    assert (count('trapped'), count('critical'), count('deceased')) == (4, 5, 2)
 
     f, unit, *_ = fleet(people={'trapped': 30, 'critical': 5})           # an engine at work: the trapped hold on
     f.dispatch(unit.id, now_s=0, building_id='bldg_x')
-    f.tick(600)
-    assert count('trapped') == 30 - 9 and count('critical') == 4 and count('deceased') == 1   # 9 freed; critical untreated
-
-    f, unit, *_ = fleet(people={'trapped': 1})                            # a lone trapped person: critical, then dead
     f.tick(900)
-    assert (count('trapped'), count('critical'), count('deceased')) == (0, 0, 1)
+    assert count('trapped') == 30 - 14 and count('critical') == 4 and count('deceased') == 1   # 14 freed; critical untreated
+
+    f, unit, *_ = fleet(people={'trapped': 1, 'critical': 2})            # a few people are not lost just for waiting
+    f.tick(1500)
+    assert (count('trapped'), count('critical'), count('deceased')) == (1, 2, 0) and f.truth.changes == []
+
 
 
 def test_a_crew_that_finds_nobody_at_the_address_looks_around_and_helps_at_the_building_nearby():

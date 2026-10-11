@@ -53,6 +53,9 @@ const AGENT_NAME: Record<string, string> = {
 };
 const AGENTS_REFRESH_MS = 3000;
 
+/** A count for a dashboard card: two digits, or a dash while no run is playing. */
+const pad = (n: number | undefined | null) => (n === undefined || n === null ? "–" : String(n).padStart(2, "0"));
+
 /** Units that are doing something come first: driving, then working, then free again, then never sent. */
 const unitOrder = (unit: LiveUnit) =>
   unit.status === "en_route" ? 0 : unit.status === "busy" ? 1 : unit.destination ? 2 : 3;
@@ -236,10 +239,13 @@ function App() {
       if (output.error) {
         out.push({ key: run.id, at: run.seenAt, kind: "error", who, title: "Could not finish this round", lines: [output.error.slice(0, 160)], note: took });
       } else if (run.agent === "response_agent") {
-        const sent = output.dispatched ?? [];
+        const proposing = output.proposed !== undefined;   // approval mode: the operator sends them
+        const sent = output.proposed ?? output.dispatched ?? [];
+        const units_ = `${sent.length} unit${sent.length === 1 ? "" : "s"}`;
         out.push({
           key: run.id, at: run.seenAt, kind: "respond", who, note: took,
-          title: sent.length ? `Sent ${sent.length} unit${sent.length === 1 ? "" : "s"}` : "Sent nobody",
+          title: !sent.length ? (proposing ? "Nothing new to propose" : "Sent nobody")
+            : proposing ? `Proposed ${units_} · waiting for approval` : `Sent ${units_}`,
           lines: [
             ...sent.map((d) => `${unitName(d.unit_id)} → ${place(d.incident_id)}`),
             ...(output.refused ?? []).map((r) => `Could not send ${unitName(r.unit_id)}: ${r.reason}`),
@@ -301,7 +307,7 @@ function App() {
           </span>
           <span className="clock">
             {clock?.sim_time_s !== undefined
-              ? <>T+{formatClock(clock.sim_time_s)} <small>SIM</small></>
+              ? <>{formatClock(clock.sim_time_s)} <small>SINCE THE EARTHQUAKE</small></>
               : <>{utc.toISOString().slice(11, 19)} <small>UTC</small></>}
           </span>
           <button className="icon-button top-icon" aria-label="Audio">
@@ -320,18 +326,6 @@ function App() {
             ? `M ${truth.scenario.mw.toFixed(1)} earthquake · Intensity ${truth.intensity.label} (Japan scale)`
             : "Generate an earthquake on the map to start"}
         </div>
-        {clock?.run_id && (
-          <div className="strip-stats">
-            {clock.units && (
-              <span>
-                <b>{clock.units.en_route}</b> on the way · <b>{clock.units.busy}</b> on scene · <b>{clock.units.available}</b> free
-              </span>
-            )}
-            <span><b>{clock.rescued ?? 0}</b> rescued</span>
-            <span><b>{clock.treated ?? 0}</b> treated</span>
-            <span className={clock.died_waiting ? "strip-loss" : ""}><b>{clock.died_waiting ?? 0}</b> died waiting</span>
-          </div>
-        )}
       </div>
       <main className="dashboard">
         <aside className="panel incoming-panel">
@@ -379,6 +373,7 @@ function App() {
                 key={report.id}
                 className={`report-card ${selectedReportId === report.id ? "selected" : ""} ${report.kind.toLowerCase()}`}
                 onClick={() => {
+                  if (selectedReportId === report.id) setReportOpen(true);   // a second click opens the full report
                   setSelectedReportId(report.id);
                   if (report.longitude !== undefined && report.latitude !== undefined) {
                     mapRef.current?.focus(report.longitude, report.latitude);
@@ -426,19 +421,13 @@ function App() {
 
         <section className="center-column">
           <div className="metrics-row">
-            <Metric
-              icon={<MapPin size={14} />}
-              label="MAPPED LOCATIONS"
-              value={observations ? String(observations.filter((o) => o.longitude != null).length).padStart(2, "0") : "00"}
-              detail="Located reports"
-            />
-            <Metric
-              icon={<AlertTriangle size={14} />}
-              label="NEEDS LOCATION"
-              value={observations ? String(observations.filter((o) => o.longitude == null).length).padStart(2, "0") : "00"}
-              detail="Review reports"
-              warning
-            />
+            {/* The response at a glance: where the 13 units are, and what has happened to the people. */}
+            <Metric icon={<Navigation size={14} />} label="ON THE WAY" value={pad(clock?.units?.en_route)} detail="units driving" />
+            <Metric icon={<MapPin size={14} />} label="ON SCENE" value={pad(clock?.units?.busy)} detail="units working" />
+            <Metric icon={<Check size={14} />} label="AVAILABLE" value={pad(clock?.units?.available)} detail="units free to send" />
+            <Metric icon={<ArrowUpRight size={14} />} label="RESCUED" value={pad(clock?.rescued)} detail="people freed" />
+            <Metric icon={<ShieldCheck size={14} />} label="TREATED" value={pad(clock?.treated)} detail="critical treated" />
+            <Metric icon={<AlertTriangle size={14} />} label="DIED WAITING" value={pad(clock?.died_waiting)} detail="not reached in time" warning />
           </div>
           <section
             className="map-panel"
@@ -446,6 +435,23 @@ function App() {
             ref={mapPanel}
           >
             <ShinjukuMap ref={mapRef} onUpdate={setMapState} />
+            {/* Full screen hides the dashboard, so the same figures ride on the map as a see-through card. */}
+            {fullscreen && clock?.run_id && (
+              <div className="map-stats-overlay" aria-label="Response figures">
+                <h3>Response</h3>
+                <dl>
+                  <div><dt>On the way</dt><dd>{clock.units?.en_route ?? 0}</dd></div>
+                  <div><dt>On scene</dt><dd>{clock.units?.busy ?? 0}</dd></div>
+                  <div><dt>Available</dt><dd>{clock.units?.available ?? 0}</dd></div>
+                </dl>
+                <h3>People</h3>
+                <dl>
+                  <div><dt>Rescued</dt><dd>{clock.rescued ?? 0}</dd></div>
+                  <div><dt>Treated</dt><dd>{clock.treated ?? 0}</dd></div>
+                  <div className="loss"><dt>Died waiting</dt><dd>{clock.died_waiting ?? 0}</dd></div>
+                </dl>
+              </div>
+            )}
             <div className="map-toolbar">
               <button aria-label="Zoom in" onClick={() => mapRef.current?.zoomIn()}>
                 <PlusIcon />
@@ -588,6 +594,7 @@ function App() {
               )}
             </div>
           </section>
+          {driving.length > 0 && (
           <section className="panel progress-panel">
             <div className="panel-heading">
               <div>
@@ -619,58 +626,9 @@ function App() {
             </div>
             <p className="canonical-note">
               {roadsRestricted} road segment{roadsRestricted === 1 ? "" : "s"} believed blocked or limited.
-              Routes use the roads believed open; a unit that meets a blocked road reports it and takes another way.
             </p>
           </section>
-          <section className="panel details-panel">
-            <div className="panel-heading">
-              <div>
-                <Layers size={14} />
-                <span>REPORT DETAILS</span>
-              </div>
-            </div>
-            {selectedReport ? (
-              <>
-                <div className="detail-source">
-                  <span>
-                    <Radio size={12} />{" "}
-                    {(CHANNELS[selectedReport.channel ?? ""]?.[0] ?? `${selectedReport.kind} report`).toUpperCase()}
-                  </span>
-                  <span className="unverified">{reportState}</span>
-                </div>
-                <h2>{selectedReport.id} · {selectedReport.time}</h2>
-                <p className="detail-text">{selectedReport.text}</p>
-                <p className="detail-address">
-                  <MapPin size={12} /> {selectedReport.location}
-                </p>
-                <div className="detail-tags">
-                  {selectedReport.precision && <span>Location: {selectedReport.precision}</span>}
-                  {selectedReport.reliability !== undefined && (
-                    <span>Source reliability {selectedReport.reliability.toFixed(2)}</span>
-                  )}
-                  {selectedReport.originalText && <span>Sent in {selectedReport.lang?.toUpperCase()}</span>}
-                  {selectedReport.longitude === undefined && obsId && <span>Not on the map</span>}
-                </div>
-                <div className="verification">
-                  <ShieldCheck size={14} />
-                  <span>
-                    {linked
-                      ? `${against ? "Speaks against an incident" : "Part of an incident"}: ${believedPeople(linked)}`
-                      : "No incident cites this report yet"}
-                  </span>
-                </div>
-                <button
-                  className="open-report-button"
-                  onClick={() => setReportOpen(true)}
-                >
-                  <ExternalLink size={13} /> Open full report
-                  <ChevronRight size={13} />
-                </button>
-              </>
-            ) : (
-              <div className="panel-empty">Select a report in the feed to see it here and find it on the map.</div>
-            )}
-          </section>
+          )}
           <section className="panel dispatch-panel">
             <div className="dispatch-heading">
               <div className="panel-heading">

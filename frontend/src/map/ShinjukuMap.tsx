@@ -18,6 +18,7 @@ import {
   type RunClock,
   SubmissionError,
   RUN_ID,
+  RUN_IS_REMEMBERED,
   simulatorAvailable,
   loadOperationalState,
   loadReportsSince,
@@ -390,7 +391,17 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
         map.on("mouseleave", "routes", () => { map.getCanvas().style.cursor = ""; });
         map.on("dragstart", () => setFollowing(null));   // taking the map in hand lets go of the unit
 
-        setTruth(runTruth);
+        // A run this tab only remembers is shown only while the simulator is still playing it. After the
+        // simulator restarts, or once another earthquake has replaced it, the page starts clean instead of
+        // showing the old run's incidents and proposals with nothing behind them.
+        const live = RUN_IS_REMEMBERED ? await loadClock() : null;
+        if (cancelled) return;
+        if (RUN_IS_REMEMBERED && live?.run_id !== RUN_ID) {
+          forgetRun();
+          setDetached(true);
+        } else {
+          setTruth(runTruth);
+        }
         setReady(true);
       } catch (cause) {
         if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
@@ -670,13 +681,16 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
         )}
         {truth && (
           <div className="map-clock" role="status">
-            <b className="map-clock-time">T+{formatClock(clock?.sim_time_s ?? 0)}</b>
+            <span className="map-clock-elapsed">
+              <b className="map-clock-time">{formatClock(clock?.sim_time_s ?? 0)}</b>
+              <small>since the earthquake</small>
+            </span>
             <button
-              className="map-clock-button"
+              className={`map-clock-button${clock && !clock.playing && !clock.finished && (clock.sim_time_s ?? 0) < 1 ? " map-start" : ""}`}
               disabled={!clock || clock.finished}
               onClick={() => clock && changeClock({ playing: !clock.playing }).then((c) => c && setClock(c))}
             >
-              {clock?.finished ? "Finished" : clock?.playing ? "Pause" : "Play"}
+              {clock?.finished ? "Finished" : clock?.playing ? "Pause" : (clock?.sim_time_s ?? 0) < 1 ? "Start" : "Play"}
             </button>
             <div className="map-view-switch" role="group" aria-label="Simulation speed">
               {SPEEDS.map((x) => (
@@ -693,11 +707,6 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
                 </button>
               ))}
             </div>
-            {view === "operational" && clock?.rescued !== undefined && (
-              <span className="map-clock-totals">
-                <b>{clock.rescued}</b> rescued · <b>{clock.treated ?? 0}</b> treated
-              </span>
-            )}
           </div>
         )}
         <div className="map-quake">

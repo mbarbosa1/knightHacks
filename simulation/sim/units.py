@@ -29,9 +29,10 @@ ASSESS_S = 120            # for a patrol to look the scene over and report
 NOTHING_S = 60            # a unit that finds nothing it can do stays this long before it is free again
 SEARCH_RADIUS_M = 150     # a unit that finds nobody at the address looks this far around it
 SEARCH_SPEED_MPS = 2.0    # and gets there on foot at this speed
-WORSEN_AFTER_S = 600      # how long people can wait before any of them get worse
+WORSEN_AFTER_S = 900      # how long people can wait before any of them get worse (15 minutes)
 WORSEN_EVERY_S = 300      # and how often after that
-WORSEN_SHARE = 0.2        # the share that gets worse each time (rounded up: a lone person does)
+WORSEN_SHARE = 0.1        # the share that gets worse each time, rounded to the nearest person: in a small
+                          # group nobody does, so one trapped person is not lost just for waiting
 NEEDS = {'rescue': 'trapped', 'medical': 'critical'}     # skill -> the people it helps
 OUTCOME = {'rescue': 'rescued', 'medical': 'treated'}    # skill -> what those people become
 RESPONDER_RELIABILITY = 0.98
@@ -295,12 +296,13 @@ class Fleet:
         for building_id, groups in self._groups.items():
             trapped = 0 if (building_id, 'rescue') in helped else self._waiting(building_id, 'rescue')
             critical = 0 if (building_id, 'medical') in helped else self._waiting(building_id, 'medical')
-            if critical:   # counted before anyone joins them: the newly critical are not at risk yet
-                dying = math.ceil(critical * WORSEN_SHARE)
+            dying = int(critical * WORSEN_SHARE + 0.5)   # counted before anyone joins them: the newly critical are not at risk yet
+            if dying:
                 self._move_people(building_id, dying, 'critical', 'deceased', at_s)
                 self.outcomes['died_waiting'] += dying
-            if trapped:
-                self._move_people(building_id, math.ceil(trapped * WORSEN_SHARE), 'trapped', 'critical', at_s)
+            worse = int(trapped * WORSEN_SHARE + 0.5)
+            if worse:
+                self._move_people(building_id, worse, 'trapped', 'critical', at_s)
 
     def _help_one(self, building_id, skill, at_s):
         """One person changes in the truth: trapped -> rescued, or critical -> treated."""

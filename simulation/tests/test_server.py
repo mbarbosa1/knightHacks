@@ -89,6 +89,12 @@ def test_reports_arrive_on_the_clock_and_one_run_plays_at_a_time(client):
     run_file = json.load(open(server._state['storage'].runs_dir / first['run_id'] / 'simulation_run.json'))
     assert run_file['status'] == 'completed' and run_file['ended_at']
 
+    held = client.post('/runs', json={'mw': 6.5, 'speed': 5, 'paused': True}).json()   # created, waiting for Start
+    assert not held['clock']['playing'] and held['clock']['sim_time_s'] < 2 and held['clock']['speed'] == 5
+    time.sleep(0.5)
+    assert client.get('/clock').json()['sim_time_s'] == held['clock']['sim_time_s']       # nothing moves until Start
+    assert client.post('/clock', json={'playing': True, 'speed': 10}).json()['playing']
+
     assert client.post('/stop').json()['finished']
     assert client.get('/clock').json() == {'run_id': None, 'finished': True, 'playing': False}
     assert client.post('/clock', json={'playing': True}).status_code == 409

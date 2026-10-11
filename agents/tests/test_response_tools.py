@@ -12,6 +12,8 @@ RUN, INC, UNIT = 'run-1', 'inc-1', 'unit-1'
 def tools(monkeypatch):
     t = RunTools.__new__(RunTools)
     t.run_id = RUN
+    t.map = type('M', (), {'building_geoms': {'bldg_1': None, 'bldg_2': None}})()
+    t._in_district = lambda lon, lat: lon < 139.9   # the test district ends there
     calls = []
     units = [{'id': UNIT, 'name': 'Engine 1', 'type': 'fire_engine', 'status': 'en_route', 'lon': 139.7, 'lat': 35.69,
               'destination': {'incident_id': INC}, 'helped': 0},
@@ -196,3 +198,17 @@ def test_the_response_agent_looks_on_its_own_and_never_runs_two_rounds_at_once(t
     assert seen >= 3
     time.sleep(0.3)
     assert len(looks) <= seen + 1                          # and it stops when the run is no longer worked on
+
+
+def test_an_incident_outside_the_district_gets_no_unit(tools, monkeypatch):
+    """A vague or false report can put an incident where the map has no buildings: nothing can be found there."""
+    monkeypatch.setattr(RunTools, 'list_incidents', lambda self: [
+        {'id': 'far', 'status': 'reported', 'building_id': None, 'location': {'longitude': 139.95, 'latitude': 35.6},
+         'person_groups': [{'condition': 'trapped', 'est_count': 5}]},
+        {'id': 'near', 'status': 'reported', 'building_id': None, 'location': {'longitude': 139.70, 'latitude': 35.69},
+         'person_groups': [{'condition': 'critical', 'est_count': 1}]},
+        {'id': 'ghost', 'status': 'reported', 'building_id': 'not-on-this-map', 'location': None, 'person_groups': None}])
+    monkeypatch.setattr(RunTools, 'list_observations', lambda self: [])
+    picture = tools.incidents_to_cover()
+    assert [i['incident_id'] for i in picture['incidents']] == ['near']
+    assert picture['not_listed']['nothing_needed_now'] == 2 and all(s['incident_id'] == 'near' for s in picture['suggested'])

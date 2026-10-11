@@ -21,6 +21,8 @@ function rememberedRun(): string | undefined {
   try { return window.sessionStorage.getItem(RUN_KEY) ?? undefined; } catch { return undefined; }
 }
 export const RUN_ID: string | undefined = env.VITE_RUN_ID ?? rememberedRun();
+/** True when the run to show is only what this tab remembered, not one asked for by id. */
+export const RUN_IS_REMEMBERED = !env.VITE_RUN_ID && RUN_ID !== undefined;
 
 /** Stop following the remembered run (Reset), so a reload does not bring its units back either. */
 export function forgetRun(): void {
@@ -225,7 +227,8 @@ async function submitEarthquake(url: string, body: unknown): Promise<RunTruth> {
 }
 
 export async function createEarthquake(magnitude: number | null, speed: number = DEFAULT_SPEED): Promise<RunTruth> {
-  return submitEarthquake(`${SIM_BASE}/runs`, magnitude === null ? { speed } : { mw: magnitude, speed });
+  // The run is created with its clock held: the operator picks 5x or 10x and presses Start.
+  return submitEarthquake(`${SIM_BASE}/runs`, { ...(magnitude === null ? {} : { mw: magnitude }), speed, paused: true });
 }
 
 /** How many simulated seconds pass per real second. */
@@ -348,6 +351,8 @@ export interface AgentRun {
     incidents?: unknown[];
     /** response_agent: what was really sent, recorded by code. */
     dispatched?: { unit_id: string; incident_id: string; eta_s: number }[];
+    /** response_agent in approval mode: dispatches waiting for the operator. */
+    proposed?: { unit_id: string; incident_id: string; eta_s: number }[];
     refused?: { unit_id: string; incident_id: string; reason: string }[];
     not_covered?: { incident?: string; type?: string; reason?: string }[];
   } | null;
