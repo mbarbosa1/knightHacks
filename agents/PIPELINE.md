@@ -40,7 +40,7 @@ The two 8000s don't clash: one is on the GPU box, the other on your laptop. Poin
 | Agent | Instructions | Tools | How it runs |
 |---|---|---|---|
 | in_agent | `assesmentAgent/in-agent.md` | `find_nearby_buildings`, `find_nearest_road` (called by `in_agent.py`) | `InAgent.process(obs)` → `ask_json` |
-| detect_agent | `assesmentAgent/detect-agent.md` | read + `upsert_incident`, `set_road_restriction`, `log_agent_run` | `run_agent` |
+| detect_agent | `assesmentAgent/detect-agent/detect-agent.md` | read + `upsert_incident`, `set_road_restriction`, `log_agent_run` | `run_agent` |
 | medical_agent | `assesmentAgent/medical-agent.md` | read + `upsert_incident`, `log_agent_run` | `run_agent` |
 | verify_agent | `assesmentAgent/verify-agent.md` | read + `find_nearby_buildings`, `upsert_incident`, `log_agent_run` | `run_agent` |
 
@@ -102,9 +102,6 @@ LLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
 
 ## Not wired up yet
 
-- `detect-agent.md` is at `assesmentAgent/detect-agent/detect-agent.md`, but the
-  orchestrator looks for `assesmentAgent/detect-agent.md`, so detect_agent is skipped.
-  Move the file or change the path in `ASSESSMENT_AGENTS`.
 - `medical-agent.md` and `verify-agent.md` don't exist yet.
 - Response agents (route, resource, plan, report) aren't in the orchestrator yet;
   `responseAgent/route-agent.md` is empty.

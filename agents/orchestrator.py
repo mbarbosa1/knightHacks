@@ -30,7 +30,7 @@ AGENTS_DIR = pathlib.Path(__file__).resolve().parent
 
 # Assessment agents that run in parallel on each batch: instructions file + the tools they may call.
 ASSESSMENT_AGENTS = {
-    'detect_agent': ('assesmentAgent/detect-agent.md',
+    'detect_agent': ('assesmentAgent/detect-agent/detect-agent.md',
                      ['get_run', 'list_observations', 'list_incidents', 'get_last_agent_run', 'find_nearby_incidents',
                       'find_nearby_buildings', 'find_nearest_road', 'upsert_incident', 'set_road_restriction',
                       'log_agent_run']),
