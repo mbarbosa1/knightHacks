@@ -21,6 +21,10 @@
 --   duplicate_incidents    extra incidents for a building that already had one (lower is better)
 --   road_block_recall      reported blocked/limited roads the agents marked blocked/limited
 --   road_block_precision   roads the agents marked blocked/limited that really are
+--   people_helped_by_units rescued + treated by the simulated units by the end of the run
+--   died_waiting           people who died during the run while waiting for help (lower is better)
+-- Rescue need is measured at the start of the run (people_start): units rescue people and the waiting get
+-- worse while a run plays, so the latest state would understate who needed help.
 -- ============================================================================
 INSERT INTO knighthacks.eval.scorecards (scenario_id, metric, value, details, agent_config, scored_at)
 WITH
@@ -30,9 +34,14 @@ events AS (
 released AS (                    -- reports the agents could see
   SELECT DISTINCT row_id AS observation_id FROM events WHERE table_name = 'observations'
 ),
-people AS (                      -- latest state of each group of people
+people AS (                      -- every group of people, latest state (for mapping reports to buildings)
   SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY id ORDER BY simulation_time_s DESC) AS rn
                  FROM knighthacks.truth.truth_people WHERE scenario_id = :run_id) WHERE rn = 1
+),
+people_start AS (                -- who needed help when the earthquake hit: units rescue people and the waiting
+  SELECT * FROM knighthacks.truth.truth_people   -- get worse during a run, so the need is measured at the start
+  WHERE scenario_id = :run_id
+    AND simulation_time_s = (SELECT min(simulation_time_s) FROM knighthacks.truth.truth_people WHERE scenario_id = :run_id)
 ),
 damage AS (
   SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY building_id ORDER BY simulation_time_s DESC) AS rn
@@ -59,7 +68,7 @@ report_kind AS (                 -- a rumour: every link of the report is fabric
 rescue AS (                      -- buildings with people who need rescue, and whether any report mentions them
   SELECT p.building_id, sum(p.count) AS people,
          p.building_id IN (SELECT building_id FROM report_building WHERE building_id IS NOT NULL) AS reported
-  FROM people p
+  FROM people_start p
   WHERE p.condition IN ('trapped', 'critical')
   GROUP BY p.building_id
 ),
@@ -146,6 +155,18 @@ metrics AS (
   SELECT 'duplicate_incidents', CAST(coalesce(sum(n - 1), 0) AS DOUBLE),
          to_json(named_struct('buildings_with_duplicates', count(*)))
   FROM (SELECT building_id, count(DISTINCT incident_id) AS n FROM incident_building GROUP BY building_id HAVING n > 1)
+  UNION ALL
+  SELECT 'people_helped_by_units',              -- rescued + treated by the simulated units, by the end of the run
+         CAST(coalesce(sum(CASE WHEN condition IN ('rescued', 'treated') THEN count END), 0) AS DOUBLE),
+         to_json(named_struct('rescued', coalesce(sum(CASE WHEN condition = 'rescued' THEN count END), 0),
+                              'treated', coalesce(sum(CASE WHEN condition = 'treated' THEN count END), 0)))
+  FROM people
+  UNION ALL
+  SELECT 'died_waiting',                         -- deceased now minus deceased when the earthquake hit (lower is better)
+         CAST(greatest(coalesce((SELECT sum(count) FROM people WHERE condition = 'deceased'), 0)
+                     - coalesce((SELECT sum(count) FROM people_start WHERE condition = 'deceased'), 0), 0) AS DOUBLE),
+         to_json(named_struct('deceased_at_start', coalesce((SELECT sum(count) FROM people_start WHERE condition = 'deceased'), 0),
+                              'deceased_now', coalesce((SELECT sum(count) FROM people WHERE condition = 'deceased'), 0)))
   UNION ALL
   SELECT 'road_block_recall', try_divide(count_if(b.road_id IS NOT NULL), count(*)),
          to_json(named_struct('marked', count_if(b.road_id IS NOT NULL), 'reported_bad_roads', count(*)))

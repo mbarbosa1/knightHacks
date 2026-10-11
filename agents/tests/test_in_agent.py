@@ -157,3 +157,45 @@ def test_normalize_records_errors_instead_of_raising(monkeypatch):
     record = agent.normalize(obs())
     assert record['error'] == 'RuntimeError: model down'
     assert record['observation_id'] == obs()['id'] and record['duration_ms'] >= 0
+
+
+# ---- unit reports (responder_update) are read without the model --------------------
+
+def unit_obs(facts, text='Engine 1: 2 people freed. Unit free.'):
+    import json
+    return obs(channel='responder_update', original_text=json.dumps(facts), text_en=text, location_precision='gps')
+
+
+@pytest.mark.parametrize('facts, event, trapped, injured, urgency', [
+    ({'unit_id': 'u1', 'building_id': 'b1', 'action': 'rescued', 'count': 2, 'still_trapped': 1}, 'people_trapped', 1, None, 5),
+    ({'unit_id': 'u1', 'building_id': 'b1', 'action': 'rescued', 'count': 3, 'still_trapped': 0}, 'other', 0, None, 2),
+    ({'unit_id': 'u2', 'building_id': 'b1', 'action': 'treated', 'count': 1, 'still_critical': 2}, 'injuries', None, 2, 5),
+    ({'unit_id': 'u3', 'building_id': 'b1', 'action': 'assessed', 'damage_level': 'collapsed', 'trapped': 4,
+      'critical': 1, 'injured': 0, 'deceased': 0}, 'building_collapse', 4, 1, 5),
+    ({'unit_id': 'u3', 'building_id': 'b1', 'action': 'nothing_found', 'trapped': 0, 'critical': 0, 'injured': 0,
+      'deceased': 0}, 'no_damage', 0, 0, 1),
+])
+def test_unit_reports_are_read_exactly(monkeypatch, facts, event, trapped, injured, urgency):
+    monkeypatch.setattr(in_agent, 'ask_json', lambda *a, **k: pytest.fail('a unit report must not reach the model'))
+    agent = in_agent.InAgent.__new__(in_agent.InAgent)
+    agent.tools, agent.instructions = FakeTools(), 'instructions'
+    r = agent.normalize(unit_obs(facts))
+    assert r['error'] is None and r['event_type'] == event and r['urgency'] == urgency
+    assert r['people']['trapped'] == trapped and r['people']['injured'] == injured
+    assert r['location']['building_candidates'][0]['building_id'] == 'b1' and r['unit_report'] == facts
+    assert agent.tools.calls == []                     # exact ids: no nearby search
+
+
+def test_unit_road_report_uses_the_exact_roads(monkeypatch):
+    agent = in_agent.InAgent.__new__(in_agent.InAgent)
+    agent.tools, agent.instructions = FakeTools(), 'instructions'
+    r = agent.normalize(unit_obs({'unit_id': 'u1', 'road_id': 'r1', 'road_ids': ['r1', 'r2'], 'status': 'BLOCKED'}))
+    assert r['event_type'] == 'road_blocked' and [c['road_id'] for c in r['location']['road_candidates']] == ['r1', 'r2']
+
+
+def test_a_responder_update_that_is_not_json_goes_to_the_model(monkeypatch):
+    monkeypatch.setattr(in_agent, 'ask_json', lambda *a, **k: {'event_type': 'road_blocked'})
+    agent = in_agent.InAgent.__new__(in_agent.InAgent)
+    agent.tools, agent.instructions = FakeTools(), 'instructions'
+    r = agent.normalize(obs(channel='responder_update', original_text='Road blocked by debris on Meiji-dori'))
+    assert r['event_type'] == 'road_blocked' and 'unit_report' not in r

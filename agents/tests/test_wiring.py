@@ -3,7 +3,7 @@ described for the model, the .md files name only tools the agent gets, and write
 before touching the database."""
 import re
 import pytest
-from agents import orchestrator
+from agents import orchestrator, runner
 from agents.tools import RunTools, TOOL_SPECS, ToolError
 
 
@@ -63,13 +63,15 @@ def test_log_agent_run_tool_only_marks_progress():
 
 
 class FakeTools:
+    run_id = 'run'
+
     def __init__(self):
         self.logged = []
 
     def toolbox(self, agent, names, done):
         return RunTools.toolbox(RunTools.__new__(RunTools), agent, ['log_agent_run'], done)
 
-    def log_agent_run(self, agent, input_ref, output, duration_ms=None):
+    def log_agent_run(self, agent, input_ref, output, duration_ms=None, run_key=None):
         self.logged.append((agent, input_ref, output))
 
 
@@ -84,7 +86,7 @@ def test_orchestrator_logs_each_agents_final_answer(monkeypatch):
     def agent(instructions, payload, specs, functions):
         functions['log_agent_run'](input_ref='obs2')
         return {'output': {'incidents': [{'incident_id': 'i1'}], 'situation_summary': 'ok'}, 'tool_calls': [], 'steps': 2}
-    monkeypatch.setattr(orchestrator, 'run_agent', agent)
+    monkeypatch.setattr(runner, 'run_agent', agent)
     orch = fake_orchestrator(['detect_agent', 'medical_agent'])
     results = orch.assess([{'observation_id': 'obs1'}, {'observation_id': 'obs2'}])
     assert set(results) == {'detect_agent', 'medical_agent'} and orch.cursor == 'obs2'
@@ -97,7 +99,7 @@ def test_orchestrator_logs_a_failed_agent_and_keeps_the_others(monkeypatch):
         if 'boom' in instructions:
             raise RuntimeError('model server error 500')
         return {'output': {'incidents': []}, 'tool_calls': [], 'steps': 1}
-    monkeypatch.setattr(orchestrator, 'run_agent', agent)
+    monkeypatch.setattr(runner, 'run_agent', agent)
     orch = fake_orchestrator(['detect_agent', 'medical_agent'])
     orch.assessment['detect_agent'] = ('boom', ['log_agent_run'])
     results = orch.assess([{'observation_id': 'obs1'}])
@@ -148,3 +150,22 @@ def test_summary_counts_writes_and_errors():
 
 def test_summary_of_a_failed_agent():
     assert orchestrator._summary({'error': 'LLMError: down', 'seconds': 1}) == {'error': 'LLMError: down', 'seconds': 1}
+
+
+def test_merge_groups_keeps_both_writers_groups():
+    from agents.tools import _merge_groups
+    old = [{'group_id': 'g1', 'est_count': 2}, {'group_id': 'g2', 'est_count': 1}]
+    assert _merge_groups(old, None) == old
+    merged = _merge_groups(old, [{'group_id': 'g1', 'est_count': 5}, {'group_id': 'g3', 'est_count': 4}])
+    assert {g['group_id']: g['est_count'] for g in merged} == {'g1': 5, 'g2': 1, 'g3': 4}
+
+
+def test_upsert_incident_rejects_made_up_incident_ids(offline_tools):
+    with pytest.raises(ToolError, match="'inc_1' is not an incident id"):
+        offline_tools.upsert_incident('reported', incident_id='inc_1')
+
+
+def test_upsert_incident_accepts_extra_fields_the_model_adds():
+    """Seen live: the hosted model passed prediction=... to upsert_incident (a TypeError before)."""
+    import inspect
+    assert any(p.kind is p.VAR_KEYWORD for p in inspect.signature(RunTools.upsert_incident).parameters.values())

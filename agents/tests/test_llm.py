@@ -123,3 +123,49 @@ def test_client_errors_are_not_retried(monkeypatch):
     with pytest.raises(llm.LLMError, match='server error 400'):
         llm.run_agent('i', 'go', [], {})
     assert len(calls) == 1
+
+
+def test_requests_are_spread_across_model_servers(monkeypatch):
+    seen = []
+    monkeypatch.setattr(llm, 'AMD', [('http://a/v1', 'k', 'm'), ('http://b/v1', 'k', 'm')])
+    monkeypatch.setattr(llm.httpx, 'post', lambda url, **kw: seen.append(url.split('/')[2]) or
+                        httpx.Response(200, json={'choices': [{'message': {'content': '{}'}}]}, request=httpx.Request('POST', url)))
+    for _ in range(4):
+        llm.ask_json('s', 'u')
+    assert sorted(seen) == ['a', 'a', 'b', 'b']
+
+
+def test_a_server_that_is_down_is_skipped(monkeypatch):
+    monkeypatch.setattr(llm, 'AMD', [('http://down/v1', 'k', 'm'), ('http://up/v1', 'k', 'm')])
+    def post(url, **kw):
+        if 'down' in url:
+            raise httpx.ConnectError('refused')
+        return httpx.Response(200, json={'choices': [{'message': {'content': '{"ok": 1}'}}]}, request=httpx.Request('POST', url))
+    monkeypatch.setattr(llm.httpx, 'post', post)
+    assert all(llm.ask_json('s', 'u') == {'ok': 1} for _ in range(3))
+
+
+def test_agents_use_the_hosted_endpoint_and_fall_back_to_amd(monkeypatch):
+    seen = []
+    monkeypatch.setattr(llm, 'AGENT', [('https://hosted/v1', 'hf_x', 'Qwen/Big')])
+    monkeypatch.setattr(llm, 'AMD', [('http://amd/v1', 'none', 'Qwen/Small')])
+    def post(url, json=None, headers=None, **kw):
+        seen.append((url.split('/')[2], json['model']))
+        status = 402 if 'hosted' in url and post.out_of_credits else 200
+        return httpx.Response(status, json={'choices': [{'message': {'content': '{"ok": 1}'}}]}, request=httpx.Request('POST', url))
+    post.out_of_credits = False
+    monkeypatch.setattr(llm.httpx, 'post', post)
+    assert llm.run_agent('i', 'go', [], {})['output'] == {'ok': 1} and seen == [('hosted', 'Qwen/Big')]
+    post.out_of_credits, seen[:] = True, []
+    assert llm.run_agent('i', 'go', [], {})['output'] == {'ok': 1}
+    assert seen == [('hosted', 'Qwen/Big'), ('amd', 'Qwen/Small')]       # out of credits -> AMD, its own model name
+
+
+def test_the_in_agent_stays_on_amd(monkeypatch):
+    seen = []
+    monkeypatch.setattr(llm, 'AGENT', [('https://hosted/v1', 'hf_x', 'Qwen/Big')])
+    monkeypatch.setattr(llm, 'AMD', [('http://amd/v1', 'none', 'Qwen/Small')])
+    monkeypatch.setattr(llm.httpx, 'post', lambda url, **kw: seen.append(url.split('/')[2]) or
+                        httpx.Response(200, json={'choices': [{'message': {'content': '{}'}}]}, request=httpx.Request('POST', url)))
+    llm.ask_json('s', 'u')
+    assert seen == ['amd']

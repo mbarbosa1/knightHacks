@@ -46,6 +46,8 @@ from agents.llm import setting                 # noqa: E402
 
 BACKEND_URL = setting('BACKEND_URL', 'http://127.0.0.1:8000').rstrip('/')
 AGENTS_DATABASE_URL = setting('AGENTS_DATABASE_URL')
+SIM_URL = setting('SIM_URL', 'http://127.0.0.1:8100').rstrip('/')   # simulator service: Gerard's routing tools
+DECISION_COLUMNS = 'id, run_id, incident_id, version, assignments, route_geojson, fallback_route_geojson, eta_s, status, invalidated_reason, approved_by, approved_at'
 INCIDENT_STATUSES = ('reported', 'corroborated', 'disputed', 'resolved')
 ROAD_STATUSES = ('OPEN', 'LIMITED', 'BLOCKED')
 INCIDENT_COLUMNS = '''id, run_id, status, building_id, uncertainty_m, person_groups, evidence, created_at, updated_at,
@@ -181,14 +183,22 @@ class RunTools:
                 'WHERE run_id = %s ORDER BY road_id', (self.run_id,)).fetchall())
 
     def upsert_incident(self, status, location=None, uncertainty_m=None, building_id=None,
-                        person_groups=None, evidence=None, incident_id=None, sim_time_s=None):
+                        person_groups=None, evidence=None, incident_id=None, sim_time_s=None, **extra):
         """Create (no incident_id) or replace (incident_id given) one incident. Pass the FULL new state:
         this replaces the incident, it does not merge. Returns the stored incident.
+
+        No duplicates: a create for something this run already has (an incident citing one of the same
+        reports, or on the same building) is merged into that incident instead, and the result says
+        "merged_into_existing": true. Agents running in parallel (detect ‖ medical) both try to create the
+        incident for a new report; a per-run lock makes the check-and-create one step.
 
         location {longitude, latitude}; person_groups [{group_id, est_count, condition, needs, confidence}];
         evidence {supports: [observation ids], contradicts: [observation ids]}."""
         if status not in INCIDENT_STATUSES:
             raise ToolError(f'status must be one of {INCIDENT_STATUSES}, got {status!r}')
+        if incident_id is not None and not _is_uuid(incident_id):
+            raise ToolError(f'incident_id {incident_id!r} is not an incident id: use an id from list_incidents or '
+                            f'find_nearby_incidents to update, or leave incident_id out to create a new incident')
         evidence = {'supports': list((evidence or {}).get('supports') or []),
                     'contradicts': list((evidence or {}).get('contradicts') or [])}
         group_ids = [g.get('group_id') for g in person_groups or []]
@@ -197,10 +207,28 @@ class RunTools:
         lon, lat = (location or {}).get('longitude'), (location or {}).get('latitude')
         if (lon is None) != (lat is None):
             raise ToolError('location needs both longitude and latitude, or neither')
-        new_id = incident_id or str(uuid.uuid4())
+        new_id, merged = incident_id or str(uuid.uuid4()), False
         with _db() as conn:
             self._require_live(conn)
             self._require_observations(conn, evidence['supports'] + evidence['contradicts'])
+            if incident_id is None:
+                conn.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', ('incidents:' + self.run_id,))
+                existing = conn.execute(
+                    '''SELECT id, status, building_id, uncertainty_m, person_groups, evidence,
+                              public.ST_X(geom) AS lon, public.ST_Y(geom) AS lat
+                       FROM ops.incidents
+                       WHERE run_id = %s AND (evidence->'supports' ?| %s::text[] OR (%s::text IS NOT NULL AND building_id = %s))
+                       ORDER BY created_at LIMIT 1''',
+                    (self.run_id, evidence['supports'], building_id, building_id)).fetchone()
+                if existing:
+                    new_id, merged = str(existing['id']), True
+                    building_id = building_id or existing['building_id']
+                    if lon is None and existing['lon'] is not None:
+                        lon, lat = existing['lon'], existing['lat']
+                    uncertainty_m = uncertainty_m if uncertainty_m is not None else existing['uncertainty_m']
+                    person_groups = _merge_groups(existing['person_groups'], person_groups)
+                    old = existing['evidence'] or {}
+                    evidence = {k: list(dict.fromkeys((old.get(k) or []) + evidence[k])) for k in ('supports', 'contradicts')}
             try:
                 row = conn.execute(
                     f'''INSERT INTO ops.incidents AS i (id, run_id, geom, uncertainty_m, status, building_id, person_groups, evidence)
@@ -223,10 +251,12 @@ class RunTools:
                                         (new_id, self.run_id)).fetchone()
                 if existing is None:
                     raise ToolError(f'incident {new_id} belongs to another run')
-                return _json(existing)
+                return {**_json(existing), **({'merged_into_existing': True} if merged else {})}
             row = dict(row)
             _event(conn, self.run_id, 'incidents', new_id, 'INSERT' if row.pop('created') else 'UPDATE', row, sim_time_s)
-            return _json(row)
+            return {**_json(row), **({'merged_into_existing': True} if merged else {}),
+                    **({'ignored_fields': sorted(extra), 'note': 'incidents do not store these fields; '
+                        'put them (e.g. prediction, priority) in your final answer'} if extra else {})}
 
     def set_road_restriction(self, road_id, status, source_observation_id=None, sim_time_s=None):
         """Mark one road segment OPEN / LIMITED / BLOCKED (both directions of a street are separate ids).
@@ -251,6 +281,124 @@ class RunTools:
                                           'FROM ops.road_restrictions WHERE run_id = %s AND road_id = %s',
                                           (self.run_id, road_id)).fetchone())
             _event(conn, self.run_id, 'road_restrictions', road_id, 'UPSERT', row, sim_time_s)
+            return _json(row)
+
+    # ---- response side: units, routes, decisions -----------------------------
+    # Routing runs on the simulator service (Gerard's /tools/*, sim/units.py) on the roads the agents BELIEVE
+    # are open (ops.road_restrictions), never the truth. Agents only draft decisions: a human approves, and
+    # only that approval dispatches a unit (POST /dispatch is not an agent tool).
+
+    def list_resources(self, status=None, type=None):
+        """Response units (ambulance / fire_engine / police): id, type, name, status, location, home facility."""
+        units = _get(f'/runs/{self.run_id}/resources', limit=1000)
+        return [u for u in units if (status is None or u.get('status') == status) and (type is None or u.get('type') == type)]
+
+    def list_units(self):
+        """Where every unit is right now in the live run, with its route and decision (for the map)."""
+        return _sim('GET', '/units')
+
+    def _place(self, place, prefix=''):
+        """{incident_id} | {building_id} | {facility_id} | {unit_id} | {longitude, latitude} -> the simulator's fields."""
+        place = place or {}
+        if place.get('incident_id'):
+            inc = next((i for i in self.list_incidents() if i['id'] == place['incident_id']), None)
+            if inc is None:
+                raise ToolError(f'incident {place["incident_id"]} is not in this event: use an id from list_incidents')
+            if inc.get('building_id') and not prefix:      # a destination: the simulator knows the building
+                return {'building_id': inc['building_id']}
+            if not inc.get('location'):
+                raise ToolError(f'incident {inc["id"]} has no location yet')
+            return {f'{prefix}lon': inc['location']['longitude'], f'{prefix}lat': inc['location']['latitude']}
+        if place.get('facility_id'):
+            f = self.map.facilities.get(place['facility_id'])
+            if f is None:
+                raise ToolError(f'facility {place["facility_id"]} is not on this map')
+            return {f'{prefix}lon': f['lon'], f'{prefix}lat': f['lat']}
+        if place.get('building_id') and not prefix:
+            if place['building_id'] not in self.map.buildings:
+                raise ToolError(f'building_id {place["building_id"]!r} is not on this map')
+            return {'building_id': place['building_id']}
+        if place.get('unit_id') and prefix:
+            return {'unit_id': place['unit_id']}
+        if place.get('longitude') is not None and place.get('latitude') is not None:
+            return {f'{prefix}lon': place['longitude'], f'{prefix}lat': place['latitude']}
+        raise ToolError('give a place as {incident_id}, {building_id}, {facility_id}, {unit_id} (start only) '
+                        'or {longitude, latitude}')
+
+    def nearest_units(self, incident_id=None, building_id=None, longitude=None, latitude=None, type=None, k=3):
+        """Free units that can reach a place soonest on the roads believed open, fastest first."""
+        place = self._place({'incident_id': incident_id, 'building_id': building_id,
+                             'longitude': longitude, 'latitude': latitude})
+        return _sim('POST', '/tools/nearest-units', {**place, 'type': type, 'k': k, 'run_id': self.run_id})
+
+    def plan_route(self, origin, destination):
+        """How a unit (or a point) would get somewhere: reachable, travel_time_s, length_m, roads, GeoJSON.
+        Sends nobody."""
+        start = self._place(origin, prefix='from_')
+        return _sim('POST', '/tools/route', {**start, **self._place(destination), 'run_id': self.run_id})
+
+    def facility_options(self, longitude, latitude, type, k=3):
+        """Facilities of a type (hospital / shelter / fire_station / police) ranked by drive time from a point.
+        capacity null means unknown, not zero."""
+        options = []
+        for fid, f in self.map.facilities.items():
+            if f.get('type') != type:
+                continue
+            r = self.plan_route({'longitude': longitude, 'latitude': latitude}, {'facility_id': fid})
+            options.append({'facility_id': fid, 'name_en': f.get('name_en'), 'capacity': f.get('capacity'),
+                            'reachable': r.get('reachable', False), 'travel_time_s': r.get('travel_time_s')})
+        if not options:
+            raise ToolError(f'no facility of type {type!r}; types on this map: '
+                            f'{sorted({f.get("type") for f in self.map.facilities.values()})}')
+        return sorted(options, key=lambda o: (not o['reachable'], o['travel_time_s'] or 1e12))[:k]
+
+    def assign_units(self, incident_ids, type):
+        """One free unit of a type per incident, each incident (in the order given) taking the fastest unit
+        not already taken. Incidents no free unit can reach are listed in 'unassigned'."""
+        taken, out, unassigned = set(), [], []
+        for iid in incident_ids:
+            options = [u for u in self.nearest_units(incident_id=iid, type=type, k=len(taken) + 3)
+                       if u.get('unit_id', u.get('id')) not in taken]
+            if not options:
+                unassigned.append(iid)
+                continue
+            unit = options[0]
+            taken.add(unit.get('unit_id', unit.get('id')))
+            out.append({'incident_id': iid, **unit})
+        return {'assignments': out, 'unassigned': unassigned}
+
+    def list_decisions(self, status=None):
+        """Response plans in this event (draft / approved / invalidated / sent), latest version first."""
+        with _db() as conn:
+            return _json(conn.execute(
+                f'SELECT {DECISION_COLUMNS} FROM ops.decisions WHERE run_id = %s AND (%s::text IS NULL OR status = %s) '
+                'ORDER BY incident_id, version DESC', (self.run_id, status, status)).fetchall())
+
+    def upsert_decision(self, incident_id, assignments, route=None, fallback_route=None, eta_s=None, sim_time_s=None):
+        """Save a new DRAFT version of the response plan for one incident. Never approves or sends it:
+        an operator approves in the UI. assignments: [{unit_id, role?}]."""
+        if not _is_uuid(incident_id):
+            raise ToolError(f'incident_id {incident_id!r} is not an incident id: use an id from list_incidents')
+        if not isinstance(assignments, list) or not all(isinstance(a, dict) and a.get('unit_id') for a in assignments):
+            raise ToolError('assignments must be a list of {unit_id, ...} with unit ids from nearest_units / list_resources')
+        known = {u['id'] for u in self.list_resources()}
+        unknown = sorted({a['unit_id'] for a in assignments} - known)
+        if unknown:
+            raise ToolError(f'unknown unit ids {unknown}: use ids from nearest_units or list_resources')
+        with _db() as conn:
+            self._require_live(conn)
+            if not conn.execute('SELECT 1 FROM ops.incidents WHERE id = %s AND run_id = %s', (incident_id, self.run_id)).fetchone():
+                raise ToolError(f'incident {incident_id} is not in this event: use an id from list_incidents')
+            conn.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', ('decisions:' + str(incident_id),))
+            version = conn.execute('SELECT coalesce(max(version), 0) + 1 AS v FROM ops.decisions WHERE incident_id = %s',
+                                   (incident_id,)).fetchone()['v']
+            row = dict(conn.execute(
+                f'''INSERT INTO ops.decisions (run_id, incident_id, version, assignments, route_geojson,
+                                               fallback_route_geojson, eta_s, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'draft') RETURNING {DECISION_COLUMNS}''',
+                (self.run_id, incident_id, version, Jsonb(assignments), Jsonb(route) if route else None,
+                 Jsonb(fallback_route) if fallback_route else None, eta_s)).fetchone())
+            _event(conn, self.run_id, 'decisions', row['id'], 'INSERT', row, sim_time_s)
             return _json(row)
 
     # ---- agent audit log (ops.agent_runs) ----------------------------------
@@ -280,6 +428,21 @@ class RunTools:
                                'WHERE run_id = %s AND agent = %s ORDER BY created_at DESC LIMIT 1',
                                (self.run_id, agent)).fetchone()
             return _json(row) if row else None
+
+    def agent_outputs(self, agent):
+        """This agent's successful outputs in this run, oldest first (e.g. in_agent records for a later agent)."""
+        with _db() as conn:
+            return [r['output'] for r in conn.execute(
+                "SELECT output FROM ops.agent_runs WHERE run_id = %s AND agent = %s AND output->>'error' IS NULL "
+                'ORDER BY created_at', (self.run_id, agent)).fetchall()]
+
+    def assessed_observations(self):
+        """Observation ids in a completed assessment batch (the orchestrator's queue bookkeeping)."""
+        with _db() as conn:
+            return {r['o'] for r in conn.execute(
+                """SELECT jsonb_array_elements_text(output->'observation_ids') AS o FROM ops.agent_runs
+                   WHERE run_id = %s AND agent = 'orchestrator' AND output->>'stage' = 'assessment'
+                     AND coalesce((output->>'complete')::boolean, true)""", (self.run_id,)).fetchall()}
 
     def processed_inputs(self, agent):
         """input_ref of every successful entry of this agent (output.error is null): work already done."""
@@ -335,6 +498,9 @@ class RunTools:
 # Tool descriptions the model sees: name -> (what it does, parameters as JSON schema, required).
 _POINT = {'lon': {'type': 'number', 'description': 'longitude'}, 'lat': {'type': 'number', 'description': 'latitude'}}
 _UUIDS = {'type': 'array', 'items': {'type': 'string'}}
+_PLACE = {'type': 'object', 'properties': {k: {'type': t} for k, t in (
+    ('incident_id', 'string'), ('building_id', 'string'), ('facility_id', 'string'), ('unit_id', 'string'),
+    ('longitude', 'number'), ('latitude', 'number'))}}
 TOOL_SPECS = {
     'get_run': ('The current event: status (running = live), hazard_types, map version.', {}, []),
     'list_observations': ('Reports of this event. ids: only these observation ids; after: only reports after this id.',
@@ -369,11 +535,74 @@ TOOL_SPECS = {
                              {'road_id': {'type': 'string', 'description': 'only an id returned by find_nearest_road'},
                               'status': {'type': 'string', 'enum': list(ROAD_STATUSES)},
                               'source_observation_id': {'type': 'string'}}, ['road_id', 'status']),
+    'list_resources': ('Response units: id, type (ambulance / fire_engine / police), status, location, home facility.',
+                       {'status': {'type': 'string', 'enum': ['available', 'en_route', 'busy', 'out_of_service']},
+                        'type': {'type': 'string', 'enum': ['ambulance', 'fire_engine', 'police']}}, []),
+    'list_units': ('Where every unit is right now, with its route and the decision it follows.', {}, []),
+    'nearest_units': ('Free units that can reach a place soonest on roads believed open, fastest first. '
+                      'Give incident_id, or building_id, or longitude+latitude.',
+                      {'incident_id': {'type': 'string'}, 'building_id': {'type': 'string'},
+                       'longitude': {'type': 'number'}, 'latitude': {'type': 'number'},
+                       'type': {'type': 'string', 'enum': ['ambulance', 'fire_engine', 'police']},
+                       'k': {'type': 'integer'}}, []),
+    'plan_route': ('How a unit or a point would get somewhere (reachable, travel_time_s, length_m, roads). Sends nobody. '
+                   'origin: {unit_id} or {longitude, latitude} or {incident_id} or {facility_id}; '
+                   'destination: {incident_id} or {building_id} or {facility_id} or {longitude, latitude}.',
+                   {'origin': _PLACE, 'destination': _PLACE}, ['origin', 'destination']),
+    'facility_options': ('Facilities of a type ranked by drive time from a point (capacity null = unknown).',
+                         {'longitude': {'type': 'number'}, 'latitude': {'type': 'number'},
+                          'type': {'type': 'string', 'enum': ['hospital', 'shelter', 'fire_station', 'police']},
+                          'k': {'type': 'integer'}}, ['longitude', 'latitude', 'type']),
+    'assign_units': ('One free unit of a type per incident (in the order given), each taking the fastest unit not '
+                     'already taken; unreachable incidents are listed as unassigned.',
+                     {'incident_ids': _UUIDS, 'type': {'type': 'string', 'enum': ['ambulance', 'fire_engine', 'police']}},
+                     ['incident_ids', 'type']),
+    'list_decisions': ('Response plans in this event, latest version first.',
+                       {'status': {'type': 'string', 'enum': ['draft', 'approved', 'invalidated', 'sent']}}, []),
+    'upsert_decision': ('Save a new DRAFT plan for one incident (a human approves it; this never sends anyone). '
+                        'assignments: [{unit_id, role}] with unit ids from nearest_units.',
+                        {'incident_id': {'type': 'string'},
+                         'assignments': {'type': 'array', 'items': {'type': 'object', 'properties': {
+                             'unit_id': {'type': 'string'}, 'role': {'type': 'string'}}}},
+                         'route': {'type': 'object'}, 'fallback_route': {'type': 'object'}, 'eta_s': {'type': 'number'}},
+                        ['incident_id', 'assignments']),
     'log_agent_run': ('Call this last, every time, with only the id of the last report you processed. Then reply '
                       'with your final JSON answer as plain text (not inside a tool call).',
                       {'input_ref': {'type': 'string', 'description': 'last observation id you processed'}},
                       ['input_ref']),
 }
+
+
+def _is_uuid(value):
+    try:
+        uuid.UUID(str(value))
+        return True
+    except ValueError:
+        return False
+
+
+def _merge_groups(old, new):
+    """Person groups of two writers for one incident: same group_id -> the newer one, others kept."""
+    if new is None:
+        return old
+    groups = {g.get('group_id'): g for g in old or []}
+    groups.update({g['group_id']: g for g in new})
+    return list(groups.values())
+
+
+def _sim(method, path, body=None):
+    """Call the simulator service's agent tools. Its 409/422 replies (no live run, unit not free, unknown
+    building, no way there) come back as ToolError with its reason, so the model can adjust."""
+    try:
+        r = httpx.request(method, SIM_URL + path, json={k: v for k, v in (body or {}).items() if v is not None}
+                          if body is not None else None, timeout=60)
+    except httpx.HTTPError as exc:
+        raise ToolError(f'simulator service not reachable at {SIM_URL} ({exc}); is ./dev.sh running?') from None
+    if r.status_code in (404, 409, 422):
+        detail = r.json().get('detail') if r.headers.get('content-type', '').startswith('application/json') else r.text
+        raise ToolError(f'simulator says ({r.status_code}): {detail}')
+    r.raise_for_status()
+    return r.json()
 
 
 def _get(path, **params):

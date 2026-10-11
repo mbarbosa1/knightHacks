@@ -9,14 +9,16 @@ another host (Hugging Face, Gemini's OpenAI endpoint, ...) only changes the thre
     data = ask_json(system=..., user=..., image_url="https://.../photo.jpg")        # vision
 
 Settings (environment variables, else backend/.env, which is never committed):
-    LLM_BASE_URL  http://localhost:8001/v1   (the SSH tunnel to the AMD server must be open:
+    LLM_BASE_URL  http://localhost:8001/v1   one address, or several separated by commas (requests are spread
+                  across them; one that stops answering is skipped), e.g. two copies of the model on the GPU:
+                  http://localhost:8001/v1,http://localhost:8002/v1   (the SSH tunnel to the AMD server must be open:
                   ssh -N -o ServerAliveInterval=30 -L 8001:localhost:8000 root@36.150.116.206 -p 36756)
     LLM_API_KEY   none
     LLM_MODEL     Qwen/Qwen3-VL-8B-Instruct
 
 The server speaks the OpenAI chat-completions API, called here with httpx (already installed).
 '''
-import json, os, pathlib, re, time
+import itertools, json, os, pathlib, re, threading, time
 import httpx
 
 ENV_FILE = pathlib.Path(__file__).resolve().parents[1] / 'backend' / '.env'
@@ -33,9 +35,40 @@ def setting(name, default=None):
     return default
 
 
-BASE_URL = setting('LLM_BASE_URL', 'http://localhost:8001/v1').rstrip('/')
+BASE_URLS = [u.strip().rstrip('/') for u in setting('LLM_BASE_URL', 'http://localhost:8001/v1').split(',') if u.strip()]
+BASE_URL = BASE_URLS[0]
 API_KEY = setting('LLM_API_KEY', 'none')
+if API_KEY in ('', 'none') and 'huggingface.co' in BASE_URL:   # pointing everything at Hugging Face: its token
+    API_KEY = setting('HF_TOKEN', 'none')
 MODEL = setting('LLM_MODEL', 'Qwen/Qwen3-VL-8B-Instruct')
+_turn, _turn_lock = itertools.count(), threading.Lock()
+
+# A model server is (base url, api key, model name). AMD: the default, used by ask_json (the in_agent).
+AMD = [(url, API_KEY, MODEL) for url in BASE_URLS]
+# Optional hosted endpoint for the tool-using agents (run_agent): many parallel requests at ~2-3 s each, where
+# the AMD server answers one at a time. Falls back to AMD when it fails. AGENT_LLM=off disables it (the tests).
+#   AGENT_LLM_BASE_URL=https://router.huggingface.co/v1   AGENT_LLM_MODEL=Qwen/Qwen3-VL-30B-A3B-Instruct
+#   AGENT_LLM_API_KEY (else HF_TOKEN)
+AGENT = ([(setting('AGENT_LLM_BASE_URL').rstrip('/'), setting('AGENT_LLM_API_KEY') or setting('HF_TOKEN', ''),
+           setting('AGENT_LLM_MODEL', MODEL))]
+         if setting('AGENT_LLM_BASE_URL') and os.environ.get('AGENT_LLM', '').lower() != 'off' else [])
+
+
+def _post(json_body, timeout, servers=None):
+    """POST /chat/completions to the next server in turn (round robin), with that server's model name.
+    A server that cannot be reached is skipped for the next one; the last connection error is raised."""
+    servers = servers or AMD
+    with _turn_lock:
+        start = next(_turn)
+    error = None
+    for i in range(len(servers)):
+        url, key, model = servers[(start + i) % len(servers)]
+        try:
+            return httpx.post(f'{url}/chat/completions', timeout=timeout,
+                              headers={'Authorization': f'Bearer {key}'}, json={**json_body, 'model': model})
+        except httpx.TransportError as exc:
+            error = exc
+    raise error
 
 
 class LLMError(RuntimeError):
@@ -67,13 +100,11 @@ def ask_json(system, user, image_url=None, max_tokens=500, retries=2, timeout=12
     last_error = None
     for attempt in range(retries + 1):
         try:
-            r = httpx.post(f'{BASE_URL}/chat/completions', timeout=timeout,
-                           headers={'Authorization': f'Bearer {API_KEY}'},
-                           json={'model': MODEL, 'messages': messages, 'temperature': 0, 'max_tokens': max_tokens})
+            r = _post({'messages': messages, 'temperature': 0, 'max_tokens': max_tokens}, timeout)
             r.raise_for_status()
             reply = r.json()['choices'][0]['message']['content']
         except (httpx.HTTPError, KeyError) as exc:
-            last_error = f'model not reachable at {BASE_URL} ({exc}); is the SSH tunnel open?'
+            last_error = f'model not reachable at {', '.join(BASE_URLS)} ({exc}); is the SSH tunnel open?'
             time.sleep(2 * (attempt + 1))
             continue
         try:
@@ -98,26 +129,36 @@ SERVER_ERROR_RETRIES = 2   # a 5xx from the model server is usually momentary (s
 
 
 def _chat(messages, tool_specs, max_tokens, timeout, step, tool_calls_so_far):
-    """One model turn of run_agent. A 5xx is retried after a short pause, so a momentary server error does
-    not throw away the tool calls the agent already made; anything else fails at once with a clear message."""
-    for attempt in range(SERVER_ERROR_RETRIES + 1):
-        try:
-            r = httpx.post(f'{BASE_URL}/chat/completions', timeout=timeout, headers={'Authorization': f'Bearer {API_KEY}'},
-                           json={'model': MODEL, 'messages': messages, 'tools': tool_specs,
-                                 'temperature': 0, 'max_tokens': max_tokens})
-            r.raise_for_status()
-            return r.json()['choices'][0]['message']
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code >= 500 and attempt < SERVER_ERROR_RETRIES:
-                time.sleep(5 * (attempt + 1))
-                continue
-            raise LLMError(f'model server error {exc.response.status_code} at step {step} '
-                           f'(after {tool_calls_so_far} tool calls, {attempt + 1} tries): {exc.response.text[:300]}') from None
-        except (httpx.HTTPError, KeyError) as exc:
-            raise LLMError(f'model not reachable at {BASE_URL} ({exc}); is the SSH tunnel open?') from None
+    """One model turn of run_agent: the hosted endpoint first when configured, else (or when it fails) AMD.
+    A 5xx is retried after a short pause, so a momentary server error does not throw away the tool calls the
+    agent already made; anything else moves on to the next group of servers, or fails with a clear message."""
+    body = {'messages': messages, 'tools': tool_specs, 'temperature': 0, 'max_tokens': max_tokens}
+    groups = ([('hosted', AGENT)] if AGENT else []) + [('AMD', AMD)]
+    for g, (name, servers) in enumerate(groups):
+        last = g == len(groups) - 1
+        for attempt in range(SERVER_ERROR_RETRIES + 1):
+            try:
+                r = _post(body, timeout, servers)
+                r.raise_for_status()
+                return r.json()['choices'][0]['message']
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code >= 500 and attempt < SERVER_ERROR_RETRIES:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                if not last:
+                    break                                   # e.g. 402 out of credits, 429: use AMD instead
+                raise LLMError(f'model server error {exc.response.status_code} at step {step} ({name}, '
+                               f'after {tool_calls_so_far} tool calls, {attempt + 1} tries): {exc.response.text[:300]}') from None
+            except (httpx.HTTPError, KeyError) as exc:
+                if not last:
+                    break
+                raise LLMError(f'model not reachable at {", ".join(u for u, _, _ in servers)} ({exc}); '
+                               f'is the SSH tunnel open?') from None
 
 
-def run_agent(instructions, user_input, tool_specs, tool_functions, max_steps=30, max_tokens=1500, timeout=180):
+# One model server answers one request at a time (continuous batching never engages for this model), so a turn
+# can wait minutes behind other agents: a generous timeout. Final answers list every incident: room for them.
+def run_agent(instructions, user_input, tool_specs, tool_functions, max_steps=30, max_tokens=4000, timeout=900):
     """Run one agent invocation and return {"output": <final JSON answer>, "tool_calls": [...], "steps": n}.
 
     instructions    the agent's .md text (system prompt)

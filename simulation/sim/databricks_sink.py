@@ -27,7 +27,7 @@ Configuration (environment variables, else backend/.env; backend/.env is never c
     DATABRICKS_HOST       https://dbc-....cloud.databricks.com
     DATABRICKS_HTTP_PATH  /sql/1.0/warehouses/<id>
     DATABRICKS_TOKEN      dapi...
-With any of them missing the upload is off and the simulator works exactly as before.
+With any of them missing (or DATABRICKS_UPLOAD=off) the upload is off and the simulator works exactly as before.
 '''
 import concurrent.futures, datetime, json, logging, os, pathlib, ssl, sys, time, urllib.error, urllib.request
 from .storage import LocalStorage
@@ -84,7 +84,9 @@ def load_settings():
 
 
 def enabled():
-    return load_settings() is not None
+    """Upload on when the three settings exist. DATABRICKS_UPLOAD=off turns it off (the tests set it, so test
+    runs never reach the real tables)."""
+    return os.environ.get('DATABRICKS_UPLOAD', '').lower() != 'off' and load_settings() is not None
 
 
 # =============================================================================
@@ -232,9 +234,13 @@ SCORECARD_SQL = pathlib.Path(__file__).resolve().parents[2] / 'databricks' / 'sc
 
 
 def default_agent_config():
-    """Which setup is being scored: the model the agents used (LLM_MODEL in backend/.env)."""
-    model = os.environ.get('LLM_MODEL') or _env_file().get('LLM_MODEL') or 'unknown-model'
-    return model.split('/')[-1].lower()
+    """Which setup is being scored: the models the agents used (backend/.env): LLM_MODEL for the in_agent, and
+    AGENT_LLM_MODEL for the tool-using agents when they run on a hosted endpoint, e.g.
+    'qwen3-vl-8b-instruct+qwen3-vl-30b-a3b-instruct'."""
+    env = _env_file()
+    names = [os.environ.get(k) or env.get(k) for k in ('LLM_MODEL', 'AGENT_LLM_MODEL')]
+    names = [n.split('/')[-1].lower() for n in names if n]
+    return '+'.join(dict.fromkeys(names)) or 'unknown-model'
 
 
 def score_run(run_id, agent_config=None, db=None):
