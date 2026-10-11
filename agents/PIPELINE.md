@@ -43,6 +43,10 @@ The two 8000s don't clash: one is on the GPU box, the other on your laptop. Poin
 | detect_agent | `assesmentAgent/detect-agent/detect-agent.md` | read + `upsert_incident`, `set_road_restriction`, `log_agent_run` | `run_agent` |
 | medical_agent | `assesmentAgent/medical-agent.md` | read + `upsert_incident`, `log_agent_run` | `run_agent` |
 | verify_agent | `assesmentAgent/verify-agent.md` | read + `find_nearby_buildings`, `upsert_incident`, `log_agent_run` | `run_agent` |
+| resource_agent | `responseAgent/resource-agent.md` | read + `list_resources`, `list_decisions`, `nearest_units`, `assign_units`, `facility_options`, `log_agent_run` | not wired up yet |
+| route_agent | `responseAgent/route-agent.md` | read + `list_road_restrictions`, `list_decisions`, `check_route`, `plan_route`, `facility_options`, `invalidate_decision`, `log_agent_run` | not wired up yet |
+| plan_agent | `responseAgent/plan-agent.md` | read + `list_resources`, `list_decisions`, `plan_route`, `upsert_decision`, `log_agent_run` | not wired up yet |
+| report_agent | `responseAgent/report-agent.md` | read + `list_road_restrictions`, `list_resources`, `list_decisions`, `log_agent_run` | not wired up yet |
 
 The tool lists live in `ASSESSMENT_AGENTS` in `orchestrator.py`. An agent takes part once its
 `.md` exists at that path; until then it's skipped, so agents can be added one at a time.
@@ -102,7 +106,24 @@ LLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
 
 ## Not wired up yet
 
-- `medical-agent.md` and `verify-agent.md` don't exist yet.
-- Response agents (route, resource, plan, report) aren't in the orchestrator yet;
-  `responseAgent/route-agent.md` is empty.
+- Response agents (resource ‖ route → plan → report) have instructions but aren't in the
+  orchestrator yet. Each `.md` documents its input: the assessment agents' outputs plus
+  `incident_ids` (incidents changed in the batch); plan gets resource + route outputs; report gets
+  everything.
+- They need these tools added to `RunTools` / `TOOL_SPECS` in `agents/tools.py` (same rules as the
+  existing write tools: run must be live, ids checked, one `ops.operational_events` row per change):
+
+  | Tool | Does | Built on |
+  |---|---|---|
+  | `list_resources(status?, type?)` | units: id, type (`ambulance` / `fire_engine` / `police`), status, location, home facility | `GET /runs/{id}/resources` |
+  | `list_decisions(status?)` | plans with their assignments, routes, version, status | `ops.decisions` |
+  | `nearest_units(incident_id, type?, k?)` | fastest available units to an incident | `Router.nearest_units` |
+  | `assign_units(incident_ids, type)` | one unit per incident, minimum total drive time | `Router.assign` |
+  | `facility_options(lon, lat, type)` | facilities ranked by drive time | `Router.facility_options` |
+  | `plan_route(origin, destination)` | route + fallback; places are `{incident_id}` / `{unit_id}` / `{facility_id}` / `{longitude, latitude}` | `Router.route` |
+  | `check_route(decision_id)` | roads on a plan's route that are no longer OPEN | `Router.affected_edges` (store `edge_ids` with the route) |
+  | `upsert_decision(incident_id, assignments, route, fallback_route, eta_s)` | new `draft` version for the incident; never approved/sent | `ops.decisions` |
+  | `invalidate_decision(decision_id, reason)` | status `invalidated` + `invalidated_reason` | `ops.decisions` |
+
+  Every routing tool plans on the agents' beliefs (`list_road_restrictions`), never on truth.
 - `assesmentAgent/detect-agent/detect_tools.py` is replaced by `agents/tools.py`.
