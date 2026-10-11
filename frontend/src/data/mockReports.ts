@@ -11,6 +11,9 @@ export interface MockReport {
   location: string;
   verified: boolean;
   incidentId: string;
+  /** Real reports only: the language it was sent in, and its text in that language when it is not English. */
+  lang?: string;
+  originalText?: string;
 }
 
 export const mockReports: MockReport[] = [

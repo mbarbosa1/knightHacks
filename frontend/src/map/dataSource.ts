@@ -164,6 +164,35 @@ export async function retryEarthquake(runId: string): Promise<RunTruth> {
   return submitEarthquake(`${SIM_BASE}/runs/${runId}/retry`, {});
 }
 
+/** One report as agents see it (ops.observations through the backend): no answer key, no hidden truth. */
+export interface Observation {
+  id: string;
+  channel: "emergency_call_119" | "eyewitness_text" | "social_media" | "fire_police_radio" | string;
+  lang: string | null;
+  original_text: string | null;
+  text_en: string | null;
+  claimed_location: string | null;
+  location_precision: "gps" | "address" | "landmark" | "vague" | null;
+  source_reliability: number | null;
+  sim_time_s: number | null;
+  longitude: number | null;
+  latitude: number | null;
+}
+
+/** Every report of a saved run, from the backend's feed (1000 per page). Empty without a backend. */
+export async function loadReports(runId: string): Promise<Observation[]> {
+  if (!API_BASE) return [];
+  const all: Observation[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const page = await getJson<Observation[]>(
+      `${API_BASE}/runs/${runId}/observations?limit=1000${after ? `&after=${after}` : ""}`);
+    all.push(...page);
+    if (page.length < 1000) return all;
+    after = page[page.length - 1].id;
+  }
+}
+
 /** True once the backend and a run id are configured; until then the operational view is a placeholder. */
 export const operationalConnected = Boolean(API_BASE);
 

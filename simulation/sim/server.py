@@ -13,6 +13,9 @@ With BACKEND_URL set (e.g. http://127.0.0.1:8000), the map comes from Neon throu
 new run is stored there. POST /runs returns success only after the reports, initial resources and
 readiness receipt commit together. Prepared submissions survive restart and can be retried.
 The default is Neon mode; SIM_LOCAL_ONLY=1 explicitly selects a local-only developer demo.
+
+SIM_GEMINI=1 has Gemini write the report wording (needs GEMINI_API_KEY; see sim/report_writer.py). It adds up to
+a few minutes to POST /runs on the free tier; reports Gemini cannot word keep their template text. Off by default.
 """
 import asyncio, collections, json, logging, os, random, uuid
 from contextlib import asynccontextmanager
@@ -32,6 +35,7 @@ from .storage import LocalStorage
 KEEP_RUNS = 20   # truth of the most recent runs stays in memory
 BACKEND_URL = None if os.environ.get('SIM_LOCAL_ONLY') == '1' else os.environ.get('BACKEND_URL', 'http://127.0.0.1:8000')
 log = logging.getLogger('uvicorn.error')
+GEMINI = os.environ.get('SIM_GEMINI') == '1'   # opt-in Gemini wording for every new run
 
 @asynccontextmanager
 async def lifespan(app):
@@ -82,7 +86,8 @@ def submission_error(storage, exc):
 
 def saved_view(run_id, name):
     try:
-        return json.loads((LocalStorage().runs_dir / str(uuid.UUID(run_id)) / name).read_text())
+        # encoding='utf-8' for Windows (Hasita's laptop): saved views hold Japanese report text; same as macOS/Linux.
+        return json.loads((LocalStorage().runs_dir / str(uuid.UUID(run_id)) / name).read_text(encoding='utf-8'))
     except (FileNotFoundError,ValueError):
         raise HTTPException(404,'Run view not found')
 
@@ -95,7 +100,8 @@ class NewRun(BaseModel):
 @app.get('/health')
 def health():
     return {'status':'ok','magnitude_range':list(MW_RANGE),'storage_mode':'neon' if BACKEND_URL else 'local-demo',
-            'truth_upload':'databricks' if databricks_sink.enabled() else 'off'}
+            'truth_upload':'databricks' if databricks_sink.enabled() else 'off',
+            'report_wording':'gemini' if GEMINI else 'templates'}
 
 
 @app.post('/runs', status_code=201)
@@ -106,7 +112,10 @@ def new_run(body: NewRun):
         storage = ApiStorage(BACKEND_URL, defer_observations=True)
     seed = body.seed if body.seed is not None else random.SystemRandom().randrange(1, 2**31)
     try:
-        truth, sc, _ = start_run(seed, storage=storage, static_map=static_map, mw=body.mw)
+        writer = None
+        if GEMINI:
+            from .report_writer import write_reports as writer
+        truth, sc, _ = start_run(seed, storage=storage, static_map=static_map, mw=body.mw, writer=writer)
         if BACKEND_URL:
             storage.prepare_ingestion(initial_resources(static_map,truth.run_id))
         data = run_truth(truth,sc,static_map)

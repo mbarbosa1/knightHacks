@@ -235,10 +235,13 @@ class ApiStorage:
                 # Keep the simulator's original row-shaped records for check_sim_run.py.
                 spool = Path(root)/str(run_id)/'pending_observations.jsonl'
                 if spool.exists():
-                    original = {o['id']:o for o in (json.loads(x) for x in spool.read_text().splitlines())}
+                    # encoding='utf-8' (here and below) added for Windows (Hasita's laptop): Windows defaults to
+                    # cp1252, which cannot read or write Japanese report text. Same as the macOS/Linux default.
+                    original = {o['id']:o for o in (json.loads(x) for x in spool.read_text(encoding='utf-8').splitlines())}
                     target = Path(root)/str(run_id)/'observations.jsonl'
                     # Atomic JSON job remains the recovery source; mirror is informational.
-                    target.write_text(''.join(json.dumps(o,ensure_ascii=False)+'\n' for o in original.values()))
+                    target.write_text(''.join(json.dumps(o,ensure_ascii=False)+'\n' for o in original.values()),
+                                      encoding='utf-8')
                 return receipt
             except Exception as exc:
                 job.update(phase='prepared',last_error=str(exc))
@@ -248,7 +251,7 @@ class ApiStorage:
     def recover_prepared(self):
         results = []
         for path in Path(self.truth_storage.runs_dir).glob('*/submission.json'):
-            job = json.loads(path.read_text())
+            job = json.loads(path.read_text(encoding='utf-8'))   # utf-8 for Windows (Hasita's laptop)
             if job['phase'] == 'prepared':
                 try:
                     results.append(self.resume(job['run_id']))

@@ -56,6 +56,8 @@ const escapeHtml = (value: unknown) =>
 interface Props {
   /** Draw every road segment, not only the affected ones. A debugging aid; off by default. */
   showRoadGraph?: boolean;
+  /** Told the id of the saved run the map now shows (after Generate, Retry or a reload), or null after Reset. */
+  onRunChange?: (runId: string | null) => void;
 }
 
 /**
@@ -64,7 +66,7 @@ interface Props {
  *  - Operational view: what agents believe (incidents, road restrictions, units). A placeholder until
  *    runs are written to the database; the layers exist and fill in when data arrives.
  */
-export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function ShinjukuMap({ showRoadGraph = false }, ref) {
+export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function ShinjukuMap({ showRoadGraph = false, onRunChange }, ref) {
   const container = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const staticRef = useRef<StaticMap | null>(null);
@@ -82,6 +84,10 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
   // After Reset the map follows no run at all, not the one this tab remembered from before.
   const [detached, setDetached] = useState(false);
   const activeRunId = truth?.ingestion?.ready ? truth.run_id : detached ? undefined : RUN_ID;
+
+  useEffect(() => {
+    onRunChange?.(activeRunId ?? null);
+  }, [activeRunId, onRunChange]);
 
   useEffect(() => {
     simulatorAvailable().then(setSimulator);
