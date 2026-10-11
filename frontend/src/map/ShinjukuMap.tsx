@@ -96,6 +96,7 @@ interface Props {
   showRoadGraph?: boolean;
   /** Called whenever anything the side panels show has changed. */
   onUpdate?: (state: MapState) => void;
+
 }
 
 /**
@@ -105,6 +106,7 @@ interface Props {
  *    runs are written to the database; the layers exist and fill in when data arrives.
  */
 export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function ShinjukuMap({ showRoadGraph = false, onUpdate }, ref) {
+
   const container = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const staticRef = useRef<StaticMap | null>(null);

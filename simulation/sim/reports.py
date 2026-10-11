@@ -5,7 +5,7 @@ templates; Gemini can reword it later without changing a fact. Channel settings,
 levels are our own assumptions (UNCERTAIN, tunable). The Japanese templates have not been checked by a
 native speaker.
 """
-import math, random, re, uuid
+import math, random, re, sys, uuid
 from .scenario import CENTER
 from .roads import KX, KY
 
@@ -20,6 +20,9 @@ CHANNELS = {
     'fire_police_radio':  {'style': 'radio', 'delay': (180, 1500), 'reliability': (0.85, 0.95), 'count_noise': 0.15, 'count_stated': 0.9,
                            'precision': {'address': 0.7, 'gps': 0.3}, 'lang': {'ja': 0.8, 'en': 0.2}},
 }
+# Two categories for display and agents. The channel names stay as the DB enum (ops.observation_channel) has them.
+CHANNEL_GROUP = {'emergency_call_119': 'radio', 'eyewitness_text': 'radio', 'fire_police_radio': 'radio',
+                 'social_media': 'social_media'}
 # Which channel carries which kind of event.
 CHANNEL_MIX = {
     'rescue': {'emergency_call_119': 0.45, 'eyewitness_text': 0.2, 'social_media': 0.2, 'fire_police_radio': 0.15},
@@ -188,14 +191,40 @@ def _render(kind, lang, style, f):
     return fill(lang), fill('en')
 
 
-def generate_reports(static_map, sc, truth, volume=1.0):
+def apply_writer(items, reposts, writer):
+    """Swap template wording for the writer's where it gave some; None keeps the template. Reposts are
+    (repost, original) pairs and copy their original's final text. Only wording changes, never a fact."""
+    firsts = [it for it in items if not it['recipe']['is_repost']]
+    try:
+        texts = writer([it['recipe'] for it in firsts])
+    except Exception as e:   # the writer is optional; any failure means template text
+        print(f'[reports] writer failed, keeping templates: {e}', file=sys.stderr)
+        return 0
+    if len(texts) != len(firsts):
+        print(f'[reports] writer returned {len(texts)} texts for {len(firsts)} reports, keeping templates', file=sys.stderr)
+        return 0
+    done = 0
+    for it, t in zip(firsts, texts):
+        if t:
+            it['observation'].update(original_text=t['original_text'], text_en=t['text_en'])
+            done += 1
+    for again, orig in reposts:
+        again['observation'].update(original_text='RT ' + orig['observation']['original_text'],
+                                    text_en='RT ' + orig['observation']['text_en'])
+    print(f'[reports] writer wording used for {done}/{len(firsts)} reports', file=sys.stderr)
+    return done
+
+
+def generate_reports(static_map, sc, truth, volume=1.0, writer=None):
     """-> [{'observation': {...}, 'links': [...], 'recipe': {...}}] in release order. Deterministic for a seed.
     observation rows match ops.observations minus received_at (set when the report is released);
     links match truth_links minus scenario_id. recipe is every fact the wording was built from, for a
     writer (Gemini) that replaces the template text; it contains truth, so it never leaves the simulator.
-    volume scales how many reports there are."""
+    volume scales how many reports there are. writer (optional, e.g. report_writer.write_reports) takes the
+    recipes and returns one {'original_text', 'text_en'} or None per recipe; it runs after every random draw,
+    so facts, ids and links are the same with or without it."""
     m, rng, places = static_map, random.Random(f'{sc.seed}:reports'), _Places(static_map)
-    out = []
+    out, reposts = [], []
 
     def new_id():
         """Same seed -> same ids within a run, but different runs never share one (ops.observations.id is
@@ -247,6 +276,7 @@ def generate_reports(static_map, sc, truth, volume=1.0):
                          source_reliability=round(max(0.1, obs['source_reliability'] - 0.1), 2),
                          sim_time_s=round(obs['sim_time_s'] + rng.uniform(30, 300), 1))
             out.append({'observation': again, 'links': item['links'], 'recipe': {**recipe, 'is_repost': True}})
+            reposts.append((out[-1], item))
         return item
 
     def how_many(key):
@@ -314,4 +344,6 @@ def generate_reports(static_map, sc, truth, volume=1.0):
         c = m.building_geoms[rng.choice(intact)].centroid
         emit('ambient', 'ambient', (c.x, c.y), [], {}, match='unmatched')
 
+    if writer is not None:
+        apply_writer(out, reposts, writer)
     return sorted(out, key=lambda x: x['observation']['sim_time_s'])
