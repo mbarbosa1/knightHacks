@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  BarChart3,
   ArrowDownRight,
   ArrowUpRight,
   Check,
@@ -32,6 +33,10 @@ import { CHANNELS, UNIT_COLOR, UNIT_LABEL, ShinjukuMap, formatClock, type Shinju
 import type { MapState } from "./map/ShinjukuMap";
 import { approveProposal, incidentPriority, loadAgentRuns, loadAgentsStatus, rejectProposal } from "./map/dataSource";
 import type { AgentRun, AgentsStatus, Decision, LiveUnit, OperationalState, Report } from "./map/dataSource";
+import "./analytics/analytics.css";
+
+const AnalyticsPage = lazy(() => import("./analytics/AnalyticsPage"));
+const currentPage = () => window.location.pathname.replace(/\/$/, "") === "/analytics" ? "analytics" : "operations";
 
 type BelievedIncident = OperationalState["incidents"][number];
 
@@ -97,6 +102,22 @@ function toReport(o: Report): MockReport {
 }
 
 function App() {
+  const [page, setPage] = useState(currentPage);
+  const [operationsVisited, setOperationsVisited] = useState(() => currentPage() === "operations");
+  const navigate = (next: "analytics" | "operations") => {
+    window.history.pushState({}, "", next === "analytics" ? "/analytics" : "/");
+    setPage(next);
+    if (next === "operations") setOperationsVisited(true);
+  };
+  useEffect(() => {
+    const follow = () => { const next = currentPage(); setPage(next); if (next === "operations") setOperationsVisited(true); };
+    window.addEventListener("popstate", follow);
+    return () => window.removeEventListener("popstate", follow);
+  }, []);
+  useEffect(() => {
+    document.title = page === "analytics" ? "Analytics & Replay · KYU-BOT" : "KYU-BOT · Disaster Intelligence";
+    if (page === "operations") window.dispatchEvent(new Event("resize"));
+  }, [page]);
   const [filter, setFilter] = useState<"All" | ReportKind>("All");
   const [search, setSearch] = useState("");
   const [selectedReportId, setSelectedReportId] = useState<string | null>(null);
@@ -302,6 +323,10 @@ function App() {
           <span className="scenario-name">Tokyo earthquake scenario</span>
         </div>
         <div className="top-actions">
+          <nav className="app-page-nav" aria-label="Main pages">
+            <a href="/" aria-current={page === "operations" ? "page" : undefined} onClick={event => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey) { event.preventDefault(); navigate("operations"); } }}>Operations</a>
+            <a href="/analytics" aria-current={page === "analytics" ? "page" : undefined} onClick={event => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey) { event.preventDefault(); navigate("analytics"); } }}><BarChart3 size={15} /> Analytics &amp; Replay</a>
+          </nav>
           <span className="live-badge">
             <i /> SIMULATION
           </span>
@@ -318,6 +343,7 @@ function App() {
           </button>
         </div>
       </header>
+      {operationsVisited ? <div className="operations-view" hidden={page !== "operations"}>
       <div className="status-strip">
         <div>
           <span className="status-dot" /> {runState}{" "}
@@ -756,6 +782,8 @@ function App() {
           </section>
         </div>
       )}
+      </div> : null}
+      {page === "analytics" ? <Suspense fallback={<div className="analytics-loading" role="status">Opening analytics…</div>}><AnalyticsPage /></Suspense> : null}
       <footer className="app-footer">
         <div>
           <Waves size={13} />

@@ -14,6 +14,7 @@ from . import repository
 from .config import Settings
 from .db import get_connection, make_pool
 from .models import DecisionPut, IncidentPut, ObservationCreate, ResourcePut, RoadRestrictionPut, RunCreate, RunEnd, SimulationIngest
+from .analytics import make_router
 
 
 def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
@@ -31,6 +32,7 @@ def create_app(settings: Settings | None = None, pool=None) -> FastAPI:
     # Environment configuration is also used when constructing the app, so CORS
     # works consistently for the browser and keeps its list explicit.
     config = settings or Settings()
+    app.include_router(make_router(config))
     app.add_middleware(CORSMiddleware, allow_origins=config.cors_origins,
                        allow_methods=["GET", "POST", "PUT"], allow_headers=["Content-Type"])
     app.add_middleware(GZipMiddleware, minimum_size=1000)
