@@ -181,14 +181,21 @@ class RunTools:
                 'WHERE run_id = %s ORDER BY road_id', (self.run_id,)).fetchall())
 
     def upsert_incident(self, status, location=None, uncertainty_m=None, building_id=None,
-                        person_groups=None, evidence=None, incident_id=None, sim_time_s=None):
+                        person_groups=None, evidence=None, incident_id=None, expected_updated_at=None, sim_time_s=None):
         """Create (no incident_id) or replace (incident_id given) one incident. Pass the FULL new state:
         this replaces the incident, it does not merge. Returns the stored incident.
+
+        A replace needs expected_updated_at, the updated_at of the incident as the caller read it. If anyone
+        wrote the incident since, nothing is written and ToolError returns its current state, so a writer that
+        read a stale copy can't overwrite another writer's change (agents run in parallel).
 
         location {longitude, latitude}; person_groups [{group_id, est_count, condition, needs, confidence}];
         evidence {supports: [observation ids], contradicts: [observation ids]}."""
         if status not in INCIDENT_STATUSES:
             raise ToolError(f'status must be one of {INCIDENT_STATUSES}, got {status!r}')
+        if incident_id and not expected_updated_at:
+            raise ToolError(f'to replace incident {incident_id}, pass expected_updated_at: its updated_at as you just '
+                            'read it with list_incidents or find_nearby_incidents')
         evidence = {'supports': list((evidence or {}).get('supports') or []),
                     'contradicts': list((evidence or {}).get('contradicts') or [])}
         group_ids = [g.get('group_id') for g in person_groups or []]
@@ -210,19 +217,29 @@ class RunTools:
                           status = EXCLUDED.status, building_id = EXCLUDED.building_id,
                           person_groups = EXCLUDED.person_groups, evidence = EXCLUDED.evidence, updated_at = now()
                         WHERE i.run_id = EXCLUDED.run_id
+                          AND i.updated_at = %s::timestamptz
                           AND (i.geom, i.uncertainty_m, i.status, i.building_id, i.person_groups, i.evidence)
                               IS DISTINCT FROM (EXCLUDED.geom, EXCLUDED.uncertainty_m, EXCLUDED.status,
                                                 EXCLUDED.building_id, EXCLUDED.person_groups, EXCLUDED.evidence)
                         RETURNING {INCIDENT_COLUMNS}, (xmax = 0) AS created''',
                     (new_id, self.run_id, lon, lon, lat, uncertainty_m, status, building_id,
-                     Jsonb(person_groups) if person_groups is not None else None, Jsonb(evidence))).fetchone()
+                     Jsonb(person_groups) if person_groups is not None else None, Jsonb(evidence),
+                     expected_updated_at)).fetchone()
             except psycopg.errors.ForeignKeyViolation as exc:
                 raise ToolError(f'building_id {building_id!r} is not on this run\'s map: use an id from find_nearby_buildings') from exc
-            if row is None:   # unchanged, or the id belongs to another run
-                existing = conn.execute(f'SELECT {INCIDENT_COLUMNS} FROM ops.incidents WHERE id = %s AND run_id = %s',
-                                        (new_id, self.run_id)).fetchone()
+            except psycopg.errors.InvalidDatetimeFormat as exc:
+                raise ToolError(f'expected_updated_at {expected_updated_at!r} is not a time: copy updated_at from the incident') from exc
+            if row is None:   # unchanged, changed by someone else since it was read, or the id belongs to another run
+                existing = conn.execute(f'''SELECT {INCIDENT_COLUMNS}, updated_at = %s::timestamptz AS as_read
+                                            FROM ops.incidents WHERE id = %s AND run_id = %s''',
+                                        (expected_updated_at, new_id, self.run_id)).fetchone()
                 if existing is None:
                     raise ToolError(f'incident {new_id} belongs to another run')
+                existing = dict(existing)
+                if not existing.pop('as_read'):
+                    raise ToolError(f'incident {new_id} was changed by another writer after you read it; nothing was '
+                                    f'written. Its current state is {json.dumps(_json(existing), ensure_ascii=False)}. '
+                                    'Combine your change with it and call upsert_incident again with this updated_at.')
                 return _json(existing)
             row = dict(row)
             _event(conn, self.run_id, 'incidents', new_id, 'INSERT' if row.pop('created') else 'UPDATE', row, sim_time_s)
@@ -354,6 +371,9 @@ TOOL_SPECS = {
     'upsert_incident': ('Create (omit incident_id) or replace (give incident_id) an incident. Pass the FULL new '
                         'state; it replaces, it does not merge. Returns the stored incident with its id.',
                         {'incident_id': {'type': 'string'},
+                         'expected_updated_at': {'type': 'string', 'description': 'required with incident_id: the '
+                                                 'incident\'s updated_at exactly as you read it. If someone changed it '
+                                                 'since, you get its current state back to merge with, and retry.'},
                          'status': {'type': 'string', 'enum': list(INCIDENT_STATUSES)},
                          'location': {'type': 'object', 'properties': {'longitude': {'type': 'number'},
                                                                        'latitude': {'type': 'number'}}},

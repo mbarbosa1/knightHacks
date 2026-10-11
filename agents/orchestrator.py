@@ -23,7 +23,7 @@ Every batch is logged to Neon as an ops.agent_runs row (agent 'orchestrator') wi
 tool calls and errors. Each agent's own entry (agent = its name, output = its final answer, or its error) is
 written here too: the agent's log_agent_run(input_ref) call only tells us which report it got to.
 '''
-import argparse, concurrent.futures, pathlib, time
+import argparse, concurrent.futures, math, pathlib, time
 from agents.llm import run_agent
 from agents.tools import RunTools
 from agents.loader import load_agent
@@ -39,9 +39,7 @@ ASSESSMENT_AGENTS = {
                      ['get_run', 'list_observations', 'list_incidents', 'get_last_agent_run', 'find_nearby_incidents',
                       'find_nearby_buildings', 'find_nearest_road', 'upsert_incident', 'set_road_restriction',
                       'log_agent_run']),
-    'medical_agent': ('assesmentAgent/medical-agent/medical-agent.md',
-                      ['get_run', 'list_observations', 'list_incidents', 'get_last_agent_run', 'find_nearby_incidents',
-                       'upsert_incident', 'log_agent_run']),
+    'medical_agent': ('assesmentAgent/medical-agent/medical-agent.md', ['list_observations']),   # writes nothing
 }
 
 
@@ -53,6 +51,7 @@ class Orchestrator:
         self.batch_size = batch_size
         self.in_workers = in_workers
         self.cursor = None                        # last observation id handed to the assessment agents
+        self.medical_queue = []                   # places with hurt people, from medical_agent; local only, never saved
         self.assessment = {}                      # name -> (instructions, tool names) for agents that exist
         for name, (path, tools) in ASSESSMENT_AGENTS.items():
             md = pathlib.Path((instructions_override or {}).get(name) or AGENTS_DIR / path)
@@ -104,7 +103,39 @@ class Orchestrator:
         with concurrent.futures.ThreadPoolExecutor(max(1, len(self.assessment))) as pool:
             results = dict(pool.map(one, self.assessment))
         self.cursor = batch[-1]['observation_id']
+        medical = (results.get('medical_agent') or {}).get('output')
+        by_id = {r['observation_id']: r for r in batch}
+        for place in (medical.get('places') or []) if isinstance(medical, dict) else []:
+            # A building only when a report pinpoints it (gps / address); "near <landmark>" fits many buildings,
+            # and a wrong building_id would merge unrelated places in the queue.
+            reports = [by_id[o] for o in place.get('observation_ids') or [] if o in by_id]
+            if not any((r.get('location') or {}).get('precision') in ('gps', 'address') for r in reports):
+                place = {**place, 'building_id': None}
+            self.add_to_medical_queue(place)
         return results
+
+    # ---- medical queue: where people need help, most urgent first (in memory) ----
+
+    def add_to_medical_queue(self, place):
+        """Add one place from medical_agent, or merge it into the same place already queued (same building, or
+        within 100 m when there is no building). Two reports of "3 trapped" are the same 3 people, so counts
+        keep the highest reported, not the sum; priority keeps the most urgent."""
+        place = {**place, 'observation_ids': list(place.get('observation_ids') or [])}
+        if place.get('priority') not in (1, 2, 3, 4):
+            place['priority'] = 1 if (place.get('trapped') or place.get('critical')) else 2 if place.get('injured') else 3
+        same = next((q for q in self.medical_queue if _same_place(q, place)), None)
+        if same is None:
+            self.medical_queue.append(place)
+        else:
+            for k in ('trapped', 'critical', 'injured'):
+                counts = [v for v in (same.get(k), place.get(k)) if v is not None]
+                same[k] = max(counts) if counts else None
+            if place['priority'] < same['priority']:   # the more urgent report describes the place
+                same.update(priority=place['priority'], why=place.get('why') or same.get('why'),
+                            name=place.get('name') or same.get('name'))
+            same['observation_ids'] += [o for o in place['observation_ids'] if o not in same['observation_ids']]
+            same['building_id'] = same.get('building_id') or place.get('building_id')
+        self.medical_queue.sort(key=_queue_order)
 
     # ---- one pass over everything new ---------------------------------------
 
@@ -125,13 +156,42 @@ class Orchestrator:
                                       'agents': summary}, run_key=f'assessment:{self.cursor}')
             for name, s in summary.items():
                 print(f'  batch {i // self.batch_size + 1}: {name:<14} {s}', flush=True)
+        self.print_medical_queue()
         return len(reports)
+
+    def print_medical_queue(self, top=10):
+        if 'medical_agent' not in self.assessment:
+            return
+        print(f'Medical queue ({len(self.medical_queue)} places, most urgent first):', flush=True)
+        for n, q in enumerate(self.medical_queue[:top], 1):
+            counts = ', '.join(f'{q[k]} {k}' for k in ('critical', 'trapped', 'injured') if q.get(k)) or 'number unknown'
+            where = q.get('name') or q.get('building_id') or q.get('location')
+            print(f'  {n}. [P{q["priority"]}] {where}: {counts}. {q.get("why") or ""}', flush=True)
 
     def watch(self, interval_s=10):
         print(f'Watching for new reports every {interval_s}s (Ctrl+C to stop)...', flush=True)
         while True:
             if not self.cycle():
                 time.sleep(interval_s)
+
+
+def _queue_order(q):
+    """Priority first, then most people trapped or critical, then most injured. A place where people were
+    reported with no number counts as at least one, so "people trapped" isn't ranked below "1 injured"."""
+    counts = [q.get(k) for k in ('critical', 'trapped', 'injured')]
+    serious = (q.get('critical') or 0) + (q.get('trapped') or 0) or (1 if all(c is None for c in counts) else 0)
+    return q['priority'], -serious, -(q.get('injured') or 0)
+
+
+def _same_place(a, b, within_m=100):
+    if a.get('building_id') and b.get('building_id'):
+        return a['building_id'] == b['building_id']
+    la, lb = a.get('location') or {}, b.get('location') or {}
+    if None in (la.get('longitude'), la.get('latitude'), lb.get('longitude'), lb.get('latitude')):
+        return False
+    dx = (la['longitude'] - lb['longitude']) * 111_320 * math.cos(math.radians(la['latitude']))
+    dy = (la['latitude'] - lb['latitude']) * 110_540
+    return math.hypot(dx, dy) <= within_m
 
 
 def _summary(result):
