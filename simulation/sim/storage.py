@@ -105,18 +105,15 @@ class LocalStorage:
         """ops.simulation_runs row; rewritten on status change. Returns the run id (ApiStorage gets it from Neon)."""
         d = self.runs_dir / str(run['id'])
         d.mkdir(parents=True, exist_ok=True)
-<<<<<<< HEAD
         json.dump(run, open(d / 'simulation_run.json', 'w', encoding='utf-8'), indent=1)
-=======
-        json.dump(run, open(d / 'simulation_run.json', 'w'), indent=1)
         return run['id']
 
     def end_run(self, run_id, status='completed', sim_time_s=None):
-        run = json.load(open(self.runs_dir / str(run_id) / 'simulation_run.json'))
+        run = json.load(open(self.runs_dir / str(run_id) / 'simulation_run.json', encoding='utf-8'))
         run.update(status=status, ended_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
         self.save_run(run)
         return run
->>>>>>> origin/main
+
 
     def save_truth_batch(self, rows):
         """Rows carry 'table' (Databricks table name); one file per table. Dedupes on event_id like Databricks."""
