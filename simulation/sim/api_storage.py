@@ -199,6 +199,22 @@ class ApiStorage:
         self.truth_storage.save_observation(obs)   # local copy only once Neon has accepted it
         return row
 
+    def save_resource(self, run_id, resource_id, body):
+        """A unit's current position and status -> ops.resources (PUT replaces the whole row)."""
+        return self._call('PUT', f'/runs/{run_id}/resources/{resource_id}', body)
+
+    def save_road_restriction(self, run_id, road_id, body):
+        """A road belief -> ops.road_restrictions. source_observation_id must already be in Neon."""
+        return self._call('PUT', f'/runs/{run_id}/road-restrictions/{road_id}', body)
+
+    def save_decision(self, run_id, decision_id, body):
+        """Who was sent where, by which route -> ops.decisions. Sent again when its status changes."""
+        return self._call('PUT', f'/runs/{run_id}/decisions/{decision_id}', body)
+
+    def load_road_restrictions(self, run_id):
+        """{road_id: status} currently believed for this run, whoever wrote it (agents or units)."""
+        return {r['road_id']: r['status'] for r in self._call('GET', f'/runs/{run_id}/road-restrictions?limit=1000')}
+
     def prepare_ingestion(self, resources=None):
         run_id = self.active_run_id
         job = read_job(self.truth_storage.runs_dir,run_id)

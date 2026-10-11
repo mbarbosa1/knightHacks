@@ -2377,6 +2377,51 @@ detail-tags span {
     gap: 8px 12px;
 }
 
+.map-clock-totals {
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.map-clock-totals b {
+    color: var(--text-primary, inherit);
+    font-variant-numeric: tabular-nums;
+}
+
+/* A responder unit on the map. No position rule here: MapLibre positions its markers itself. */
+.map-unit {
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    background: var(--unit);
+    border: 2px solid #ffffff;
+    box-shadow: 0 0 0 1.5px #18212b, 0 2px 6px #18212b55;
+    color: #ffffff;
+    font: 700 10px/14px system-ui, sans-serif;
+    text-align: center;
+    cursor: default;
+}
+
+.map-unit-busy {
+    box-shadow: 0 0 0 1.5px #18212b, 0 0 0 5px color-mix(in srgb, var(--unit) 45%, transparent);
+}
+
+.map-unit-free {
+    opacity: 0.55;
+}
+
+.map-legend i.legend-unit {
+    width: 13px;
+    height: 13px;
+    border-radius: 3px;
+    border: 1px solid #18212b;
+    color: #ffffff;
+    font: 700 8px/11px system-ui, sans-serif;
+    font-style: normal;
+    text-align: center;
+}
+
+
 .map-clock-time {
     font: 600 16px "DM Mono", monospace;
     color: var(--text-primary);

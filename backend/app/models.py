@@ -94,6 +94,18 @@ class RoadRestrictionPut(InputModel):
     sim_time_s: Nonnegative | None = None
 
 
+class DecisionPut(InputModel):
+    incident_id: UUID | None = None
+    version: int = Field(default=1, ge=1, le=2**31-1)
+    assignments: list[dict] = Field(default_factory=list, max_length=100)
+    route_geojson: dict | None = None
+    fallback_route_geojson: dict | None = None
+    eta_s: Nonnegative | None = None
+    status: Literal["draft", "approved", "invalidated", "sent"] = "sent"
+    invalidated_reason: str | None = Field(default=None, max_length=2000)
+    sim_time_s: Nonnegative | None = None
+
+
 class IngestObservation(ObservationCreate):
     id: UUID
 

@@ -543,6 +543,45 @@ async def put_road_restriction(connection, run_id, road_id, body):
     return row
 
 
+DECISION_COLUMNS = ("id,run_id,incident_id,version,assignments,route_geojson,fallback_route_geojson,"
+                    "eta_s,status,invalidated_reason,approved_by,approved_at")
+
+
+async def put_decision(connection, run_id, decision_id, body):
+    """Record a dispatch decision (who was sent where, by which route) for this run.
+
+    Keyed by the decision's own ID, so it is safe to retry and to send again
+    when the status changes (sent -> invalidated). A changed route is a new
+    decision with the next version number, not an edit of the old one.
+    """
+    await writable_run(connection, run_id)
+    if body.incident_id is not None:
+        found = await (await connection.execute(
+            "SELECT 1 FROM ops.incidents WHERE run_id=%s AND id=%s", (run_id, body.incident_id))).fetchone()
+        if found is None:
+            raise HTTPException(422, "Incident must belong to this run")
+    values = (body.incident_id, body.version, Jsonb(body.assignments),
+              Jsonb(body.route_geojson) if body.route_geojson is not None else None,
+              Jsonb(body.fallback_route_geojson) if body.fallback_route_geojson is not None else None,
+              body.eta_s, body.status, body.invalidated_reason)
+    row = await (await connection.execute(
+        f'''INSERT INTO ops.decisions (id,run_id,incident_id,version,assignments,route_geojson,
+                                       fallback_route_geojson,eta_s,status,invalidated_reason)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           ON CONFLICT (id) DO UPDATE SET incident_id=EXCLUDED.incident_id, version=EXCLUDED.version,
+             assignments=EXCLUDED.assignments, route_geojson=EXCLUDED.route_geojson,
+             fallback_route_geojson=EXCLUDED.fallback_route_geojson, eta_s=EXCLUDED.eta_s,
+             status=EXCLUDED.status, invalidated_reason=EXCLUDED.invalidated_reason
+           WHERE ops.decisions.run_id=EXCLUDED.run_id
+           RETURNING {DECISION_COLUMNS}''',
+        (decision_id, run_id, *values),
+    )).fetchone()
+    if row is None:
+        raise HTTPException(409, "Decision ID is already assigned to another run")
+    await record_event(connection, run_id, "decisions", decision_id, "UPSERT", row, body.sim_time_s)
+    return row
+
+
 # =============================================================================
 # 7. EVENT LOG
 #    ops.operational_events is an append-only history: one entry per change
