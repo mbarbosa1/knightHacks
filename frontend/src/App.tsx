@@ -16,6 +16,7 @@ import {
   Menu,
   Minus,
   Navigation,
+  Plane,
   Radio,
   Search,
   Settings2,
@@ -32,12 +33,17 @@ import { type MockReport, type ReportKind } from "./data/mockReports";
 import { CHANNELS, UNIT_COLOR, UNIT_LABEL, ShinjukuMap, formatClock, type ShinjukuMapHandle } from "./map/ShinjukuMap";
 import type { MapState } from "./map/ShinjukuMap";
 import { approveProposal, incidentPriority, loadAgentRuns, loadAgentsStatus, rejectProposal } from "./map/dataSource";
-import type { AgentRun, AgentsStatus, Decision, LiveUnit, OperationalState, Report } from "./map/dataSource";
+import type { AgentRun, AgentsStatus, Decision, LiveUnit, OperationalState, ReconResult, Report } from "./map/dataSource";
+import { ReconPage } from "./Recon";
 import "./analytics/analytics.css";
 
 const AnalyticsPage = lazy(() => import("./analytics/AnalyticsPage"));
 const currentPage = () => window.location.pathname.replace(/\/$/, "") === "/analytics" ? "analytics" : "operations";
 
+const DBX = "https://dbc-87980e9b-e483.cloud.databricks.com", DBX_ORG = "7474645633187109";
+const EMBED_URL = `${DBX}/embed/dashboardsv3/01f1c57b716915d8b00465003e793b28?o=${DBX_ORG}`;
+const DASHBOARD_URL = `${DBX}/dashboardsv3/01f1c57b716915d8b00465003e793b28/published?o=${DBX_ORG}`;
+const GENIE_URL = `${DBX}/genie/rooms/01f1c580620a1d308658e770ef4e127c?o=${DBX_ORG}`;
 type BelievedIncident = OperationalState["incidents"][number];
 
 /** One line of the agent activity feed: an agent's conclusion, or word from a unit in the field. */
@@ -102,22 +108,6 @@ function toReport(o: Report): MockReport {
 }
 
 function App() {
-  const [page, setPage] = useState(currentPage);
-  const [operationsVisited, setOperationsVisited] = useState(() => currentPage() === "operations");
-  const navigate = (next: "analytics" | "operations") => {
-    window.history.pushState({}, "", next === "analytics" ? "/analytics" : "/");
-    setPage(next);
-    if (next === "operations") setOperationsVisited(true);
-  };
-  useEffect(() => {
-    const follow = () => { const next = currentPage(); setPage(next); if (next === "operations") setOperationsVisited(true); };
-    window.addEventListener("popstate", follow);
-    return () => window.removeEventListener("popstate", follow);
-  }, []);
-  useEffect(() => {
-    document.title = page === "analytics" ? "Analytics & Replay · KYU-BOT" : "KYU-BOT · Disaster Intelligence";
-    if (page === "operations") window.dispatchEvent(new Event("resize"));
-  }, [page]);
   const [filter, setFilter] = useState<"All" | ReportKind>("All");
   const [search, setSearch] = useState("");
   const [selectedReportId, setSelectedReportId] = useState<string | null>(null);
@@ -203,6 +193,18 @@ function App() {
     const unit = approve && !problem ? units.find((u) => u.id === d.assignments?.[0]?.resource_id) : null;
     if (unit) mapRef.current?.focus(unit.lon, unit.lat);
   };
+  // Drone recon page: kept beside the dashboard (which stays mounted, so the map keeps its state).
+  // Pages: operations, drone recon (Arwa), analytics & replay (Camila), and the embedded Databricks dashboard (Arwa).
+  const [page, setPage] = useState<"ops" | "recon" | "analytics" | "databricks">(currentPage() === "analytics" ? "analytics" : "ops");
+  useEffect(() => {
+    document.title = page === "analytics" ? "Analytics & Replay · KYU-BOT" : "KYU-BOT · Disaster Intelligence";
+    const path = page === "analytics" ? "/analytics" : "/";
+    if (window.location.pathname !== path) window.history.replaceState({}, "", path);
+    if (page === "ops") window.dispatchEvent(new Event("resize"));   // the map was hidden: let it measure itself again
+  }, [page]);
+  const [reconFor, setReconFor] = useState<string | null>(null);
+  const [recons, setRecons] = useState<Record<string, ReconResult>>({});
+  const openRecon = (incidentId: string) => { setReconFor(incidentId); setPage("recon"); };
   const destinationName = (unit: LiveUnit) =>
     unit.destination
       ? (unit.destination.building_id && mapRef.current?.buildingName(unit.destination.building_id)) ||
@@ -319,14 +321,22 @@ function App() {
           </div>
         </div>
         <div className="scenario">
-          <span className="eyebrow">OPERATIONS OVERVIEW</span>
+          <span className="eyebrow">{page === "ops" ? "OPERATIONS OVERVIEW" : page === "recon" ? "DRONE RECON" : page === "analytics" ? "ANALYTICS & REPLAY" : "DATABRICKS DASHBOARD"}</span>
           <span className="scenario-name">Tokyo earthquake scenario</span>
         </div>
+        <nav className="page-tabs">
+          <button className={page === "ops" ? "active" : ""} onClick={() => setPage("ops")}><MapPin size={13} /> Operations</button>
+          <button className={page === "recon" ? "active" : ""} onClick={() => setPage("recon")}>
+            <Plane size={13} /> Drone recon{Object.keys(recons).length ? <small>{Object.keys(recons).length}</small> : null}
+          </button>
+          <button className={page === "analytics" ? "active" : ""} onClick={() => setPage("analytics")}>
+            <BarChart3 size={13} /> Analytics &amp; replay
+          </button>
+          <button className={page === "databricks" ? "active" : ""} onClick={() => setPage("databricks")}>
+            <Layers size={13} /> Databricks
+          </button>
+        </nav>
         <div className="top-actions">
-          <nav className="app-page-nav" aria-label="Main pages">
-            <a href="/" aria-current={page === "operations" ? "page" : undefined} onClick={event => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey) { event.preventDefault(); navigate("operations"); } }}>Operations</a>
-            <a href="/analytics" aria-current={page === "analytics" ? "page" : undefined} onClick={event => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey) { event.preventDefault(); navigate("analytics"); } }}><BarChart3 size={15} /> Analytics &amp; Replay</a>
-          </nav>
           <span className="live-badge">
             <i /> SIMULATION
           </span>
@@ -343,7 +353,7 @@ function App() {
           </button>
         </div>
       </header>
-      {operationsVisited ? <div className="operations-view" hidden={page !== "operations"}>
+      <div className="operations-view" hidden={page === "analytics"}>
       <div className="status-strip">
         <div>
           <span className="status-dot" /> {runState}{" "}
@@ -353,7 +363,25 @@ function App() {
             : "Generate an earthquake on the map to start"}
         </div>
       </div>
-      <main className="dashboard">
+      {page === "databricks" && (
+        <main className="databricks-page">
+          <div className="analytics-bar">
+            <span>History of every simulated earthquake: damage, people, reports and how well the agents did (Databricks).</span>
+            <a className="recon-fly" href={GENIE_URL} target="_blank" rel="noreferrer">Ask Genie ↗</a>
+            <a className="analytics-link" href={DASHBOARD_URL} target="_blank" rel="noreferrer">Open in Databricks ↗</a>
+          </div>
+          <iframe className="analytics-frame" src={EMBED_URL} title="Databricks dashboard" />
+        </main>
+      )}
+      {page === "recon" && (
+        <ReconPage queue={queue} reports={observations ?? []} decisions={decisions} results={recons}
+          onResult={(id, r) => setRecons((all) => ({ ...all, [id]: r }))}
+          selectedId={reconFor} onSelect={setReconFor} runId={runId}
+          acting={acting} onDecide={decide} unitName={unitName}
+          buildingName={(id) => mapRef.current?.buildingName(id)}
+          onShowOnMap={(lon, lat) => { setPage("ops"); window.setTimeout(() => mapRef.current?.focus(lon, lat), 50); }} />
+      )}
+      <main className="dashboard" style={page === "ops" ? undefined : { display: "none" }}>
         <aside className="panel incoming-panel">
           <div className="panel-heading">
             <div>
@@ -545,6 +573,10 @@ function App() {
                         {(incident.evidence?.supports.length ?? 0) === 1 ? "" : "s"}
                         {onIt.length ? ` · ${onIt.map((u) => UNIT_LABEL[u.type] ?? u.type).join(", ")} on it` : ""}
                       </small>
+                    </button>
+                    <button className={`recon-link${recons[incident.id] ? " flown" : ""}`} title="Drone recon: see the block from above"
+                      onClick={() => openRecon(incident.id)}>
+                      <Plane size={11} /> {recons[incident.id] ? "Drone ✓" : "Drone"}
                     </button>
                     {jobs.length > 0 && (
                       <div className="incident-jobs">
@@ -782,7 +814,7 @@ function App() {
           </section>
         </div>
       )}
-      </div> : null}
+      </div>
       {page === "analytics" ? <Suspense fallback={<div className="analytics-loading" role="status">Opening analytics…</div>}><AnalyticsPage /></Suspense> : null}
       <footer className="app-footer">
         <div>

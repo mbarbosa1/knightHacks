@@ -8,3 +8,4 @@ google-genai>=1.0      # optional: Gemini report wording (python -m sim.run --ge
 fastapi>=0.115,<1      # sim/server.py: lets the map ask for an earthquake
 uvicorn>=0.30,<1
 httpx>=0.27            # fastapi test client
+Pillow>=10   # drone recon images (sim/recon.py)

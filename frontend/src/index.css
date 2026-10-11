@@ -2884,6 +2884,189 @@ detail-tags span {
 
 .team-done > span:first-child { color: #1f6b35; }
 
+/* ---- Page tabs (top bar) ---- */
+.page-tabs { display: flex; gap: 2px; padding: 3px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-subtle); }
+.page-tabs button {
+    display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border: 0; border-radius: 4px;
+    background: transparent; color: var(--text-secondary); font: 500 11.5px "DM Sans", sans-serif;
+}
+.page-tabs button:hover { color: var(--text-primary); }
+.page-tabs button.active { background: var(--surface); color: var(--text-primary); box-shadow: 0 1px 2px #0000001f; }
+.page-tabs small {
+    min-width: 16px; padding: 0 4px; border-radius: 8px; background: var(--accent); color: #fff;
+    font: 600 9px/16px "DM Mono", monospace; text-align: center;
+}
+
+/* ---- Drone link on an incident row ---- */
+.incident-row { position: relative; }
+.incident-row .incident-main { padding-right: 64px; }
+.recon-link {
+    position: absolute; top: 6px; right: 7px; display: inline-flex; align-items: center; gap: 3px;
+    padding: 2px 6px; border: 1px solid var(--border); border-radius: 3px; background: var(--surface);
+    color: var(--text-secondary); font: 500 9.5px "DM Sans", sans-serif;
+}
+.recon-link:hover { color: var(--text-primary); border-color: var(--text-muted); }
+.recon-link.flown { color: #1f6b35; border-color: #b7dcc1; background: #f1faf3; }
+
+/* ---- Drone recon page ---- */
+.recon-page {
+    flex: none; height: calc(100vh - 112px); min-height: 520px; padding: 12px;   /* fixed: a flex basis let it grow */
+    display: grid; grid-template-columns: minmax(240px, 290px) minmax(380px, 1fr) minmax(280px, 340px);
+    grid-template-rows: minmax(0, 1fr); gap: 10px; overflow: hidden;   /* columns scroll inside, the page never grows */
+    color: var(--text-primary);
+}
+.recon-list, .recon-view, .recon-reading {
+    min-height: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 7px;
+}
+.recon-list { display: flex; flex-direction: column; gap: 6px; padding: 10px; overflow-y: auto; }
+.recon-list-head { display: flex; flex-direction: column; gap: 3px; padding: 2px 2px 6px; border-bottom: 1px solid var(--border); }
+.recon-list-head span, .recon-section {
+    font: 500 9.5px "DM Mono", monospace; letter-spacing: 0.12em; color: var(--text-muted);
+}
+.recon-list-head small { color: var(--text-secondary); font-size: 10.5px; line-height: 1.4; }
+.recon-item {
+    flex-shrink: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 7px; align-items: center; padding: 8px;
+    border: 1px solid var(--border); border-radius: 6px; background: var(--surface-muted); text-align: left;
+}
+.recon-item:hover { border-color: var(--text-muted); }
+.recon-item.active { border-color: #24313d; box-shadow: 0 0 0 1px #24313d inset; background: var(--surface); outline: none; }
+.recon-item strong { font-size: 12px; }
+.recon-item small { grid-column: 1 / -1; color: var(--text-secondary); font-size: 10.5px; }
+.recon-doubts { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 3px; }
+.recon-doubts em {
+    padding: 1px 5px; border-radius: 3px; background: #fff4e5; color: #8a4b08; font: normal 9.5px "DM Sans", sans-serif;
+}
+.recon-doubts em.recon-flown { display: inline-flex; align-items: center; gap: 3px; background: #eaf6ed; color: #1f6b35; }
+
+.recon-view { display: flex; flex-direction: column; padding: 10px; gap: 8px; overflow: hidden; }
+.recon-compare {
+    position: relative; flex: 1; min-height: 0; aspect-ratio: 1; max-width: 100%; margin: 0 auto;
+    border-radius: 5px; overflow: hidden; cursor: ew-resize; user-select: none; touch-action: none; background: #222;
+}
+.recon-compare img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
+.recon-divider { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: #fff; box-shadow: 0 0 6px #0008; }
+.recon-divider span {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 28px; height: 28px;
+    display: grid; place-items: center; border-radius: 50%; background: #fff; color: #24313d; font-size: 14px;
+    box-shadow: 0 1px 4px #0006;
+}
+.recon-tag {
+    position: absolute; bottom: 10px; padding: 3px 7px; border-radius: 3px; background: #18212bd9; color: #fff;
+    font: 500 9.5px "DM Mono", monospace; letter-spacing: 0.08em;
+}
+.recon-tag.left { left: 10px; }
+.recon-tag.right { right: 10px; }
+.recon-empty {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+    padding: 30px; text-align: center; color: var(--text-secondary);
+}
+.recon-empty p { max-width: 360px; margin: 0; font-size: 12.5px; line-height: 1.5; }
+.recon-fly, .recon-send {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 8px 16px; border: 0;
+    border-radius: 5px; background: #24313d; color: #fff; font: 600 12px "DM Sans", sans-serif;
+}
+.recon-fly:hover:not(:disabled), .recon-send:hover:not(:disabled) { background: #111a22; }
+.recon-fly:disabled, .recon-send:disabled { opacity: 0.75; cursor: default; }
+.recon-credit { color: var(--text-muted); font-size: 9.5px; line-height: 1.4; text-align: center; }
+.spin { animation: recon-spin 1s linear infinite; }
+@keyframes recon-spin { to { transform: rotate(360deg); } }
+
+.recon-reading { padding: 12px; overflow-y: auto; }
+.recon-why p { margin: 8px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
+.recon-why b { color: var(--text-primary); }
+.recon-why .recon-note { padding-top: 8px; border-top: 1px solid var(--border); font-size: 11px; }
+.recon-card { display: flex; flex-direction: column; gap: 5px; }
+.recon-card p { margin: 0 0 4px; color: var(--text-secondary); font-size: 12px; line-height: 1.45; }
+.recon-card p b { color: var(--text-primary); }
+.recon-verdict { padding: 7px 9px; border-radius: 5px; font-weight: 600; font-size: 12.5px; }
+.recon-verdict.confirm { background: #fdecee; color: #a90d27; }
+.recon-verdict.doubt { background: #eaf6ed; color: #1f6b35; }
+.recon-verdict.unclear { background: var(--surface-subtle); color: var(--text-secondary); }
+.recon-damage { display: flex; align-items: center; gap: 10px; margin: 2px 0 6px; }
+.damage-pill { padding: 2px 7px; border-radius: 3px; color: #fff; font: 600 10px "DM Mono", monospace; background: #868e96; }
+.damage-collapsed { background: #7a0d1b; }
+.damage-severe { background: #c1121f; }
+.damage-moderate { background: #e8590c; }
+.damage-light { background: #b08900; }
+.damage-none { background: #2f7d46; }
+.recon-conf { flex: 1; position: relative; height: 16px; border-radius: 3px; background: var(--surface-subtle); overflow: hidden; }
+.recon-conf i { position: absolute; inset: 0 auto 0 0; background: #c8d3dc; }
+.recon-conf small { position: relative; padding-left: 6px; font: 10px/16px "DM Mono", monospace; color: var(--text-primary); }
+.recon-streets { margin: 0 0 4px; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 3px; }
+.recon-streets li { display: flex; justify-content: space-between; gap: 8px; font-size: 11.5px; color: var(--text-secondary); }
+.recon-streets b { flex-shrink: 0; padding: 0 5px; border-radius: 3px; font: 600 9.5px/16px "DM Mono", monospace; }
+.pass-yes { background: #eaf6ed; color: #1f6b35; }
+.pass-one-lane { background: #fff4e5; color: #8a4b08; }
+.pass-no { background: #fdecee; color: #a90d27; }
+.recon-summary { padding: 8px; border-radius: 5px; background: var(--surface-muted); }
+.recon-actions { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.recon-secondary { display: flex; gap: 6px; }
+.recon-secondary button {
+    flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 5px;
+    border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text-secondary); font-size: 11px;
+}
+.recon-secondary button:hover:not(:disabled) { color: var(--text-primary); border-color: var(--text-muted); }
+.recon-meta { color: var(--text-muted); font-size: 10px; }
+
+@media (max-width: 900px) {
+    .recon-page { grid-template-columns: 1fr; height: auto; }
+    .page-tabs button { padding: 5px 8px; }
+}
+
+.recon-buildings { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
+.recon-buildings span {
+    padding: 1px 6px; border-radius: 3px; color: #fff; background: #868e96; font: 10px/16px "DM Mono", monospace;
+}
+.recon-buildings b { margin-right: 2px; }
+
+/* real aerial photo of the place, straight from GSI tiles, before any flight */
+.recon-preview { position: relative; flex: 1; min-height: 0; border-radius: 5px; overflow: hidden; background: #d9dde1; }
+.recon-preview .tiles { position: absolute; left: 50%; top: 50%; width: 1280px; height: 1280px; }
+.recon-preview .tiles img { position: absolute; width: 256px; height: 256px; }
+.recon-preview .cross { position: absolute; left: 50%; top: 50%; width: 26px; height: 26px; transform: translate(-50%, -50%); }
+.recon-preview .cross::before, .recon-preview .cross::after {
+    content: ""; position: absolute; background: #c8102e; box-shadow: 0 0 0 1px #fff;
+}
+.recon-preview .cross::before { left: 12px; top: 0; width: 2px; height: 26px; }
+.recon-preview .cross::after { top: 12px; left: 0; height: 2px; width: 26px; }
+.recon-preview .ring {
+    position: absolute; left: 50%; top: 50%; width: 120px; height: 120px; transform: translate(-50%, -50%);
+    border: 2px dashed #ffffffcc; border-radius: 50%;
+}
+.recon-overlay {
+    position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); width: min(420px, 90%);
+    display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 14px 16px; border-radius: 8px;
+    background: #ffffffeb; box-shadow: 0 4px 18px #0003; text-align: center;
+}
+.recon-overlay p { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.45; }
+.recon-overlay strong { color: var(--text-primary); font-size: 13px; }
+
+.recon-tag.top { top: 10px; bottom: auto; }
+.recon-hint {
+    position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); padding: 3px 9px; border-radius: 10px;
+    background: #ffffffe0; color: var(--text-primary); font-size: 10.5px; pointer-events: none;
+}
+.recon-details { border-top: 1px solid var(--border); padding-top: 6px; }
+.recon-details summary { cursor: pointer; color: var(--text-secondary); font-size: 11.5px; margin-bottom: 6px; }
+.recon-details[open] { display: flex; flex-direction: column; gap: 5px; }
+.recon-decision {
+    display: flex; flex-direction: column; gap: 7px; margin-top: 4px; padding: 10px; border-radius: 6px;
+    border: 1px solid #24313d33; background: var(--surface-muted);
+}
+.recon-reco { margin: 0; padding-left: 8px; border-left: 3px solid #868e96; font-size: 12px; color: var(--text-primary) !important; }
+.recon-reco.confirm { border-left-color: #c1121f; }
+.recon-reco.doubt { border-left-color: #2f7d46; }
+.recon-decision .proposal { margin: 0; }
+.recon-note-small { font-size: 11px !important; color: var(--text-muted) !important; }
+.recon-done { color: #1f6b35; font-style: normal; font-size: 11px; font-weight: 600; }
+
+.databricks-page { flex: none; height: calc(100vh - 112px); min-height: 520px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.analytics-bar { display: flex; align-items: center; gap: 10px; color: var(--text-secondary); font-size: 12px; }
+.analytics-bar span { flex: 1; }
+.analytics-bar a { text-decoration: none; }
+.analytics-link { padding: 7px 12px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--text-primary); font-size: 12px; }
+.analytics-frame { flex: 1; width: 100%; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
+
 /* Agent activity: what each agent concluded and what units report back, newest first. */
 .activity-list {
     max-height: 290px;

@@ -175,13 +175,18 @@ export async function loadStaticMap(): Promise<StaticMap> {
 }
 
 /**
- * The truth of a run that already exists. The page opens on the plain city, so this only returns
- * something when a run was asked for by id (VITE_RUN_ID); otherwise an earthquake starts with Generate.
+ * The run to show when the page opens: the one the simulator is playing right now (so the page always shows
+ * what the agents are working on, even after a reload or when the earthquake was generated in another tab),
+ * else the one this tab last generated or VITE_RUN_ID. Null when there is none: start one with Generate.
  */
 export async function loadRunTruth(): Promise<RunTruth | null> {
-  if (!RUN_ID) return null;
+  const live = await getJson<{ run_id?: string | null }>(`${SIM_BASE}/clock`).then((c) => c.run_id ?? undefined, () => undefined);
+  const runId = live ?? RUN_ID;
+  if (!runId) return null;
   try {
-    return await getJson<RunTruth>(`${SIM_BASE}/runs/${RUN_ID}/truth`);
+    const truth = await getJson<RunTruth>(`${SIM_BASE}/runs/${runId}/truth`);
+    try { window.sessionStorage.setItem(RUN_KEY, runId); } catch { /* storage may be disabled */ }
+    return truth;
   } catch {
     return null;
   }
@@ -395,4 +400,54 @@ export async function loadReportsSince(runId: string, after?: string): Promise<R
     cursor = batch[batch.length - 1].id;
   }
   return out;
+}
+
+/** Drone recon (simulator POST /recon): the real GSI aerial photo of a place, a SIMULATED post-earthquake drone
+ *  image of it, and the vision model's reading. Image paths are on the simulator service. */
+export interface ReconResult {
+  id: string;
+  run_id: string;
+  incident_id: string | null;
+  longitude: number;
+  latitude: number;
+  sim_time_s: number;
+  before: string;
+  after: string;
+  candidates: { label: string; building_id: string; name: string | null; usage: string | null; floors: number | null }[];
+  reading: {
+    damage_seen: "none" | "light" | "moderate" | "severe" | "collapsed" | null;
+    /** The model's call for each lettered building (before vs after). */
+    buildings: Record<string, string>;
+    building: string | null;
+    collapse_visible: boolean;
+    debris_on_streets: { where?: string; passable?: string }[];
+    approach: string | null;
+    staging: string | null;
+    confidence: number | null;
+    summary: string | null;
+  };
+  matched_building_id: string | null;
+  seconds: number;
+  report_id?: string;
+}
+
+export const reconImage = (path: string) => `${SIM_BASE}${path}`;
+
+async function simPost<T>(path: string, body?: unknown): Promise<T> {
+  const r = await fetch(`${SIM_BASE}${path}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) {
+    const detail = await r.json().then((j) => j.detail, () => r.statusText);
+    throw new Error(typeof detail === "string" ? detail : `HTTP ${r.status}`);
+  }
+  return r.json() as Promise<T>;
+}
+
+export function flyRecon(place: { incident_id: string; building_id: string | null; lon: number; lat: number; context: string }) {
+  return simPost<ReconResult>("/recon", place);
+}
+
+export function sendReconReport(reconId: string) {
+  return simPost<{ report_id: string; text: string }>(`/recon/${reconId}/report`);
 }

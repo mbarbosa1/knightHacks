@@ -92,6 +92,23 @@ const UNIT_LETTER = { fire_engine: "E", ambulance: "A", police: "P" } as const;
 const UNIT_STATUS = { en_route: "on the way", busy: "working on scene", available: "free" } as const;
 const UNITS_REFRESH_MS = 500;
 
+/** The part of a route still ahead of a vehicle at `pos`: from the nearest point on the route (searching only
+ *  from segment `p.segment` on, which it then moves forward) to the end. Flat-earth metres are fine over a city. */
+function routeAhead(route: [number, number][], pos: [number, number], p: { segment: number }): [number, number][] {
+  const kx = 111_320 * Math.cos((pos[1] * Math.PI) / 180), ky = 110_540;
+  let best = { d: Infinity, i: p.segment, pt: route[p.segment] };
+  for (let i = p.segment; i < route.length - 1; i++) {
+    const [ax, ay] = route[i], [bx, by] = route[i + 1];
+    const dx = (bx - ax) * kx, dy = (by - ay) * ky, len2 = dx * dx + dy * dy;
+    const t = len2 ? Math.max(0, Math.min(1, (((pos[0] - ax) * kx) * dx + ((pos[1] - ay) * ky) * dy) / len2)) : 0;
+    const pt: [number, number] = [ax + (bx - ax) * t, ay + (by - ay) * t];
+    const d = Math.hypot((pos[0] - pt[0]) * kx, (pos[1] - pt[1]) * ky);
+    if (d < best.d) best = { d, i, pt };
+  }
+  p.segment = best.i;
+  return [best.pt, ...route.slice(best.i + 1)];
+}
+
 export const formatClock = (s: number) =>
   `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 const empty = (): GeoJSON.FeatureCollection => ({ type: "FeatureCollection", features: [] });
@@ -545,6 +562,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
   // The whole route appears at once; as the vehicle drives, the line is cut at the vehicle every frame, so it
   // always runs from where the vehicle is drawn to the destination and shrinks smoothly behind it.
   const latest = useRef<{ units: LiveUnit[]; view: MapView }>({ units: [], view: "operational" });
+  const progress = useRef(new Map<string, { key: string; segment: number }>());   // how far along its route
   const drawRoutes = () => {
     const routes = mapRef.current?.getSource("routes") as GeoJSONSource | undefined;
     if (!routes) return;
@@ -553,9 +571,13 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
     routes.setData({
       type: "FeatureCollection",
       features: driving.map((unit) => {
+        // unit.route is the whole planned route (station -> destination). Draw only what is left: from the point
+        // on the route nearest the vehicle, searching forward from where it was last, so it never runs backwards.
         const at = unitMarkers.current.get(unit.id)?.getLngLat();
-        // unit.route starts where the simulator last placed the vehicle; the marker glides toward that point.
-        const coords: [number, number][] = at ? [[at.lng, at.lat], ...unit.route!] : unit.route!;
+        const key = `${unit.decision?.id}:${unit.decision?.version}`;
+        let p = progress.current.get(unit.id);
+        if (!p || p.key !== key) progress.current.set(unit.id, p = { key, segment: 0 });
+        const coords = at ? routeAhead(unit.route!, [at.lng, at.lat], p) : unit.route!;
         return { type: "Feature", geometry: { type: "LineString", coordinates: coords },
                  properties: { id: unit.id, color: UNIT_COLOR[unit.type] ?? UNIT_COLOR.police, followed: unit.id === followingRef.current } };
       }),

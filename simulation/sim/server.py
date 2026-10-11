@@ -422,6 +422,67 @@ def dispatch_unit(body: Dispatch):
         raise HTTPException(409, str(exc))
 
 
+class ReconRequest(Place):
+    """Fly the drone over a place. `context` is what the reports say (shown to the model as possibly wrong)."""
+    context: str = Field(default='', max_length=1500)
+    incident_id: str | None = None
+
+
+@app.post('/recon', status_code=201)
+def recon_fly(body: ReconRequest):
+    """Drone recon (sim/recon.py): the real aerial photo, a SIMULATED post-earthquake drone image of the same
+    area drawn from the truth, and the vision model's reading of it. Sends nothing to the agents by itself."""
+    from . import recon
+    live, fleet = _live_fleet(body.run_id)
+    static_map = fleet.m
+    lon, lat = body.lon, body.lat
+    if body.building_id in static_map.building_geoms:
+        c = static_map.building_geoms[body.building_id].centroid
+        lon, lat = (lon, lat) if lon is not None and lat is not None else (c.x, c.y)
+    if lon is None or lat is None:
+        raise HTTPException(422, 'Give building_id or lon + lat')
+    roads = {rid: (r or {}).get('status', 'OPEN') for rid, r in fleet.truth.road_status.items()}
+    try:
+        result = recon.fly(live.run_id, static_map, fleet.truth.building_damage, roads, lon, lat,
+                           building_id=body.building_id, context=body.context, sim_time_s=live.state()['sim_time_s'])
+    except Exception as exc:                       # photo tiles or the model unreachable: say so, never crash
+        log.warning('recon failed: %s', exc)
+        raise HTTPException(502, f'Drone recon failed: {exc}')
+    result['incident_id'] = body.incident_id
+    _state.setdefault('recon', {})[result['id']] = result
+    return result
+
+
+@app.get('/recon/images/{run_id}/{name}')
+def recon_image(run_id: str, name: str):
+    from fastapi.responses import FileResponse
+    from . import recon
+    path = (recon.OUT / run_id / 'recon' / name).resolve()
+    if not name.endswith('.jpg') or recon.OUT.resolve() not in path.parents or not path.exists():
+        raise HTTPException(404, 'No such image')
+    return FileResponse(path, media_type='image/jpeg', headers={'Cache-Control': 'max-age=3600'})
+
+
+@app.post('/recon/{recon_id}/report', status_code=201)
+def recon_report(recon_id: str):
+    """Send a recon reading to the agents as a 'sensor' report, like any other report (POST observations)."""
+    from . import recon
+    result = _state.get('recon', {}).get(recon_id)
+    if result is None:
+        raise HTTPException(404, 'Unknown recon (the simulator was restarted?). Fly again.')
+    live, _ = _live_fleet(result['run_id'])
+    if not BACKEND_URL:
+        raise HTTPException(409, 'Local-only simulator: no backend to send reports to')
+    import httpx
+    body = recon.as_report(result)
+    body['sim_time_s'] = live.state()['sim_time_s']
+    r = httpx.post(f"{BACKEND_URL}/runs/{result['run_id']}/observations", json=body, timeout=20)
+    if r.status_code >= 400:
+        raise HTTPException(502, f'Backend refused the report: {r.text[:300]}')
+    result['report_id'] = body['id']
+    return {'report_id': body['id'], 'text': body['text_en']}
+
+
 @app.post('/stop')
 def stop():
     """Stop the live run and close it (the map's Reset). Safe to call when nothing is playing."""
