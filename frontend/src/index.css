@@ -2674,3 +2674,39 @@ detail-tags span {
     background: #2b8a3e;
     box-shadow: 0 0 6px #2b8a3e88;
 }
+
+/* The map on the whole screen, for the demo. */
+.map-panel:fullscreen {
+    width: 100vw;
+    height: 100vh;
+    border: 0;
+    border-radius: 0;
+}
+
+.map-dots-toggle {
+    white-space: nowrap;
+    opacity: 0.75;
+}
+
+.map-dots-toggle.active {
+    opacity: 1;
+}
+
+/* The unit the camera is riding along with. */
+.map-unit {
+    cursor: pointer;
+}
+
+.map-unit-followed {
+    transform-origin: center;
+    outline: 3px solid #18212b;
+    outline-offset: 3px;
+    z-index: 5;
+}
+
+.map-following {
+    white-space: nowrap;
+    color: #ffffff;
+    background: #18212b;
+    border-color: #18212b;
+}

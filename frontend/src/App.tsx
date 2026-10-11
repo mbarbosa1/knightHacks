@@ -100,6 +100,17 @@ function App() {
   const [reportOpen, setReportOpen] = useState(false);
   const [utc, setUtc] = useState(new Date());
   const mapRef = useRef<ShinjukuMapHandle>(null);
+  const mapPanel = useRef<HTMLElement>(null);
+  const [fullscreen, setFullscreen] = useState(false);
+  useEffect(() => {
+    const changed = () => setFullscreen(document.fullscreenElement === mapPanel.current);
+    document.addEventListener("fullscreenchange", changed);
+    return () => document.removeEventListener("fullscreenchange", changed);
+  }, []);
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else mapPanel.current?.requestFullscreen();
+  };
   // The map follows the saved run and collects its reports as the live clock releases them into Neon
   // (Gemini-worded when the simulator runs with SIM_GEMINI=1). The feed shows the same list, so it fills in one
   // by one. With no saved run on the map, the feed is empty.
@@ -168,6 +179,11 @@ function App() {
     };
   }, [runId]);
   const agentsLive = Boolean(runId && agentsStatus?.running && agentsStatus.run_id === runId);
+  useEffect(() => {
+    setSelectedReportId(null);
+    setReportOpen(false);
+    setSearch("");
+  }, [runId]);
 
   const activity: Activity[] = useMemo(() => {
     const incidents = mapState?.operational.incidents ?? [];
@@ -394,6 +410,7 @@ function App() {
           <section
             className="map-panel"
             aria-label="3D simulation map"
+            ref={mapPanel}
           >
             <ShinjukuMap ref={mapRef} onUpdate={setMapState} />
             <div className="map-toolbar">
@@ -406,6 +423,13 @@ function App() {
               <span />
               <button aria-label="Recentre on Shinjuku Station" onClick={() => mapRef.current?.recenter()}>
                 <Crosshair size={15} />
+              </button>
+              <button
+                aria-label={fullscreen ? "Leave full screen" : "Show the map full screen"}
+                title={fullscreen ? "Leave full screen (Esc)" : "Full screen"}
+                onClick={toggleFullscreen}
+              >
+                {fullscreen ? <X size={15} /> : <Maximize2 size={14} />}
               </button>
             </div>
             <div className="map-attribution">
@@ -544,7 +568,7 @@ function App() {
               </div>
             </div>
             <p className="dispatch-instruction">
-              Every responder unit as the simulator has it now. Click one to find it on the map.
+              Every responder unit as the simulator has it now. Click one to follow it on the map.
             </p>
             <div className="team-list unit-list">
               {units.map((unit) => (
@@ -552,7 +576,10 @@ function App() {
                   className="team-row unit-row"
                   key={unit.id}
                   title={unit.name}
-                  onClick={() => mapRef.current?.focus(unit.lon, unit.lat)}
+                  onClick={() => {
+                    mapRef.current?.focus(unit.lon, unit.lat);
+                    mapRef.current?.follow(unit.destination ? unit.id : null);   // ride along with a unit that has been sent
+                  }}
                 >
                   <span className="team-dot" style={{ background: UNIT_COLOR[unit.type] ?? UNIT_COLOR.police }} />
                   <strong>{unit.name}</strong>

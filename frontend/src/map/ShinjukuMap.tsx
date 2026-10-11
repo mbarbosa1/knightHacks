@@ -38,6 +38,8 @@ export interface ShinjukuMapHandle {
   recenter(): void;
   /** Fly to a place, e.g. where a report says it is. */
   focus(lon: number, lat: number): void;
+  /** Keep the camera on a unit as it drives (null stops following). */
+  follow(unitId: string | null): void;
   /** What to call a building in the side panels: its name, else its address, else what it is used for. */
   buildingName(id: string): string | null;
 }
@@ -109,6 +111,11 @@ interface Props {
  *    runs are written to the database; the layers exist and fill in when data arrives.
  */
 export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function ShinjukuMap({ showRoadGraph = false, onUpdate }, ref) {
+  const [showReports, setShowReports] = useState(true);   // report dots can be hidden to see the units clearly
+  // The unit the camera is following (click its route or its badge). Dragging the map lets go of it.
+  const [following, setFollowing] = useState<string | null>(null);
+  const followingRef = useRef<string | null>(null);
+  followingRef.current = following;
 
   const container = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -191,6 +198,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
     zoomOut: () => mapRef.current?.zoomOut(),
     recenter: () => mapRef.current?.easeTo(HOME),
     focus: (lon, lat) => mapRef.current?.easeTo({ center: [lon, lat], zoom: 16.5, duration: 700 }),
+    follow: (unitId) => setFollowing(unitId),
     buildingName: (id) => {
       const p = staticRef.current?.buildings.features.find((f) => f.properties.id === id)?.properties;
       return p ? p.name_en || p.address_en?.split(",")[0] || (p.usage ? p.usage.replace(/_/g, " ") : null) : null;
@@ -248,7 +256,12 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
           type: "line",
           source: "routes",
           layout: { "line-cap": "round", "line-join": "round" },
-          paint: { "line-color": ["get", "color"], "line-width": 3, "line-opacity": 0.7, "line-dasharray": [1, 1.5] },
+          paint: {
+            "line-color": ["get", "color"],
+            "line-width": ["case", ["get", "followed"], 6, 3],
+            "line-opacity": ["case", ["get", "followed"], 0.95, 0.7],
+            "line-dasharray": [1, 1.5],
+          },
         });
 
         map.addSource("buildings", { type: "geojson", data: staticMap.buildings, promoteId: "id" });
@@ -278,11 +291,13 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
           type: "circle",
           source: "reports",
           paint: {
-            "circle-radius": ["case", ["get", "fresh"], 15, 7],
+            // A report that just arrived pulses large; after that it shrinks to a small quiet dot, so hundreds
+            // of reports do not bury the units and the buildings.
+            "circle-radius": ["case", ["get", "fresh"], 12, 3.5],
             "circle-color": ["get", "color"],
-            "circle-opacity": ["case", ["get", "fresh"], 0.35, 0.95],
+            "circle-opacity": ["case", ["get", "fresh"], 0.35, 0.6],
             "circle-stroke-color": ["case", ["get", "fresh"], ["get", "color"], "#ffffff"],
-            "circle-stroke-width": ["case", ["get", "fresh"], 3, 2],
+            "circle-stroke-width": ["case", ["get", "fresh"], 2.5, 0.75],
           },
         });
 
@@ -350,6 +365,16 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
             .addTo(map);
         });
         map.on("mouseleave", "reports", () => popup.remove());
+
+        // Click a route (a thin line, so anywhere within a few pixels of it) to ride along with that unit.
+        map.on("click", (event) => {
+          const { x, y } = event.point;
+          const hit = map.queryRenderedFeatures([[x - 8, y - 8], [x + 8, y + 8]], { layers: ["routes"] })[0];
+          if (hit?.properties?.id) setFollowing(hit.properties.id as string);
+        });
+        map.on("mouseenter", "routes", () => { map.getCanvas().style.cursor = "pointer"; });
+        map.on("mouseleave", "routes", () => { map.getCanvas().style.cursor = ""; });
+        map.on("dragstart", () => setFollowing(null));   // taking the map in hand lets go of the unit
 
         setTruth(runTruth);
         setReady(true);
@@ -446,6 +471,11 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
     if (map && ready) map.setLayoutProperty("road-graph", "visibility", showRoadGraph ? "visible" : "none");
   }, [showRoadGraph, ready]);
 
+  useEffect(() => {
+    const map = mapRef.current;
+    if (map && ready) map.setLayoutProperty("reports", "visibility", showReports ? "visible" : "none");
+  }, [showReports, ready]);
+
   // Paint the chosen view. Buildings and roads carry it as feature state; points are GeoJSON sources.
   useEffect(() => {
     const map = mapRef.current;
@@ -501,6 +531,11 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
         const el = document.createElement("div");
         el.style.setProperty("--unit", UNIT_COLOR[unit.type] ?? UNIT_COLOR.police);
         el.textContent = UNIT_LETTER[unit.type] ?? "?";
+        const id = unit.id;
+        el.addEventListener("click", (event) => {
+          event.stopPropagation();
+          setFollowing(followingRef.current === id ? null : id);
+        });
         marker = new maplibregl.Marker({ element: el, anchor: "center" }).setLngLat([unit.lon, unit.lat]).addTo(map);
         markers.set(unit.id, marker);
       }
@@ -510,6 +545,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
       el.classList.add("map-unit");
       el.classList.toggle("map-unit-busy", unit.status === "busy");
       el.classList.toggle("map-unit-free", unit.status === "available");
+      el.classList.toggle("map-unit-followed", unit.id === following);
       el.title = `${unit.name}: ${UNIT_STATUS[unit.status] ?? unit.status}${unit.helped ? `, ${unit.helped} helped` : ""}`;
     }
     (map.getSource("routes") as GeoJSONSource).setData({
@@ -519,10 +555,17 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
         .map((unit) => ({
           type: "Feature",
           geometry: { type: "LineString", coordinates: unit.route! },
-          properties: { id: unit.id, color: UNIT_COLOR[unit.type] ?? UNIT_COLOR.police },
+          properties: { id: unit.id, color: UNIT_COLOR[unit.type] ?? UNIT_COLOR.police, followed: unit.id === following },
         })),
     });
-  }, [view, units, ready]);
+    // Ride along: keep the followed unit in the middle of the view, close in and looking down its street.
+    const followed = following ? shown.find((unit) => unit.id === following) : null;
+    if (followed) {
+      map.easeTo({ center: [followed.lon, followed.lat], zoom: Math.max(map.getZoom(), 16.8), pitch: 60, duration: 600, easing: (t) => t });
+    } else if (following && units.length && !units.some((unit) => unit.id === following)) {
+      setFollowing(null);   // that unit is not in this run
+    }
+  }, [view, units, ready, following]);
 
   useEffect(() => {
     onUpdate?.({ view, truth, clock, operational, reports, units });
@@ -560,6 +603,18 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
             Ground truth
           </button>
         </div>
+        <button
+          className={`map-clock-button map-dots-toggle${showReports ? " active" : ""}`}
+          onClick={() => setShowReports((on) => !on)}
+          title="Show or hide the report dots"
+        >
+          Reports {showReports ? "on" : "off"}
+        </button>
+        {following && (
+          <button className="map-clock-button map-following" onClick={() => setFollowing(null)} title="Stop following">
+            Following {units.find((unit) => unit.id === following)?.name.split(" ").slice(-2).join(" ") ?? "unit"} ✕
+          </button>
+        )}
         {truth && (
           <div className="map-clock" role="status">
             <b className="map-clock-time">T+{formatClock(clock?.sim_time_s ?? 0)}</b>
@@ -645,7 +700,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
       </div>
 
       {/* The key only appears once there is something to explain. */}
-      {view === "operational" && (reports.length > 0 || units.some((u) => u.destination)) && (
+      {view === "operational" && ((showReports && reports.length > 0) || units.some((u) => u.destination)) && (
         <div className="map-legend damage-legend">
           {(Object.keys(UNIT_COLOR) as (keyof typeof UNIT_COLOR)[])
             .filter((type) => units.some((u) => u.destination && u.type === type))
@@ -655,7 +710,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
               </span>
             ))}
           {Object.entries(CHANNELS)
-            .filter(([channel]) => reports.some((r) => r.channel === channel))
+            .filter(([channel]) => showReports && reports.some((r) => r.channel === channel))
             .map(([channel, [label, color]]) => (
               <span key={channel}>
                 <i className="legend-dot" style={{ background: color }} /> {label}
