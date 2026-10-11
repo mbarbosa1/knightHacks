@@ -12,7 +12,7 @@ Nothing here knows whether the storage is local files or the backend API.
 import threading, time
 
 SPEEDS = (10, 20)         # 30x was dropped: a big earthquake's reports could not all be saved in time
-DEFAULT_SPEED = 20
+DEFAULT_SPEED = 10       # at 20x a big earthquake's reports reach Neon late (about 3 a second can be saved)
 TICK_S = 0.25            # real seconds between ticks
 TAIL_S = 60              # simulated seconds the clock keeps running after the last scheduled thing
 SAVE_UNIT_EVERY_S = 2.0  # real seconds between saved positions of a moving unit (each save is a request)
@@ -34,7 +34,7 @@ class LiveRun:
         self._speed, self._playing = speed, False
         self._sim_s, self._last = 0.0, None     # simulated time banked so far, and when we last banked it
         self._released, self._last_error = 0, None
-        self._stop, self._thread, self.finished = threading.Event(), None, False
+        self._stop, self._thread, self._reports_thread, self.finished = threading.Event(), None, None, False
         self.fleet = fleet
         self._outbox = []          # writes waiting to be saved, in order: nothing overtakes anything else
         self._unit_saved = {}      # unit id -> (status, real time, location) as last saved
@@ -69,29 +69,19 @@ class LiveRun:
         units = self.fleet.counts() if self.fleet is not None else None
         with self._lock:
             return {'units': units, 'unit_reports': self._unit_reports,
+                    **(self.fleet.outcomes if self.fleet is not None else {}),
                     'run_id': self.run_id, 'sim_time_s': round(self._advance(), 1), 'end_s': round(self.end_s, 1),
                     'speed': self._speed, 'playing': self._playing, 'finished': self.finished,
                     'reports_released': self._released, 'reports_total': self.total, 'last_error': self._last_error}
 
     # --- what happens as time passes ---------------------------------------------------------------
     def tick(self):
-        """Release every report that is due. A report that fails to save stays first in line and is
-        retried on the next tick, so reports always reach the agents in order."""
+        """Move the units and save what they did. Reports that are due are saved too, unless the
+        run is playing on its own threads (start()), where a second thread does nothing else: each
+        save is a request, and at 20x reports come due faster than one thread can save them and
+        keep the units moving."""
         with self._lock:
             now_s = self._advance()
-            due = []
-            while self._released + len(due) < self.total and self._queue[self._released + len(due)]['sim_time_s'] <= now_s:
-                due.append(self._queue[self._released + len(due)])
-        for obs in due:
-            try:
-                self._storage.save_observation(obs)
-            except Exception as exc:   # network trouble: keep the clock running, try again next tick
-                with self._lock:
-                    self._last_error = str(exc)
-                return
-            with self._lock:
-                self._released += 1
-                self._last_error = None
         while self._schedule and self._schedule[0][0] <= now_s:
             _, what = self._schedule.pop(0)
             if self._on_due:
@@ -100,12 +90,37 @@ class LiveRun:
             self._move_units(now_s)
         self._flush()
         if self.fleet is not None and getattr(self.fleet.truth, 'pending_truth_writes', None):
-            self.fleet.truth.flush(self._storage)   # answer-key links for the units' own reports
+            try:
+                self.fleet.truth.flush(self._storage)   # what the units changed in the truth, and their reports' answer key
+            except Exception as exc:                    # kept by the truth and retried next tick
+                with self._lock:
+                    self._last_error = str(exc)
+        if self._reports_thread is None:
+            self._release_reports()
         moving = self.fleet is not None and self.fleet.counts()['en_route'] > 0
         with self._lock:
             done = self._sim_s >= self.end_s and self._released == self.total and not moving and not self._outbox
         if done:
             self._finish()
+
+    def _release_reports(self):
+        """Save every report that is due, oldest first. One that fails to save stays first in line
+        and is retried next time, so reports always reach the agents in order."""
+        while not self._stop.is_set():
+            with self._lock:
+                now_s = self._advance()
+                obs = self._queue[self._released] if self._released < self.total else None
+            if obs is None or obs['sim_time_s'] > now_s:
+                return
+            try:
+                self._storage.save_observation(obs)
+            except Exception as exc:   # network trouble: keep the clock running, try again shortly
+                with self._lock:
+                    self._last_error = str(exc)
+                return
+            with self._lock:
+                self._released += 1
+                self._last_error = None
 
     # --- units -------------------------------------------------------------------------------------
     def _move_units(self, now_s):
@@ -165,9 +180,15 @@ class LiveRun:
     def start(self):
         with self._lock:
             self._playing, self._last = True, self._clock()
+        self._reports_thread = threading.Thread(target=self._reports_loop, name=f'reports-{self.run_id[:8]}', daemon=True)
         self._thread = threading.Thread(target=self._loop, name=f'live-{self.run_id[:8]}', daemon=True)
+        self._reports_thread.start()
         self._thread.start()
         return self
+
+    def _reports_loop(self):
+        while not self._stop.wait(TICK_S):
+            self._release_reports()
 
     def _loop(self):
         while not self._stop.wait(TICK_S):
@@ -176,5 +197,6 @@ class LiveRun:
     def stop(self):
         """Stop the clock for good (a new run started, or the simulator is shutting down)."""
         self._finish()
-        if self._thread and self._thread is not threading.current_thread():
-            self._thread.join(timeout=5)
+        for thread in (self._thread, self._reports_thread):
+            if thread and thread is not threading.current_thread():
+                thread.join(timeout=5)

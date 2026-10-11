@@ -85,7 +85,7 @@ def test_reports_arrive_on_the_clock_and_one_run_plays_at_a_time(client):
     first_clock = server._state['live']
     second = client.post('/runs', json={'mw': 6.5}).json()         # a new earthquake stops the one before
     assert first_clock.finished and client.get('/clock').json()['run_id'] == second['run_id']
-    assert second['clock']['speed'] == 20
+    assert second['clock']['speed'] == 10                          # the default
     run_file = json.load(open(server._state['storage'].runs_dir / first['run_id'] / 'simulation_run.json'))
     assert run_file['status'] == 'completed' and run_file['ended_at']
 

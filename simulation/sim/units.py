@@ -6,6 +6,10 @@ the unit drives the real roads at their real speeds, and only finds out a road i
 gets there. It then reports it first-hand and takes another way.
 
 Planning uses what is *believed* about the roads. Driving meets what is *true*.
+
+On scene the unit does the work its type can do, on the people who are really there: an engine frees
+the trapped, an ambulance treats the critical, a patrol looks and reports what it sees. Two units of a
+type at one building work twice as fast. When nothing is left for it, the unit reports and is free.
 """
 import json, math, threading, uuid
 from dataclasses import dataclass, field
@@ -13,6 +17,14 @@ from .routing import LIMITED_FACTOR, statuses
 
 SKILLS = {'fire_engine': ['rescue'], 'ambulance': ['medical'], 'police': ['assess']}
 REROUTE_PAUSE_S = 20      # simulated seconds a unit stands still while a new route is worked out
+# Work on scene, in simulated seconds.
+RESCUE_S = {'collapsed': 60, 'severe': 40}   # to free one trapped person, by how bad the building is
+RESCUE_S_OTHER = 20
+TREAT_S = 30              # to treat one critical person
+ASSESS_S = 120            # for a patrol to look the scene over and report
+NOTHING_S = 60            # a unit that finds nothing it can do stays this long before it is free again
+NEEDS = {'rescue': 'trapped', 'medical': 'critical'}     # skill -> the people it helps
+OUTCOME = {'rescue': 'rescued', 'medical': 'treated'}    # skill -> what those people become
 RESPONDER_RELIABILITY = 0.98
 
 
@@ -59,6 +71,10 @@ class Fleet:
         self.lock = threading.RLock()   # the clock thread moves units while requests dispatch and read them
         self._on_decision = on_decision or (lambda row: None)
         self._versions = {}        # incident_id -> last decision version used
+        self.outcomes = {'rescued': 0, 'treated': 0}
+        self._groups = {}          # building_id -> {condition: people group id}
+        for gid, g in getattr(truth, 'people', {}).items():
+            self._groups.setdefault(g['building_id'], {})[g['condition']] = gid
         self.found = {}            # road_id -> sim time a unit found it blocked
         self.log = []              # what happened, newest last: dispatched / blocked / arrived / stuck
         self.units = {}
@@ -103,6 +119,7 @@ class Fleet:
         route = self.router.route(unit.node, destination['node'], self.believed())
         if route is None:
             raise DispatchError(f'{unit.name} has no way to get there on the roads believed open')
+        unit.task = None   # a new job: the last one's trail and routes are not carried over
         self._follow(unit, route, destination, now_s, reason=None)
         unit.status = 'en_route'
         self._record(unit, now_s)
@@ -153,6 +170,11 @@ class Fleet:
             for unit in self.units.values():
                 if unit.status == 'en_route':
                     self._advance(unit, now_s)
+            while True:   # work on scene, strictly in time order so units sharing a building take turns
+                due = [u for u in self.units.values() if u.status == 'busy' and u.task['work']['next_s'] <= now_s]
+                if not due:
+                    break
+                self._work(min(due, key=lambda u: (u.task['work']['next_s'], u.id)))
 
     def _advance(self, unit, now_s):
         t, G = unit.task, self.router.G
@@ -186,6 +208,78 @@ class Fleet:
         unit.status = 'busy'
         unit.task['arrived_s'] = at_s
         self.log.append({'t': at_s, 'kind': 'arrived', 'unit_id': unit.id, 'text': f'{unit.name} on scene'})
+        skill = unit.skills[0] if unit.skills else None
+        building_id = unit.task['destination']['building_id']
+        secs = ASSESS_S if skill == 'assess' else self._secs_per_person(skill, building_id) if self._waiting(building_id, skill) else None
+        unit.task['work'] = {'skill': skill, 'done': 0, 'working': secs is not None and skill != 'assess',
+                             'next_s': at_s + (secs or NOTHING_S)}
+
+    # --- work on scene -----------------------------------------------------------------------------
+    def _waiting(self, building_id, skill):
+        """How many people at this building this skill can still help."""
+        gid = self._groups.get(building_id, {}).get(NEEDS.get(skill))
+        return self.truth.people[gid]['count'] if gid else 0
+
+    def _secs_per_person(self, skill, building_id):
+        if skill == 'medical':
+            return TREAT_S
+        level = getattr(self.truth, 'building_damage', {}).get(building_id, {}).get('damage_level')
+        return RESCUE_S.get(level, RESCUE_S_OTHER)
+
+    def _work(self, unit):
+        """The unit has reached the end of one piece of work: one person helped, or its look around done."""
+        w, building_id = unit.task['work'], unit.task['destination']['building_id']
+        at_s = w['next_s']
+        if w['working'] and self._waiting(building_id, w['skill']):
+            self._help_one(building_id, w['skill'], at_s)
+            w['done'] += 1
+            if self._waiting(building_id, w['skill']):
+                w['next_s'] = at_s + self._secs_per_person(w['skill'], building_id)
+                return
+        self._leave(unit, at_s)
+
+    def _help_one(self, building_id, skill, at_s):
+        """One person changes in the truth: trapped -> rescued, or critical -> treated."""
+        people, outcome = self.truth.people, OUTCOME[skill]
+        gid = self._groups[building_id][NEEDS[skill]]
+        g = people[gid]
+        self.truth.set_people(gid, building_id, g['count'] - 1, g['condition'], g['mobility'], g['language'], at_s)
+        helped = f'{building_id}:{outcome}'
+        self.truth.set_people(helped, building_id, people.get(helped, {}).get('count', 0) + 1, outcome,
+                              g['mobility'], g['language'], at_s)
+        self._groups[building_id][outcome] = helped
+        self.outcomes[outcome] += 1
+
+    def _leave(self, unit, at_s):
+        """Nothing left here for this unit: it reports what it did (or saw) and is free where it stands."""
+        w, building_id = unit.task['work'], unit.task['destination']['building_id']
+        counts = {c: self.truth.people[g]['count'] for c, g in self._groups.get(building_id, {}).items()}
+        seen = {c: counts.get(c, 0) for c in ('trapped', 'critical', 'injured', 'deceased')}
+        if w['skill'] == 'assess':
+            level = getattr(self.truth, 'building_damage', {}).get(building_id, {}).get('damage_level')
+            facts = {'action': 'assessed', 'damage_level': level, **seen}
+            found = ', '.join(f'{n} {c}' for c, n in seen.items() if n) or 'nobody hurt or trapped'
+            text = f"{unit.name} on scene: {'building ' + level if level and level != 'none' else 'no damage to the building'}; {found}."
+        elif w['done']:
+            left = self._waiting(building_id, w['skill'])
+            facts = {'action': OUTCOME[w['skill']], 'count': w['done'], 'still_' + NEEDS[w['skill']]: left}
+            did = 'freed' if w['skill'] == 'rescue' else 'treated'
+            text = f"{unit.name}: {w['done']} {'person' if w['done'] == 1 else 'people'} {did}. Unit free."
+        else:
+            facts = {'action': 'nothing_found', **seen}
+            text = f"{unit.name}: {'nobody trapped' if w['skill'] == 'rescue' else 'no critical patients'} here. Unit free."
+        observation = {
+            'id': str(uuid.uuid5(uuid.UUID(self.run_id), f"{unit.id}:{unit.task['decision_id']}:left")), 'run_id': self.run_id,
+            'channel': 'responder_update', 'source_reliability': RESPONDER_RELIABILITY, 'format': 'structured', 'lang': 'en',
+            'original_text': json.dumps({'unit_id': unit.id, 'building_id': building_id, **facts}),
+            'text_en': text, 'media_url': None, 'claimed_location': None,
+            'claimed_geom': {'type': 'Point', 'coordinates': [round(unit.lon, 6), round(unit.lat, 6)]},
+            'location_precision': 'gps', 'sim_time_s': round(at_s, 1)}
+        if building_id is not None:
+            self.truth.add_link(observation['id'], 'matched', 'building', building_id, at_s)
+        self._emit(observation)
+        unit.status, unit.task['left_s'] = 'available', at_s
+        self.log.append({'t': at_s, 'kind': 'left', 'unit_id': unit.id, 'text': text})
 
     def _blocked(self, unit, road_id, at_s):
         """The unit has reached a road that is really blocked. It reports it and replans.
@@ -246,7 +340,8 @@ class Fleet:
                         'route': t['route'] if t and unit.status == 'en_route' else None,
                         'abandoned_routes': t['abandoned'] if t else [],
                         'destination': {k: t['destination'][k] for k in ('lon', 'lat', 'building_id', 'incident_id')} if t else None,
-                        'decision': {'id': t['decision_id'], 'version': t['version'], 'reason': t['reason']} if t else None})
+                        'decision': {'id': t['decision_id'], 'version': t['version'], 'reason': t['reason']} if t else None,
+                        'helped': t['work']['done'] if t and t.get('work') else 0})
         return out
 
     # --- questions agents ask before deciding (always on believed road status) ----------------------
