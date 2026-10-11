@@ -25,6 +25,7 @@ from fastapi import FastAPI, HTTPException
 from .api_storage import ApiStorage
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from . import databricks_sink
 from .export import run_truth
 from .live import DEFAULT_SPEED, SPEEDS, LiveRun
 from .routing import Router
@@ -42,6 +43,7 @@ log = logging.getLogger('uvicorn.error')
 async def lifespan(app):
     # Prepared submissions are retried after restart. They are already on disk.
     task = asyncio.create_task(asyncio.to_thread(ApiStorage(BACKEND_URL).recover_prepared)) if BACKEND_URL else None
+    databricks_sink.upload_pending_in_background()   # truth of runs that never reached Databricks
     yield
     if task:
         await task
@@ -130,7 +132,7 @@ class NewRun(BaseModel):
 @app.get('/health')
 def health():
     return {'status':'ok','magnitude_range':list(MW_RANGE),'storage_mode':'neon' if BACKEND_URL else 'local-demo',
-            'speeds':list(SPEEDS)}
+            'speeds':list(SPEEDS),'truth_upload':'databricks' if databricks_sink.enabled() else 'off'}
 
 
 @app.post('/runs', status_code=201)
@@ -169,6 +171,7 @@ def new_run(body: NewRun):
     except Exception as exc:
         log.error('Simulation submission failed: %s',exc)
         raise submission_error(storage,exc) from exc
+    databricks_sink.upload_in_background(truth.run_id)   # truth files are complete; never blocks this response
     while len(_state['runs']) > KEEP_RUNS:
         old, _ = _state['runs'].popitem(last=False)
         _state['reports'].pop(old, None)
