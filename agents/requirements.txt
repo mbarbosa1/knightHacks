@@ -1,0 +1,4 @@
+# Agents run in the repo-root .venv (the simulator's): they reuse its map code (simulation/sim/).
+#   .venv/bin/pip install -r agents/requirements.txt
+-r ../simulation/requirements.txt
+psycopg[binary]>=3.1   # Neon as the agents role (agents/tools.py)
