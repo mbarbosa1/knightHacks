@@ -156,9 +156,49 @@ async function submitEarthquake(url: string, body: unknown): Promise<RunTruth> {
   return result as RunTruth;
 }
 
-export async function createEarthquake(magnitude: number | null): Promise<RunTruth> {
-  return submitEarthquake(`${SIM_BASE}/runs`, magnitude === null ? {} : { mw: magnitude });
+export async function createEarthquake(magnitude: number | null, speed: number = DEFAULT_SPEED): Promise<RunTruth> {
+  return submitEarthquake(`${SIM_BASE}/runs`, magnitude === null ? { speed } : { mw: magnitude, speed });
 }
+
+/** How many simulated seconds pass per real second. */
+export const SPEEDS = [10, 20] as const;
+export const DEFAULT_SPEED = 20;
+
+/** The live run's clock, kept by the simulator. run_id is null when nothing is playing. */
+export interface RunClock {
+  run_id: string | null;
+  sim_time_s?: number;
+  end_s?: number;
+  speed?: number;
+  playing: boolean;
+  finished: boolean;
+  reports_released?: number;
+  reports_total?: number;
+  last_error?: string | null;
+}
+
+export async function loadClock(): Promise<RunClock | null> {
+  try {
+    return await getJson<RunClock>(`${SIM_BASE}/clock`);
+  } catch {
+    return null;
+  }
+}
+
+async function postSim(path: string, body: unknown): Promise<RunClock | null> {
+  try {
+    const response = await fetch(`${SIM_BASE}${path}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    return response.ok ? ((await response.json()) as RunClock) : null;
+  } catch {
+    return null;
+  }
+}
+
+export const changeClock = (change: { speed?: number; playing?: boolean }) => postSim("/clock", change);
+/** Stop the live run and close it. */
+export const stopRun = () => postSim("/stop", {});
 
 export async function retryEarthquake(runId: string): Promise<RunTruth> {
   return submitEarthquake(`${SIM_BASE}/runs/${runId}/retry`, {});

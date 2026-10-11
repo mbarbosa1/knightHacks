@@ -7,6 +7,12 @@ import {
   createEarthquake,
   retryEarthquake,
   forgetRun,
+  DEFAULT_SPEED,
+  SPEEDS,
+  changeClock,
+  loadClock,
+  stopRun,
+  type RunClock,
   SubmissionError,
   RUN_ID,
   simulatorAvailable,
@@ -49,6 +55,8 @@ export const FACILITY_MARK = {
 } as const;
 const UNIT_COLORS = ["match", ["get", "type"], "ambulance", "#0c8599", "fire_engine", "#e8590c", "#5f3dc4"];
 
+const formatClock = (s: number) =>
+  `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 const empty = (): GeoJSON.FeatureCollection => ({ type: "FeatureCollection", features: [] });
 const escapeHtml = (value: unknown) =>
   String(value ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c] ?? c);
@@ -79,6 +87,24 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
   const [working, setWorking] = useState(false);
   const [quakeError, setQuakeError] = useState<string | null>(null);
   const [retryRunId, setRetryRunId] = useState<string | null>(null);
+  const [speed, setSpeed] = useState<number>(DEFAULT_SPEED);
+  const [clock, setClock] = useState<RunClock | null>(null);
+
+  // The simulator keeps the clock; the map only asks what time it is.
+  useEffect(() => {
+    if (!truth) {
+      setClock(null);
+      return;
+    }
+    let stop = false;
+    const tick = () => loadClock().then((c) => !stop && setClock(c && c.run_id === truth.run_id ? c : null));
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
+  }, [truth]);
   // After Reset the map follows no run at all, not the one this tab remembered from before.
   const [detached, setDetached] = useState(false);
   const activeRunId = truth?.ingestion?.ready ? truth.run_id : detached ? undefined : RUN_ID;
@@ -91,7 +117,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
     setWorking(true);
     setQuakeError(null);
     try {
-      setTruth(await (retryId ? retryEarthquake(retryId) : createEarthquake(randomMagnitude ? null : magnitude)));
+      setTruth(await (retryId ? retryEarthquake(retryId) : createEarthquake(randomMagnitude ? null : magnitude, speed)));
       setRetryRunId(null);
       setDetached(false);
       setSimulator(true);
@@ -358,6 +384,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
             <button
               className="map-quake-reset"
               onClick={() => {
+                stopRun();   // one run plays at a time: Reset stops its clock and closes it
                 setTruth(null);
                 setQuakeError(null);
                 setRetryRunId(null);
@@ -370,9 +397,41 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
             </button>
           </div>
         </div>
-        {truth?.ingestion?.ready && !working && !quakeError && (
-          <div className="map-status" role="status">
-            Saved to Neon · {truth.ingestion.stored_observations} reports · {truth.ingestion.stored_resources} responder units
+        {truth && !working && !quakeError && (
+          <div className="map-clock" role="status">
+            <b className="map-clock-time">T+{formatClock(clock?.sim_time_s ?? 0)}</b>
+            <button
+              className="map-clock-button"
+              disabled={!clock || clock.finished}
+              onClick={() => clock && changeClock({ playing: !clock.playing }).then((c) => c && setClock(c))}
+            >
+              {clock?.finished ? "Finished" : clock?.playing ? "Pause" : "Play"}
+            </button>
+            <div className="map-view-switch" role="group" aria-label="Simulation speed">
+              {SPEEDS.map((s) => (
+                <button
+                  key={s}
+                  className={(clock?.speed ?? speed) === s ? "active" : ""}
+                  disabled={!clock || clock.finished}
+                  onClick={() => {
+                    setSpeed(s);
+                    changeClock({ speed: s }).then((c) => c && setClock(c));
+                  }}
+                >
+                  {s}x
+                </button>
+              ))}
+            </div>
+            <span>
+              {/* How many reports are still to come is hidden truth: only the ground truth view shows the total. */}
+              {clock
+                ? view === "truth"
+                  ? `${clock.reports_released} of ${clock.reports_total} reports in`
+                  : `${clock.reports_released} reports in`
+                : "clock not running"}
+              {truth.ingestion?.ready ? ` · saved to Neon · ${truth.ingestion.stored_resources} responder units` : ""}
+              {clock?.last_error ? " · retrying a report that failed to save" : ""}
+            </span>
           </div>
         )}
         <div className="map-status" aria-live="polite">
@@ -385,7 +444,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
           ) : quakeError ? (
             <span className="map-status-error">{quakeError}</span>
           ) : working ? (
-            "Generating the simulation and waiting for Neon to confirm all reports and resources are saved…"
+            "Generating the simulation and waiting for Neon to confirm the run and its responder units are saved…"
           ) : !truth ? (
             simulator ? (
               <>

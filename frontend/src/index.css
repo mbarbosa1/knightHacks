@@ -2364,6 +2364,34 @@ detail-tags span {
     color: var(--text-primary);
 }
 
+.map-clock {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+}
+
+.map-clock-time {
+    font: 600 17px "DM Mono", monospace;
+    color: var(--text-primary);
+    min-width: 92px;
+}
+
+.map-clock-button {
+    border: 1px solid #d7dfe3;
+    border-radius: 4px;
+    background: transparent;
+    padding: 6px 11px;
+    font: 500 12.5px "DM Mono", monospace;
+    color: var(--text-secondary);
+    cursor: pointer;
+}
+
+.map-clock button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
 .map-status-error {
     color: var(--accent-dark);
 }
