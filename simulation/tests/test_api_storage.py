@@ -29,7 +29,10 @@ def backend():
             if body.get('channel') == 'bad':
                 status, out = 422, {'detail': 'bad channel'}
             elif self.path == '/runs':
-                status, out = 201, {'id': server_run_id, 'status': 'created'}
+                status, out = 201, {'id': body['id'], 'status': 'created'}
+            elif self.path.endswith('/ingest'):
+                status, out = 200, {'ready':True,'stored_observations':len(body['observations']),
+                                    'stored_resources':len(body['resources'])}
             else:
                 status, out = 200, {'id': body.get('id'), 'status': body.get('status')}
             self.send_response(status)
@@ -49,10 +52,10 @@ def backend():
 def test_run_id_comes_from_the_backend(backend, tmp_path):
     url, calls, server_run_id = backend
     s = ApiStorage(url, truth_storage=LocalStorage(runs_dir=tmp_path))
-    run_id = s.save_run({'id': 'local-id', 'map_version_id': 'shinjuku-v1', 'seed': 42,
+    run_id = s.save_run({'id': server_run_id, 'map_version_id': 'shinjuku-v1', 'seed': 42,
                          'hazard_types': ['earthquake'], 'status': 'running'})
     assert run_id == server_run_id
-    assert calls[0] == ('/runs', {'map_version_id': 'shinjuku-v1', 'seed': 42, 'hazard_types': ['earthquake']})
+    assert calls[0] == ('/runs', {'id':server_run_id, 'map_version_id': 'shinjuku-v1', 'seed': 42, 'hazard_types': ['earthquake']})
     s.save_observation({**OBS, 'run_id': run_id})
     assert calls[1][0] == f'/runs/{run_id}/observations' and calls[1][1]['id'] == OBS['id']
     s.end_run(run_id)
@@ -86,7 +89,35 @@ def test_graph_built_from_road_segments_routes_like_the_osmnx_one():
 def test_deferred_reports_are_sent_only_when_asked(backend, tmp_path):
     url, calls, _ = backend
     s = ApiStorage(url, truth_storage=LocalStorage(runs_dir=tmp_path), defer_observations=True)
-    s.save_observation({**OBS, 'run_id': 'r'})
+    run_id = s.save_run({'id':str(uuid.uuid4()),'map_version_id':'shinjuku-v1','seed':42,'hazard_types':['earthquake']})
+    calls.clear()
+    s.save_observation({**OBS, 'run_id':run_id})
     assert calls == [] and len(s.pending_observations) == 1
     assert s.post_pending_observations() == 1
-    assert calls[0][0] == '/runs/r/observations' and s.pending_observations == []
+    assert calls[-1][0] == f'/runs/{run_id}/ingest' and s.pending_observations == []
+
+
+def test_prepared_submission_survives_failed_save_and_new_storage_instance(tmp_path):
+    run_id = str(uuid.uuid4())
+    class Storage(ApiStorage):
+        fail = True
+        def _call(self, method, path, body=None):
+            if path == '/runs':
+                return {'id':body['id'],'status':'created'}
+            if self.fail:
+                raise ApiError('network down')
+            return {'ready':True,'stored_observations':len(body['observations']),'stored_resources':0}
+    s = Storage('http://unused',truth_storage=LocalStorage(runs_dir=tmp_path),defer_observations=True)
+    s.save_run({'id':run_id,'map_version_id':'shinjuku-v1','seed':42,'hazard_types':['earthquake']})
+    s.save_observation({**OBS,'run_id':run_id})
+    s.prepare_ingestion()
+    with pytest.raises(ApiError):
+        s.post_pending_observations()
+    assert json.loads((tmp_path/run_id/'submission.json').read_text())['phase'] == 'prepared'
+    restarted = Storage('http://unused',truth_storage=LocalStorage(runs_dir=tmp_path))
+    restarted.fail = False
+    assert restarted.recover_prepared()[0]['ready']
+    assert json.loads((tmp_path/run_id/'submission.json').read_text())['phase'] == 'saved'
+    assert len((tmp_path/run_id/'observations.jsonl').read_text().splitlines()) == 1
+    restarted.resume(run_id)
+    assert len((tmp_path/run_id/'observations.jsonl').read_text().splitlines()) == 1

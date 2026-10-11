@@ -3,7 +3,10 @@
 FastAPI connects to Neon Postgres + PostGIS. The simulator and the browser
 (React + MapLibre) call the API;
 database credentials stay server-side. The React/Vite frontend currently uses
-mock reports, dispatches, and an illustrated placeholder map.
+mock report/dispatch panels alongside a real MapLibre map.
+
+The reliable simulation-to-agent handoff is implemented; see
+[Agent data handoff](docs/agent-data-handoff.md) for readiness, retries, and the observation feed.
 
 ## Current status
 
@@ -19,10 +22,10 @@ Verified October 10, 2026 against the configured development database:
   retries, run isolation, ended runs, and atomic event history. All test writes
   are rolled back.
 
-Still to connect: the MapLibre 3D map and frontend API calls, the simulation,
-agent processing, routing/replanning, decision approval, and Databricks
-export/scoring. There is no simulator or agent/export implementation in
-this repository. The API has no authentication or per-user authorization yet;
+MapLibre and simulator generation now connect to the backend. Generate waits
+for an atomic Neon commit of observations and initial responder resources, with
+a readiness receipt and durable retry support. Remaining work: agent processing,
+live simulation ticks, decision approval, and Databricks export/scoring. The API has no authentication or per-user authorization yet;
 keep it on localhost until those are added.
 
 ## Start the backend

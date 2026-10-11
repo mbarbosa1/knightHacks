@@ -11,13 +11,12 @@ ROOT="$PWD"
 PY="$ROOT/.venv/bin/python"
 
 [ -x "$PY" ] || { echo "Missing .venv. Run:  python3 -m venv .venv && .venv/bin/pip install -r simulation/requirements.txt"; exit 1; }
-[ -d "$ROOT/simulation/data" ] || { echo "Missing simulation/data (the map files). The simulator cannot run without them."; exit 1; }
+[ -f "$ROOT/backend/.env" ] && [ -x "$ROOT/backend/.venv/bin/python" ] || { echo "Neon mode requires backend/.env and backend/.venv. Configure them before generating runs."; exit 1; }
+export BACKEND_URL="${BACKEND_URL:-http://127.0.0.1:8000}"
+export VITE_API_BASE="${VITE_API_BASE:-$BACKEND_URL}"
+export VITE_SIM_BASE="${VITE_SIM_BASE:-http://127.0.0.1:8100}"
 [ -d "$ROOT/frontend/node_modules" ] || { echo "Installing the website's libraries (first run only)..."; (cd "$ROOT/frontend" && npm install --no-audit --no-fund); }
 
-if [ ! -f "$ROOT/frontend/public/sim/map/buildings.geojson" ]; then
-    echo "Exporting the map for the website (first run only)..."
-    (cd "$ROOT/simulation" && "$PY" -m sim.export --seed 42 --mw 7.4)
-fi
 
 pids=()
 stop() { trap - EXIT INT TERM; echo; echo "Stopping..."; kill "${pids[@]}" 2>/dev/null || true; wait 2>/dev/null || true; exit 0; }

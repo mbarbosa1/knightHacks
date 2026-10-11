@@ -5,6 +5,9 @@ import {
   EMPTY_OPERATIONAL,
   MAGNITUDE_RANGE,
   createEarthquake,
+  retryEarthquake,
+  SubmissionError,
+  RUN_ID,
   simulatorAvailable,
   loadOperationalState,
   loadRunTruth,
@@ -74,20 +77,24 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
   const [randomMagnitude, setRandomMagnitude] = useState(false);
   const [working, setWorking] = useState(false);
   const [quakeError, setQuakeError] = useState<string | null>(null);
+  const [retryRunId, setRetryRunId] = useState<string | null>(null);
+  const activeRunId = truth?.ingestion?.ready ? truth.run_id : RUN_ID;
 
   useEffect(() => {
     simulatorAvailable().then(setSimulator);
   }, []);
 
-  const newEarthquake = async () => {
+  const newEarthquake = async (retryId?: string) => {
     setWorking(true);
     setQuakeError(null);
     try {
-      setTruth(await createEarthquake(randomMagnitude ? null : magnitude));   // shown in whichever view is selected
+      setTruth(await (retryId ? retryEarthquake(retryId) : createEarthquake(randomMagnitude ? null : magnitude)));
+      setRetryRunId(null);
       setSimulator(true);
-    } catch {
+    } catch (cause) {
       setSimulator(await simulatorAvailable());
-      setQuakeError("The simulator did not answer.");
+      setRetryRunId(cause instanceof SubmissionError && cause.retryable ? cause.runId : null);
+      setQuakeError(cause instanceof Error ? cause.message : "The simulator did not answer. Saving has not been confirmed.");
     } finally {
       setWorking(false);
     }
@@ -236,10 +243,11 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
 
   // Operational state: polled while a run is connected, otherwise empty.
   useEffect(() => {
-    if (!operationalConnected) return;
+    if (!operationalConnected || !activeRunId) return;
+    setOperational(EMPTY_OPERATIONAL);
     let stop = false;
     const tick = () =>
-      loadOperationalState()
+      loadOperationalState(activeRunId)
         .then((state) => !stop && setOperational(state))
         .catch(() => undefined);
     tick();
@@ -248,7 +256,7 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
       stop = true;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [activeRunId]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -339,14 +347,16 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
               />
               random
             </label>
-            <button onClick={newEarthquake} disabled={controlsOff}>
-              {working ? "Simulating…" : "Generate earthquake"}
+            <button onClick={() => newEarthquake()} disabled={controlsOff}>
+              {working ? "Generating and saving…" : "Generate earthquake"}
             </button>
+            {retryRunId && <button onClick={() => newEarthquake(retryRunId)} disabled={working}>Retry saving this run</button>}
             <button
               className="map-quake-reset"
               onClick={() => {
                 setTruth(null);
                 setQuakeError(null);
+                setRetryRunId(null);
               }}
               disabled={!truth || working}
             >
@@ -354,6 +364,11 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
             </button>
           </div>
         </div>
+        {truth?.ingestion?.ready && !working && !quakeError && (
+          <div className="map-status" role="status">
+            Saved to Neon · {truth.ingestion.stored_observations} reports · {truth.ingestion.stored_resources} responder units
+          </div>
+        )}
         <div className="map-status" aria-live="polite">
           {error ? (
             <span className="map-status-error">
@@ -363,6 +378,8 @@ export const ShinjukuMap = forwardRef<ShinjukuMapHandle, Props>(function Shinjuk
             "Loading Shinjuku…"
           ) : quakeError ? (
             <span className="map-status-error">{quakeError}</span>
+          ) : working ? (
+            "Generating the simulation and waiting for Neon to confirm all reports and resources are saved…"
           ) : !truth ? (
             simulator ? (
               <>
